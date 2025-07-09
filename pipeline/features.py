@@ -8,6 +8,11 @@ def generate_signals_and_targets(daily_data_by_date, horizons=[1, 3, 5]):
         date = fname[:8]
         df = df.copy()
 
+        # Initialize columns for bet size, which in quant PNL calc is row-constant
+        num_stocks = df.shape[0]
+        for h in horizons:
+            df[f'betsize_{h}d'] = 1.0  # equal weight per stock (can customize later)
+
         # past returns (signals)
         for h in horizons:
             if i - h < 0:
@@ -22,7 +27,8 @@ def generate_signals_and_targets(daily_data_by_date, horizons=[1, 3, 5]):
                                               np.nan)
             merged = merged[['ticker', 'signal_RR']].rename(columns={'signal_RR': f'signal_RR_{h}d'})
             df = df.merge(merged, on='ticker', how='left')
-            df[f'signal_MR_{h}d'] = df[f'signal_RR_{h}d'] - df['SPpvCLCL']
+            if 'SPpvCLCL' in df.columns:
+                df[f'signal_MR_{h}d'] = df[f'signal_RR_{h}d'] - df['SPpvCLCL']
 
         # future returns (targets)
         for h in horizons:
@@ -38,7 +44,8 @@ def generate_signals_and_targets(daily_data_by_date, horizons=[1, 3, 5]):
                                             np.nan)
             merged = merged[['ticker', 'fret_RR']].rename(columns={'fret_RR': f'fret_RR_{h}d'})
             df = df.merge(merged, on='ticker', how='left')
-            df[f'fret_MR_{h}d'] = df[f'fret_RR_{h}d'] - df['SPpvCLCL']
+            if 'SPpvCLCL' in df.columns:
+                df[f'fret_MR_{h}d'] = df[f'fret_RR_{h}d'] - df['SPpvCLCL']
 
         df['date'] = date
         result.append((fname, df))
