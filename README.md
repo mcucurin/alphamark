@@ -11,3 +11,6 @@ After running, the output .pkl and .csv files will be saved in the output/DAILY_
 python plotting/plot_quantile_bars.py
 
 After running, the pdf of visuals will be saved in the output folder and each image as a png will be saved in the outputs/PLOTS folder.
+
+
+NEED TO CHANGE: get rid of nested loops to make the code more efficient for larger input data sets.
