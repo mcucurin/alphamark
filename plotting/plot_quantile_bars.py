@@ -30,17 +30,13 @@ with PdfPages("output/Quantile_Barplots.pdf") as pdf:
                 (stats_df['target'] == target) &
                 (stats_df['stat_type'] == metric)
             ]
-
+            # Pivot: index=signal, columns=qrank, values=value
+            pivot = data.pivot_table(index='signal', columns='qrank', values='value', fill_value=0)
             x = np.arange(len(signals))  # one base position per signal
-
             for j, qrank in enumerate(qranks):
-                values = []
-                for sig in signals:
-                    val = data[(data['signal'] == sig) & (data['qrank'] == qrank)]['value']
-                    values.append(val.values[0] if not val.empty else 0)
-
+                # Use .reindex to ensure order matches signals
+                values = pivot[qrank].reindex(signals).values if qrank in pivot.columns else np.zeros(len(signals))
                 ax.bar(x + q_offsets[j], values, width=bar_width, label=qrank)
-
             ax.set_ylabel(metric)
             ax.set_xticks(x)
             ax.set_xticklabels(signals, rotation=45)
