@@ -1,52 +1,62 @@
 import numpy as np
-from scipy.stats import spearmanr, linregress
 from collections import defaultdict
-import dcor
+
+from pipeline.pnl import comp_pnl_all_quantiles
+
 
 def create_4d_stats():
+    """Returns a nested dictionary structure for storing stats."""
     return defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
 
+
 def compute_daily_stats(df, signal_cols, target_cols, quantiles=[1.0, 0.75, 0.5, 0.25]):
+    """
+    Compute PnL quantile statistics for each (signal, target) pair.
+    Returns a 4-level dict: stats[metric][signal][quantile_label][target] = value
+    """
     stats = create_4d_stats()
-    for signal in signal_cols:
-        for target in target_cols:
-            df_filtered = df[[signal, target]].replace([np.inf, -np.inf], np.nan).dropna()
-            abs_signal = df_filtered[signal].abs()
-            for q in quantiles:
-                threshold = abs_signal.quantile(1 - q)
-                portfolio = df_filtered[abs_signal >= threshold]
-                if portfolio.empty:
-                    continue
 
-                key_qrank = f'qr_{int(q * 100)}'
+    for signal, target in zip(signal_cols, target_cols):
+        # 1) Clean and extract series
+        df_clean = df[[signal, target]].replace([np.inf, -np.inf], np.nan)
+        s = df_clean[signal]
+        f = df_clean[target]
 
-                # Metrics
-                sig = portfolio[signal]
-                tgt = portfolio[target]
-                pnl = np.sign(sig) * tgt
-                notional = np.abs(sig).sum()
-                nr_instr = np.isfinite(sig) & (sig != 0)
-                ppd = pnl.mean()
-                std = pnl.std()
+        # 2) Build quantile ranks DataFrame
+        pct_rank = s.abs().rank(pct=True)
+        n_q = len(quantiles)
+        qranks = (
+            np.ceil(pct_rank * n_q)
+            .fillna(0)
+            .astype(int)
+            .to_frame(signal)
+        )
 
-                stats['pnl'][signal][key_qrank][target] = pnl.sum()
-                stats['ppd'][signal][key_qrank][target] = ppd
-                stats['sharpe'][signal][key_qrank][target] = ppd / std * np.sqrt(252) if std > 0 else np.nan
-                stats['hit_ratio'][signal][key_qrank][target] = (np.sign(sig) == np.sign(tgt)).mean()
-                stats['long_ratio'][signal][key_qrank][target] = (np.sign(sig) == 1).mean()
-                stats['spearman'][signal][key_qrank][target] = spearmanr(sig, tgt)[0]
-                stats['n'][signal][key_qrank][target] = nr_instr.sum()
-                stats['sizeNotional'][signal][key_qrank][target] = notional
-                stats['nrInstr'][signal][key_qrank][target] = nr_instr.sum()
+        # 3) Future returns DataFrame
+        fut_rets = f.to_frame(signal)
 
-                # R2 and t-stat
-                slope, intercept, r_val, p_val, stderr = linregress(sig, tgt)
-                stats['r2'][signal][key_qrank][target] = r_val**2
-                stats['t_stat'][signal][key_qrank][target] = slope / stderr if stderr > 0 else np.nan
+        # 4) Bet-size DataFrame (expects column naming like "betsize_<horizon>")
+        horizon = target.split('_')[-1]
+        bs_col = f"betsize_{horizon}"
+        bs = df[bs_col].to_frame(signal) if bs_col in df.columns else None
 
-                # Distance correlation
-                try:
-                    stats['dcor'][signal][key_qrank][target] = dcor.distance_correlation(sig.values, tgt.values)
-                except Exception:
-                    stats['dcor'][signal][key_qrank][target] = np.nan
+        # 5) Compute stats via the vectorized PnL engine
+        out = comp_pnl_all_quantiles(
+            qranks,
+            fut_rets,
+            bet_size=bs,
+            probs=quantiles,
+            add_corr=True,
+            add_long_ratio=True,
+            add_hit_ratio=True,
+            add_stdev=False,
+            add_r2tval=True,
+        )
+
+        # 6) Unpack results into the nested dict
+        for label, info_df in out.items():
+            for metric in info_df.index:
+                stats[metric][signal][label][target] = info_df.at[metric, signal]
+
     return stats
+
