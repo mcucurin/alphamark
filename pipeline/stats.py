@@ -17,12 +17,10 @@ def compute_daily_stats(df, signal_cols, target_cols, quantiles=[1.0, 0.75, 0.5,
     stats = create_4d_stats()
 
     for signal, target in zip(signal_cols, target_cols):
-        # 1) Clean and extract series
         df_clean = df[[signal, target]].replace([np.inf, -np.inf], np.nan)
         s = df_clean[signal]
         f = df_clean[target]
 
-        # 2) Build quantile ranks DataFrame
         pct_rank = s.abs().rank(pct=True)
         n_q = len(quantiles)
         qranks = (
@@ -32,15 +30,12 @@ def compute_daily_stats(df, signal_cols, target_cols, quantiles=[1.0, 0.75, 0.5,
             .to_frame(signal)
         )
 
-        # 3) Future returns DataFrame
         fut_rets = f.to_frame(signal)
 
-        # 4) Bet-size DataFrame (expects column naming like "betsize_<horizon>")
         horizon = target.split('_')[-1]
         bs_col = f"betsize_{horizon}"
         bs = df[bs_col].to_frame(signal) if bs_col in df.columns else None
 
-        # 5) Compute stats via the vectorized PnL engine
         out = comp_pnl_all_quantiles(
             qranks,
             fut_rets,
@@ -53,7 +48,6 @@ def compute_daily_stats(df, signal_cols, target_cols, quantiles=[1.0, 0.75, 0.5,
             add_r2tval=True,
         )
 
-        # 6) Unpack results into the nested dict
         for label, info_df in out.items():
             for metric in info_df.index:
                 stats[metric][signal][label][target] = info_df.at[metric, signal]
