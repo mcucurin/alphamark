@@ -42,7 +42,7 @@ with PdfPages("output/Quantile_Barplots.pdf") as pdf:
             ax.set_xticklabels(signals, rotation=45)
             ax.legend(title='Quantile')
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.tight_layout(rect=(0, 0.03, 1, 0.95))
         pdf.savefig(fig)
         plt.close()
 
