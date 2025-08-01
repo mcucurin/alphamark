@@ -23,6 +23,14 @@ qranks = sorted(stats_df['qrank'].unique(), key=lambda x: float(x.split('_')[1])
 bar_width = 0.15
 q_offsets = np.arange(-(len(qranks)-1)/2, (len(qranks)+1)/2) * bar_width
 
+# Color map for quantile ranks
+quantile_colors = {
+    'qr_100': 'red',
+    'qr_75': 'green',
+    'qr_50': 'blue',
+    'qr_25': 'black'
+}
+
 # Create PDF
 with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
 
@@ -40,7 +48,8 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 x = np.arange(len(signals))
                 for j, qrank in enumerate(qranks):
                     values = pivot[qrank].reindex(signals).values if qrank in pivot.columns else np.zeros(len(signals))
-                    ax.bar(x + q_offsets[j], values, width=bar_width, label=qrank)
+                    color = quantile_colors.get(qrank, 'gray')
+                    ax.bar(x + q_offsets[j], values, width=bar_width, label=qrank, color=color)
                 ax.set_ylabel(metric, fontsize=10)
                 ax.set_xticks(x)
                 ax.set_xticklabels(signals, rotation=45, ha='right')
@@ -67,14 +76,14 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
 
                 fig, ax1 = plt.subplots(figsize=(14, 6))
                 ax2 = ax1.twinx()
-                ax1.set_title(f"Cumulative P&L + PPD — Target: {target} | Alpha: {signal} | Bet Size: {bet_strategy}", fontsize=16)
+                ax1.set_title(f"Target: {target} | Alpha: {signal} | Bet Size: {bet_strategy}", fontsize=16)
 
                 for qrank in qranks:
                     pnl_data = subset[(subset['qrank'] == qrank) & (subset['stat_type'] == 'pnl')].sort_values('date')
                     ppd_data = subset[(subset['qrank'] == qrank) & (subset['stat_type'] == 'ppd')].sort_values('date')
                     if pnl_data.empty or ppd_data.empty:
                         continue
-                    color = plt.cm.tab10(qranks.index(qrank) % 10)
+                    color = quantile_colors.get(qrank, 'gray')
                     ax1.plot(pnl_data['date'], pnl_data['value'].cumsum(), label=qrank, color=color, linewidth=1.5)
                     ax2.plot(ppd_data['date'], ppd_data['value'], color=color, linestyle='--', alpha=0.7)
 

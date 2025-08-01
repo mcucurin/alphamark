@@ -2,69 +2,73 @@ import numpy as np
 from scipy.stats import spearmanr, linregress
 from collections import defaultdict
 import dcor
+from itertools import product
 
-def create_4d_stats():
-    return defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+def create_5d_stats():
+    return defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(dict))))
 
-def compute_daily_stats(df, signal_cols, target_cols, quantiles=[1.0, 0.75, 0.5, 0.25], bet_size_col='betsize_equal'):
-    stats = create_4d_stats()
-    
-    for signal in signal_cols:
-        for target in target_cols:
-            # Require signal, target, and bet size
-            required_cols = [signal, target, bet_size_col]
-            if not all(col in df.columns for col in required_cols):
+def compute_daily_stats(df, signal_cols, target_cols, quantiles=[1.0, 0.75, 0.5, 0.25], bet_size_col=['betsize_equal']):
+    stats = create_5d_stats()
+
+    # Pre-clean data for all required columns once
+    required_all = set(signal_cols + target_cols + bet_size_col)
+    df_clean = df[list(required_all)].replace([np.inf, -np.inf], np.nan).dropna()
+
+    if df_clean.empty:
+        return stats
+
+    # Precompute quantile masks per signal
+    quantile_masks = {
+        signal: {
+            f'qr_{int(q * 100)}': df_clean[signal].abs() >= df_clean[signal].abs().quantile(1 - q)
+            for q in quantiles
+        } for signal in signal_cols
+    }
+
+    for signal, target, bet_col in product(signal_cols, target_cols, bet_size_col):
+        if not all(col in df_clean.columns for col in [signal, target, bet_col]):
+            continue
+
+        for q, mask in quantile_masks[signal].items():
+            portfolio = df_clean[mask][[signal, target, bet_col]].dropna()
+            if portfolio.empty:
                 continue
 
-            df_filtered = df[required_cols].replace([np.inf, -np.inf], np.nan).dropna()
-            abs_signal = df_filtered[signal].abs()
+            sig = portfolio[signal].values
+            tgt = portfolio[target].values
+            bsz = portfolio[bet_col].values
 
-            for q in quantiles:
-                threshold = abs_signal.quantile(1 - q)
-                portfolio = df_filtered[abs_signal >= threshold]
-                if portfolio.empty:
-                    continue
+            signed = np.sign(sig)
+            pnl = signed * tgt * bsz
+            notional = np.abs(sig * bsz).sum()
+            std = pnl.std()
 
-                key_qrank = f'qr_{int(q * 100)}'
-                sig = portfolio[signal]
-                tgt = portfolio[target]
-                betsize = portfolio[bet_size_col]
+            stats['pnl'][signal][q][target][bet_col] = pnl.sum()
+            stats['ppd'][signal][q][target][bet_col] = pnl.sum() / notional if notional > 0 else np.nan
+            stats['sharpe'][signal][q][target][bet_col] = (pnl.sum() / std * np.sqrt(252)) if std > 0 else np.nan
+            stats['hit_ratio'][signal][q][target][bet_col] = (np.sign(sig) == np.sign(tgt)).mean()
+            stats['long_ratio'][signal][q][target][bet_col] = (signed == 1).mean()
+            stats['bet_size'][signal][q][target][bet_col] = bsz.mean()
+            stats['n'][signal][q][target][bet_col] = len(sig)
+            stats['sizeNotional'][signal][q][target][bet_col] = notional
+            stats['nrInstr'][signal][q][target][bet_col] = len(sig)
 
-                pnl = np.sign(sig) * tgt * betsize
-                notional = np.abs(sig * betsize).sum()
-                nr_instr = np.isfinite(sig) & (sig != 0)
-                ppd = pnl.mean()
-                std = pnl.std()
+            if np.unique(sig).size > 1 and np.unique(tgt).size > 1:
+                stats['spearman'][signal][q][target][bet_col] = spearmanr(sig, tgt)[0]
+            else:
+                stats['spearman'][signal][q][target][bet_col] = np.nan
 
-                stats['pnl'][signal][key_qrank][target] = pnl.sum()
-                stats['ppd'][signal][key_qrank][target] = ppd
-                stats['sharpe'][signal][key_qrank][target] = ppd / std * np.sqrt(252) if std > 0 else np.nan
-                stats['hit_ratio'][signal][key_qrank][target] = (np.sign(sig) == np.sign(tgt)).mean()
-                stats['long_ratio'][signal][key_qrank][target] = (np.sign(sig) == 1).mean()
-                stats['bet_size'][signal][key_qrank][target] = betsize.mean()
-                stats['n'][signal][key_qrank][target] = nr_instr.sum()
-                stats['sizeNotional'][signal][key_qrank][target] = notional
-                stats['nrInstr'][signal][key_qrank][target] = nr_instr.sum()
+            if np.unique(sig).size > 1:
+                slope, intercept, r_val, p_val, stderr = linregress(sig, tgt)
+                stats['r2'][signal][q][target][bet_col] = r_val ** 2
+                stats['t_stat'][signal][q][target][bet_col] = slope / stderr if stderr > 0 else np.nan
+            else:
+                stats['r2'][signal][q][target][bet_col] = np.nan
+                stats['t_stat'][signal][q][target][bet_col] = np.nan
 
-                # Spearman correlation
-                if sig.nunique() > 1 and tgt.nunique() > 1:
-                    stats['spearman'][signal][key_qrank][target] = spearmanr(sig, tgt)[0]
-                else:
-                    stats['spearman'][signal][key_qrank][target] = np.nan
-
-                # R² and t-stat
-                if sig.nunique() > 1:
-                    slope, intercept, r_val, p_val, stderr = linregress(sig, tgt)
-                    stats['r2'][signal][key_qrank][target] = r_val**2
-                    stats['t_stat'][signal][key_qrank][target] = slope / stderr if stderr > 0 else np.nan
-                else:
-                    stats['r2'][signal][key_qrank][target] = np.nan
-                    stats['t_stat'][signal][key_qrank][target] = np.nan
-
-                # Distance correlation
-                try:
-                    stats['dcor'][signal][key_qrank][target] = dcor.distance_correlation(sig.values, tgt.values)
-                except Exception:
-                    stats['dcor'][signal][key_qrank][target] = np.nan
+            try:
+                stats['dcor'][signal][q][target][bet_col] = dcor.distance_correlation(sig, tgt)
+            except Exception:
+                stats['dcor'][signal][q][target][bet_col] = np.nan
 
     return stats
