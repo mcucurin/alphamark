@@ -61,7 +61,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             pdf.savefig(fig)
             plt.close()
 
-    # ---- Cumulative P&L + PPD Plots ----
+    # ---- Cumulative P&L + Cumulative PPD (ratio-of-cums) ----
     for target in targets:
         for signal in signals:
             for bet_strategy in bet_sizes:
@@ -69,7 +69,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                     (stats_df['target'] == target) &
                     (stats_df['signal'] == signal) &
                     (stats_df['bet_size_col'] == bet_strategy) &
-                    (stats_df['stat_type'].isin(['pnl', 'ppd']))
+                    (stats_df['stat_type'].isin(['pnl', 'sizeNotional']))
                 ]
                 if subset.empty:
                     continue
@@ -79,16 +79,32 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 ax1.set_title(f"Target: {target} | Alpha: {signal} | Bet Size: {bet_strategy}", fontsize=16)
 
                 for qrank in qranks:
-                    pnl_data = subset[(subset['qrank'] == qrank) & (subset['stat_type'] == 'pnl')].sort_values('date')
-                    ppd_data = subset[(subset['qrank'] == qrank) & (subset['stat_type'] == 'ppd')].sort_values('date')
-                    if pnl_data.empty or ppd_data.empty:
+                    sub_q = subset[subset['qrank'] == qrank]
+                    pnl_data = sub_q[sub_q['stat_type'] == 'pnl'].sort_values('date')[['date','value']]
+                    notional_data = sub_q[sub_q['stat_type'] == 'sizeNotional'].sort_values('date')[['date','value']]
+
+                    if pnl_data.empty or notional_data.empty:
                         continue
+
+                    merged = pd.merge(
+                        pnl_data.rename(columns={'value':'pnl'}),
+                        notional_data.rename(columns={'value':'notional'}),
+                        on='date', how='outer'
+                    ).sort_values('date')
+                    merged[['pnl','notional']] = merged[['pnl','notional']].fillna(0.0)
+
+                    merged['cum_pnl'] = merged['pnl'].cumsum()
+                    merged['cum_notional'] = merged['notional'].cumsum()
+                    merged['cum_ppd'] = np.where(merged['cum_notional'] > 0,
+                                                 merged['cum_pnl'] / merged['cum_notional'],
+                                                 np.nan)
+
                     color = quantile_colors.get(qrank, 'gray')
-                    ax1.plot(pnl_data['date'], pnl_data['value'].cumsum(), label=qrank, color=color, linewidth=1.5)
-                    ax2.plot(ppd_data['date'], ppd_data['value'], color=color, linestyle='--', alpha=0.7)
+                    ax1.plot(merged['date'], merged['cum_pnl'], label=qrank, color=color, linewidth=1.5)
+                    ax2.plot(merged['date'], merged['cum_ppd'], color=color, linestyle='--', alpha=0.9)
 
                 ax1.set_ylabel("Cumulative P&L")
-                ax2.set_ylabel("PPD")
+                ax2.set_ylabel("Cumulative PPD (cum PnL / cum Notional)")
                 ax1.grid(True, linestyle='--', alpha=0.4)
                 ax1.xaxis.set_major_locator(mdates.YearLocator())
                 ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
@@ -98,4 +114,39 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 pdf.savefig(fig)
                 plt.close()
 
+    # ---- Cumulative Size Notional (no # of instruments) ----
+    for target in targets:
+        for signal in signals:
+            for bet_strategy in bet_sizes:
+                subset = stats_df[
+                    (stats_df['target'] == target) &
+                    (stats_df['signal'] == signal) &
+                    (stats_df['bet_size_col'] == bet_strategy) &
+                    (stats_df['stat_type'] == 'sizeNotional')
+                ]
+                if subset.empty:
+                    continue
+
+                fig, ax = plt.subplots(figsize=(14, 6))
+                ax.set_title(f"Target: {target} | Alpha: {signal} | Bet Size: {bet_strategy}", fontsize=16)
+
+                for qrank in qranks:
+                    notional_data = subset[(subset['qrank'] == qrank)].sort_values('date')[['date','value']]
+                    if notional_data.empty:
+                        continue
+                    color = quantile_colors.get(qrank, 'gray')
+                    ax.plot(notional_data['date'], notional_data['value'].cumsum(), label=qrank, color=color, linewidth=1.5)
+
+                ax.set_ylabel("Cumulative Size Notional")
+                ax.grid(True, linestyle='--', alpha=0.4)
+                ax.xaxis.set_major_locator(mdates.YearLocator())
+                ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+                fig.autofmt_xdate()
+                ax.legend(title='Quantile Rank', loc='upper left')
+                plt.tight_layout()
+                pdf.savefig(fig)
+                plt.close()
+
 print("✅ Full PDF saved to output/Quantile_Combined_Report.pdf")
+
+
