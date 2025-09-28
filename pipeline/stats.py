@@ -78,7 +78,8 @@ def compute_daily_stats(
 
                 pnl_vec = np.sign(s) * y * b
                 pnl = float(pnl_vec.sum())
-                notional = float(np.abs(s * b).sum())
+                #notional = float(np.abs(s * b).sum())
+                notional = b.sum()
 
                 stats['pnl'][signal][qlabel][target][bet] = pnl
                 stats['ppd'][signal][qlabel][target][bet] = (pnl / notional) if notional > 0 else np.nan
