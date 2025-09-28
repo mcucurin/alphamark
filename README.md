@@ -14,6 +14,6 @@ After running, the pdf of visuals will be saved in the output folder and each im
 
 
 NEED TO CHANGE: 
-- get rid of nested loops to make the code more efficient for larger input data sets.
-   - possibly use data structures in Python for example.
-- need to verify calculations are correct for various statistics.
+- validate values (pnl, ppd, sharpe, etc. and cumsum graphs) (DHRUV)
+- add user inputs / make dynamic (LUCAS)
+- next step: add sample file with signals/target/bet size columns
