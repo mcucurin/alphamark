@@ -16,4 +16,5 @@ After running, the pdf of visuals will be saved in the output folder and each im
 NEED TO CHANGE: 
 - validate values (pnl, ppd, sharpe, etc. and cumsum graphs) (DHRUV)
 - add user inputs / make dynamic (LUCAS)
+- improve parallel processing of data, ideally get rid of nested loops
 - next step: add sample file with signals/target/bet size columns
