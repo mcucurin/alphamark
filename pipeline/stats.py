@@ -5,10 +5,19 @@ from collections import defaultdict
 from itertools import product
 
 # ---- optional dcor ----
+# ---- optional dcor (minimal guard) ----
 try:
     import dcor as _dcor
     def _distance_correlation(x, y):
-        return _dcor.distance_correlation(x, y)
+        x = np.asarray(x, dtype=float).ravel()
+        y = np.asarray(y, dtype=float).ravel()
+        n = min(x.size, y.size)
+        if n < 3:
+            return np.nan
+        # dcor returns 0 for constants; treat as undefined -> NaN
+        if np.all(x == x[0]) or np.all(y == y[0]):
+            return np.nan
+        return float(_dcor.distance_correlation(x, y))
 except Exception:
     def _distance_correlation(x, y):
         return np.nan
@@ -51,9 +60,7 @@ def compute_daily_stats(
     stats = create_5d_stats()
 
     # Auto-detect an instrument ID column if present (used for exact trade counts)
-    id_candidates = ['id', 'instrument', 'inst_id', 'sid', 'asset', 'symbol', 'ticker',
-                     'permno', 'permno_', 'ric', 'secid']
-    id_col = next((c for c in id_candidates if c in df.columns), None)
+    id_col = 'ticker' if 'ticker' in df.columns else None
 
     needed = list(set(signal_cols + target_cols + bet_size_cols + ([id_col] if id_col else [])))
     df = df[needed].replace([np.inf, -np.inf], np.nan).dropna(how="any")
