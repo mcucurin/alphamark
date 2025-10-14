@@ -30,23 +30,25 @@ metrics_to_plot = [
 CUM_SECTIONS = ['pnl', 'ppd', 'sizeNotional', 'nrInstr', 'n_trades', 'ppt']
 
 # ===== Heatmap inputs =====
+# IMPORTANT: Only Heatmaps 1 & 2 may use sidecars (panel daily pickles).
 PANEL_DAILY_DIR      = "output/PANEL_DAILY"   # requires sidecars panel_YYYYMMDD.pkl
-ALPHA_PREFIX         = "pret_"                # used only for inventory text
+ALPHA_PREFIX         = "pret_"                # used only for H1/H2 labels
 ALPHA_COLS_EXPLICIT  = None                   # or e.g. ['pret_1_MR','pret_1_RR',...]
-# IMPORTANT: Heatmap 2 needs ONE exact realized return column name present in sidecars
-TARGET_COL_FOR_PNL   = "fret_1d"              # e.g. 'fret_1d'  (MUST exist in sidecars)
+
+# Heatmap 2 needs ONE realized return column present in sidecars
+TARGET_COL_FOR_PNL   = "fret_1_RR"            # e.g. 'fret_1d'  (MUST exist in sidecars)
 BET_COL_FOR_PNL      = None                   # optional bet-size column in sidecars; None => unit
+
 HEATMAP_QRANKS       = ['qr_100', 'qr_75', 'qr_50', 'qr_25']  # for H3–H6 (time-corr)
 
-# ===== Distribution plots (explicit lists; no auto-detection) =====
-# Put EXACT column names you want to plot (must exist in sidecars),
-# or leave [] to skip that distribution page.
-DIST_FEATURE_LIST = []                        # e.g. ['pret_1_MR','pret_1_RR','pret_3_MR','pret_3_RR']
-DIST_BET_LIST     = ['betsize_equal','betsize_cap200k','betsize_cap250k']
-DIST_FRET_LIST    = ['fret_1_MR','fret_3_MR','fret_1_RR','fret_3_RR']
+# ===== Distribution plots (sidecars) =====
+# Leave lists empty to AUTO-DISCOVER by prefix; otherwise provide exact columns.
+DIST_FRET_LIST = []                           # e.g. ['fret_1_RR','fret_3_RR','fret_1_MR']
+DIST_BET_LIST  = []                           # e.g. ['betsize_equal','betsize_cap200k','betsize_cap250k']
 
 DIST_BINS       = 60
 MAX_SAMPLES     = 2_000_000        # cap rows concatenated from sidecars (None => all)
+RENDER_DISTRIBUTION_PAGES = True   # render FRET + betsize distributions
 
 # ===== Outlier tables (PKL) =====
 OUTLIERS_DIR                 = "output/OUTLIERS"
@@ -176,82 +178,171 @@ def _placeholder(ax, title, msg):
     ax.set_title(title, fontsize=13, weight='bold')
     ax.text(0.5, 0.5, msg, ha='center', va='center', fontsize=11)
 
-# =========================
-# Heatmap computations
-# =========================
+# =========================================================
+# ====== Heatmap computations (H1 & H2) — H1 FIXED ========
+# =========================================================
+
+def _discover_alpha_union(panel_daily_dir, alpha_prefix, alpha_cols_explicit=None):
+    """
+    Return (labels, day_files) where labels is the UNION of alpha cols across all sidecars
+    (or the explicit list if provided).
+    """
+    day_files = sorted(glob.glob(os.path.join(panel_daily_dir, "panel_*.pkl")))
+    if not day_files:
+        return [], []
+
+    if alpha_cols_explicit:
+        return list(alpha_cols_explicit), day_files
+
+    cols_union = set()
+    for p in day_files:
+        try:
+            d = pd.read_pickle(p)
+        except Exception:
+            continue
+        cols_union.update(c for c in d.columns if str(c).startswith(alpha_prefix))
+    return sorted(cols_union), day_files
+
+def _avg_matrices_ignore_nan(mats):
+    """
+    Element-wise average of square matrices, ignoring NaNs.
+    Returns (H, n_used_per_cell), where H has NaNs where no finite obs exist.
+    """
+    if not mats:
+        return None, None
+    k = mats[0].shape[0]
+    sumM = np.zeros((k, k), float)
+    cntM = np.zeros((k, k), int)
+    for M in mats:
+        m = np.isfinite(M)
+        sumM[m] += M[m]
+        cntM[m] += 1
+    with np.errstate(invalid='ignore', divide='ignore'):
+        H = sumM / cntM
+    H[cntM == 0] = np.nan
+    return H, cntM
 
 def compute_heatmap1_alpha_space(panel_daily_dir, alpha_prefix, alpha_cols_explicit=None):
-    day_files = sorted(glob.glob(os.path.join(panel_daily_dir, "panel_*.pkl")))
-    if not day_files:
-        return None, None, 0
+    """
+    H1: Alpha space correlation across stocks averaged over days.
+    Uses the UNION of alpha columns across all sidecars and fills missing with NaN per day.
+    Averages cell-wise while ignoring NaNs. If any cell remains NaN, fill with a pooled (all-days)
+    Spearman fallback for that pair.
+    """
+    labels, day_files = _discover_alpha_union(panel_daily_dir, alpha_prefix, alpha_cols_explicit)
+    if len(labels) < 2 or not day_files:
+        return None, (labels if labels else None), 0
 
-    sum_M = None
-    n_used = 0
-    labels = None
+    day_mats = []
+    per_day_blocks = []  # keep alpha values for fallback
 
     for p in day_files:
-        d = pd.read_pickle(p)
-        if d.empty:
+        try:
+            d = pd.read_pickle(p)
+        except Exception:
             continue
-        if labels is None:
-            labels = _infer_alphas_from_columns(d.columns, alpha_cols_explicit, alpha_prefix)
-            if len(labels) < 2:
-                return None, labels, 0
-        X = d[labels].apply(pd.to_numeric, errors='coerce').to_numpy()
-        if X.shape[0] < 3:
+        if d is None or len(d) < 3:
             continue
-        M = _spearman_corr_across_stocks(X)
-        if not np.isfinite(M).any():
-            continue
-        sum_M = M if sum_M is None else (sum_M + M)
-        n_used += 1
 
-    if n_used == 0:
+        # Build a full block with all labels; missing columns -> NaN
+        n = len(d)
+        block = {c: (pd.to_numeric(d[c], errors='coerce') if c in d.columns else pd.Series([np.nan]*n)) for c in labels}
+        DF = pd.DataFrame(block)[labels]
+        per_day_blocks.append(DF)
+
+        X = DF.to_numpy()
+        M = _spearman_corr_across_stocks(X)
+        if np.isfinite(M).any():
+            day_mats.append(M)
+
+    if not day_mats:
         return None, labels, 0
-    H1 = sum_M / n_used
-    return H1, labels, n_used
+
+    H1, _ = _avg_matrices_ignore_nan(day_mats)
+    k = len(labels)
+
+    # ---- pooled fallback for cells still NaN ----
+    if np.isnan(H1).any():
+        for i in range(k):
+            for j in range(i, k):
+                if np.isfinite(H1[i, j]):
+                    continue
+                xi_all, xj_all = [], []
+                for DF in per_day_blocks:
+                    if DF.shape[0] < 3:
+                        continue
+                    xi = pd.to_numeric(DF[labels[i]], errors='coerce')
+                    xj = pd.to_numeric(DF[labels[j]], errors='coerce')
+                    m = np.isfinite(xi) & np.isfinite(xj)
+                    if m.sum() >= 3:
+                        xi_all.append(xi[m].to_numpy())
+                        xj_all.append(xj[m].to_numpy())
+                if xi_all:
+                    a = np.concatenate(xi_all)
+                    b = np.concatenate(xj_all)
+                    if a.size >= 3:
+                        rho = spearmanr(a, b, nan_policy='omit').correlation
+                        if np.isfinite(rho):
+                            H1[i, j] = H1[j, i] = float(rho)
+
+    # ensure diagonal is 1 (in case of rare constant-column days + no fallback)
+    for i in range(k):
+        if not np.isfinite(H1[i, i]):
+            H1[i, i] = 1.0
+
+    n_days_used = len(day_mats)
+    return H1, labels, n_days_used
 
 def compute_heatmap2_pnl_across_stocks_avg(panel_daily_dir, alpha_prefix, target_col, bet_col=None, alpha_cols_explicit=None):
-    day_files = sorted(glob.glob(os.path.join(panel_daily_dir, "panel_*.pkl")))
-    if not day_files:
-        return None, None, 0
+    """
+    H2: PnL space correlation across stocks averaged over days.
+    For each alpha column a, per-stock PnL is sign(a) * target * bet (bet=1 if None).
+    Uses UNION of alpha labels and averages cell-wise ignoring NaNs.
+    (Unchanged here)
+    """
+    labels, day_files = _discover_alpha_union(panel_daily_dir, alpha_prefix, alpha_cols_explicit)
+    if len(labels) < 2 or not day_files:
+        return None, (labels if labels else None), 0
 
-    sum_M = None
-    n_used = 0
-    labels = None
-
+    day_mats = []
     for p in day_files:
-        d = pd.read_pickle(p)
-        if d.empty or (target_col not in d.columns):
+        try:
+            d = pd.read_pickle(p)
+        except Exception:
+            continue
+        if d is None or len(d) < 3 or (target_col not in d.columns):
             continue
 
-        if labels is None:
-            labels = _infer_alphas_from_columns(d.columns, alpha_cols_explicit, alpha_prefix)
-            if len(labels) < 2:
-                return None, labels, 0
-
-        Y = pd.to_numeric(d[target_col], errors='coerce').to_numpy()
+        Y = pd.to_numeric(d[target_col], errors='coerce')
         if bet_col and (bet_col in d.columns):
-            B = np.abs(pd.to_numeric(d[bet_col], errors='coerce').to_numpy())
+            B = np.abs(pd.to_numeric(d[bet_col], errors='coerce'))
         else:
-            B = np.ones_like(Y, dtype=float)
+            B = pd.Series(np.ones(len(d), dtype=float), index=d.index)
 
-        X = np.column_stack([
-            np.sign(pd.to_numeric(d[col], errors='coerce').to_numpy()) * Y * B
-            for col in labels
-        ])
-        if X.shape[0] < 3:
-            continue
+        cols = []
+        for col in labels:
+            if col in d.columns:
+                E = pd.to_numeric(d[col], errors='coerce')
+                pnl = np.sign(E) * Y * B
+            else:
+                pnl = pd.Series(np.nan, index=d.index)
+            cols.append(pnl.to_numpy(dtype=float))
+
+        X = np.column_stack(cols)
         M = _spearman_corr_across_stocks(X)
-        if not np.isfinite(M).any():
-            continue
-        sum_M = M if sum_M is None else (sum_M + M)
-        n_used += 1
+        if np.isfinite(M).any():
+            day_mats.append(M)
 
-    if n_used == 0:
+    if not day_mats:
         return None, labels, 0
-    H2 = sum_M / n_used
-    return H2, labels, n_used
+
+    H2, _ = _avg_matrices_ignore_nan(day_mats)
+    n_days_used = len(day_mats)
+    return H2, labels, n_days_used
+
+# =========================
+# Heatmap computations (H3+ use stats_df)
+# =========================
 
 def compute_timecorr_from_daily_pkls(stats_df, target: str, bet: str, qrank: str):
     df = stats_df[(stats_df['stat_type'] == 'pnl') &
@@ -291,9 +382,9 @@ def _metric_table_rows(odf: pd.DataFrame, metric: str, top_k: int, have_z: bool,
     lows  = sub.head(top_k).copy()
     highs = sub.tail(top_k).iloc[::-1].copy()
 
-    labels = ["Type", "Date", "Signal", "Bet", "Target", "Q", "Value"]
-    if have_z:    labels.append("z")
-    if have_rule: labels.append("Rule")
+    labels_tbl = ["Type", "Date", "Signal", "Bet", "Target", "Q", "Value"]
+    if have_z:    labels_tbl.append("z")
+    if have_rule: labels_tbl.append("Rule")
 
     def row_from_series(r, kind):
         return [
@@ -316,7 +407,7 @@ def _metric_table_rows(odf: pd.DataFrame, metric: str, top_k: int, have_z: bool,
     for _, r in lows.iterrows():
         rows.append(row_from_series(r, "Low"))
 
-    return labels, rows
+    return labels_tbl, rows
 
 def _draw_table_in_axis(ax, title: str, col_labels, rows, fontsize=9):
     ax.axis('off')
@@ -402,10 +493,10 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
 
     tables = []
     for m in metrics:
-        labels, rows = _metric_table_rows(odf, m, top_k=top_k, have_z=have_z, have_rule=have_rule)
-        if labels is None or not rows:
+        labels_tbl, rows = _metric_table_rows(odf, m, top_k=top_k, have_z=have_z, have_rule=have_rule)
+        if labels_tbl is None or not rows:
             continue
-        tables.append((m, labels, rows))
+        tables.append((m, labels_tbl, rows))
     if not tables:
         return
 
@@ -423,12 +514,12 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
             left=0.03, right=0.97, top=0.90, bottom=0.06, hspace=0.35
         )
 
-        for row_idx, (metric_name, labels, rows) in enumerate(chunk):
+        for row_idx, (metric_name, labels_tbl, rows) in enumerate(chunk):
             ax = fig.add_subplot(gs[row_idx, 0])
             _draw_table_in_axis(
                 ax,
                 title=f"{metric_name} — Top {top_k} Highs & Lows",
-                col_labels=labels,
+                col_labels=labels_tbl,
                 rows=rows,
                 fontsize=9
             )
@@ -437,11 +528,24 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
         plt.close(fig)
 
 # =========================
-# Distribution helpers (explicit lists only)
+# Distribution helpers (sidecars) — FRETs + bet sizes
 # =========================
 
 def _gather_sidecars(panel_dir):
     return sorted(glob.glob(os.path.join(panel_dir, "panel_*.pkl")))
+
+def _infer_cols_from_sidecars(files, prefix, explicit_list):
+    """Return sorted list of columns matching prefix across sidecars, unless explicit_list is given."""
+    if explicit_list:
+        return [c for c in explicit_list]
+    cols = set()
+    for f in files:
+        try:
+            d = pd.read_pickle(f)
+        except Exception:
+            continue
+        cols |= {c for c in d.columns if str(c).startswith(prefix)}
+    return sorted(cols)
 
 def _concat_columns(files, col_list, max_samples=None):
     """
@@ -566,37 +670,31 @@ def add_distribution_pages(pdf):
     if not files:
         fig, ax = plt.subplots(figsize=(12, 2.6))
         ax.axis('off')
-        fig.suptitle("Distribution Plots (features, bets, targets)", fontsize=14, weight='bold')
+        fig.suptitle("Distribution Plots", fontsize=14, weight='bold')
         ax.text(0.03, 0.5, f"No sidecars found in {PANEL_DAILY_DIR}. Skipping distributions.", fontsize=11)
         plt.tight_layout(); pdf.savefig(fig); plt.close(fig)
         return
 
-    # Features
-    _render_distribution_block(
-        pdf,
-        "Feature Return Distributions (pret_*)",
-        files,
-        DIST_FEATURE_LIST,
-        bins=DIST_BINS,
-        label_min_pct=3.0
-    )
+    # Auto-discover lists if the user left them empty
+    fret_cols = _infer_cols_from_sidecars(files, "fret_", DIST_FRET_LIST)
+    bet_cols  = _infer_cols_from_sidecars(files, "betsize_", DIST_BET_LIST)
 
-    # Bet sizes
-    _render_distribution_block(
-        pdf,
-        "Bet Size Distributions (betsize_*)",
-        files,
-        DIST_BET_LIST,
-        bins=DIST_BINS,
-        label_min_pct=4.0
-    )
-
-    # Realized returns / targets
+    # FRET distributions
     _render_distribution_block(
         pdf,
         "Realized Return Distributions (fret_*)",
         files,
-        DIST_FRET_LIST,
+        fret_cols,
+        bins=DIST_BINS,
+        label_min_pct=3.0
+    )
+
+    # Bet size distributions
+    _render_distribution_block(
+        pdf,
+        "Bet Size Distributions (betsize_*)",
+        files,
+        bet_cols,
         bins=DIST_BINS,
         label_min_pct=4.0
     )
@@ -608,7 +706,7 @@ def add_distribution_pages(pdf):
 os.makedirs("output", exist_ok=True)
 with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
 
-    # -------- Bar Plots --------
+    # -------- Bar Plots (from stats_df) --------
     if BAR_PAGE_VARS:
         page_levels = [LEVELS[var] for var in BAR_PAGE_VARS]
         page_iter = list(product(*page_levels))
@@ -626,6 +724,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             continue
 
         if BAR_X_VARS:
+            subset = subset.copy()
             subset['x_key'] = subset[BAR_X_VARS].astype(str).agg('|'.join, axis=1)
             x_levels = sorted(subset['x_key'].unique().tolist())
         else:
@@ -672,7 +771,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
     # HEATMAPS (six total, after bar plots)
     # =========================
 
-    # Heatmap 1 & 2 (side-by-side)
+    # Heatmap 1 & 2 (side-by-side) — USE SIDECARS
     H1, labels1, n_days1 = compute_heatmap1_alpha_space(
         PANEL_DAILY_DIR, ALPHA_PREFIX, ALPHA_COLS_EXPLICIT
     )
@@ -701,7 +800,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
     plt.tight_layout()
     pdf.savefig(fig); plt.close(fig)
 
-    # Heatmaps 3–6 (2×2 grid): time corr of summed PnL per quantile
+    # Heatmaps 3–6 (2×2 grid): time corr of summed PnL per quantile — FROM stats_df
     target_for_hmaps = targets[0] if targets else None
     bet_for_hmaps    = bet_sizes[0] if bet_sizes else None
 
@@ -732,12 +831,13 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
     pdf.savefig(fig); plt.close(fig)
 
     # =========================
-    # DISTRIBUTION PAGES (explicit lists; always render all requested)
+    # DISTRIBUTION PAGES (FRETs + bet sizes)
     # =========================
-    add_distribution_pages(pdf)
+    if RENDER_DISTRIBUTION_PAGES:
+        add_distribution_pages(pdf)
 
     # =========================
-    # CUMULATIVE PAGES
+    # CUMULATIVE PAGES (from stats_df)
     # =========================
     for target in targets:
         for signal in signals:
