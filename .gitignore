@@ -10,9 +10,11 @@ __pycache__/
 Thumbs.db
 
 *.log
-outputs/
 
 data/
 
 output/DAILY_SUMMARIES/stats_tensor.pkl
 output/DAILY_SUMMARIES/stats_tensor.csv
+
+**/*.csv
+**/*.pkl
