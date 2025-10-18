@@ -1,451 +1,777 @@
-import os
-import glob
-import warnings
+# plotting/plot_quantile_bars.py
+import os, glob, warnings
 import numpy as np
 import pandas as pd
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import matplotlib.ticker as mtick
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.gridspec import GridSpec
-from itertools import product
-from scipy.stats import spearmanr, ConstantInputWarning
+from itertools import product, combinations
+
+# =====================================================
+# Clean white backgrounds everywhere (fixes gray pages)
+# =====================================================
+mpl.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.facecolor": "white",
+    "savefig.facecolor": "white",
+    "savefig.edgecolor": "white",
+    "axes.grid": False,
+})
+
+def savefig_white(pdf, fig):
+    fig.patch.set_facecolor("white")
+    fig.patch.set_alpha(1.0)
+    for ax in fig.get_axes():
+        ax.set_facecolor("white")
+    pdf.savefig(fig, facecolor="white", edgecolor="white")
+    plt.close(fig)
 
 # =========================
-# ---- USER CONFIG --------
+# -------- USER CONFIG ----
+# =========================
+# Choose up to 4 qrank labels to DISPLAY across the whole report.
+# Examples:
+#   QR = ['qr_100','qr_75','qr_50','qr_25']   # all four
+#   QR = ['qr_100','qr_50']                   # only 100 and 50
+QR = ['qr_100','qr_75','qr_50','qr_25']
+
+# If any chosen qrank is missing from the data files:
+# - If False (default): they'll be dropped (and we warn).
+# - If True: they'll still appear in legends (empty where no data).
+ALLOW_MISSING_QRANKS = False
+
+# ---- FIXED filters (no "ALL") for Heatmap 2 and Heatmap 3 ----
+# Provide a string (e.g., 'fret_1d') or a list of strings (e.g., ['fret_1d', 'fret_5d']).
+# Set to "AUTO" to pick the most frequent available value(s) in the data (still fixed, not "ALL").
+# HEATMAP 2 (Cross-section corr of PnL) — must have >=2 (target, bet) rows per day for given quantile
+H2_TARGETS = "AUTO"       # e.g. 'fret_1d' or ['fret_1d','fret_5d']
+H2_BETS    = "AUTO"       # e.g. 'betsize_equal' or ['betsize_equal','betsize_vol']
+# HEATMAP 3 (Time-series corr of PnL) — separate fixed filters allowed
+H3_TARGETS = "AUTO"
+H3_BETS    = "AUTO"
+
+# =========================
+# ---- PER-GRAPH ROLLING WINDOWS ----
+# =========================
+# Temporal lines after Heatmap 1 (alpha metric cross-section corr)
+ROLL_H1_LINES = 30
+# Temporal lines after Heatmap 2 (PnL cross-section corr)
+ROLL_H2_LINES = 30
+# Temporal lines after Heatmap 3 (time correlation of per-alpha PnL across days)
+# NOTE: when set to 1, we use EXPANDING correlation (daily series, no fixed window).
+ROLL_H3_LINES = 1
+
+# Bottom pages (left series is first metric; right series is the second metric)
+# 1 = left series cumulative (Cum P&L / Cum PPD / Cum PPT) with daily right-axis
+# >1 = left series stays cumulative; each day's left increment is normalized by a rolling denominator,
+#      while the right-axis uses rolling sums over that window.
+ROLL_PNL_NRINSTR  = 30   # affects: left=P&L (cum or cum of PnL/roll nrInstr), right=nrInstr (daily/rolling)
+ROLL_PPD_NOTIONAL = 30   # affects: left=PPD (cum or cum of PnL/roll Notional), right=Notional (daily/rolling)
+ROLL_PPT_TRADES   = 30   # affects: left=PPT (cum or cum of PnL/roll Trades), right=Trades (daily/rolling)
+
+# Keep left series cumulative but let the rolling window normalize each daily increment (when window > 1).
+NORMALIZE_LEFT_WITH_ROLL = True
+
+# =========================
+# -------- CONFIG ---------
 # =========================
 
-# Bar page grouping (pages split by these)
-BAR_PAGE_VARS = ['signal', 'bet_size_col']
-BAR_X_VARS    = ['target']
+BAR_PAGE_VARS = ['signal', 'bet_size_col']     # page split (no __ALL__ here)
+BAR_X_VARS    = ['target']                     # x-axis grouping
 
 metrics_to_plot = [
-    'pnl', 'ppd', 'sharpe', 'hit_ratio', 'long_ratio',
-    'nrInstr', 'sizeNotional', 'r2', 't_stat',
-    'n_trades', 'ppt', 'spearman', 'dcor'
+    'pnl','ppd','sharpe','hit_ratio','long_ratio',
+    'nrInstr','sizeNotional','r2','t_stat','n_trades','ppt','spearman','dcor'
 ]
 
-# Cumulative sections to draw (omit any to hide the section)
-CUM_SECTIONS = ['pnl', 'ppd', 'sizeNotional', 'nrInstr', 'n_trades', 'ppt']
+CUM_SECTIONS = ['pnl','ppd','sizeNotional','nrInstr','n_trades','ppt']
 
-# ===== Heatmap inputs =====
-# IMPORTANT: Only Heatmaps 1 & 2 may use sidecars (panel daily pickles).
-PANEL_DAILY_DIR      = "output/PANEL_DAILY"   # requires sidecars panel_YYYYMMDD.pkl
-ALPHA_PREFIX         = "pret_"                # used only for H1/H2 labels
-ALPHA_COLS_EXPLICIT  = None                   # or e.g. ['pret_1_MR','pret_1_RR',...]
-
-# Heatmap 2 needs ONE realized return column present in sidecars
-TARGET_COL_FOR_PNL   = "fret_1_RR"            # e.g. 'fret_1d'  (MUST exist in sidecars)
-BET_COL_FOR_PNL      = None                   # optional bet-size column in sidecars; None => unit
-
-HEATMAP_QRANKS       = ['qr_100', 'qr_75', 'qr_50', 'qr_25']  # for H3–H6 (time-corr)
-
-# ===== Distribution plots (sidecars) =====
-# Leave lists empty to AUTO-DISCOVER by prefix; otherwise provide exact columns.
-DIST_FRET_LIST = []                           # e.g. ['fret_1_RR','fret_3_RR','fret_1_MR']
-DIST_BET_LIST  = []                           # e.g. ['betsize_equal','betsize_cap200k','betsize_cap250k']
-
-DIST_BINS       = 60
-MAX_SAMPLES     = 2_000_000        # cap rows concatenated from sidecars (None => all)
-RENDER_DISTRIBUTION_PAGES = True   # render FRET + betsize distributions
-
-# ===== Outlier tables (PKL) =====
+# Outlier tables
 OUTLIERS_DIR                 = "output/OUTLIERS"
-OUTLIER_METRICS_FOR_TABLES   = ['pnl', 'ppd', 'sizeNotional', 'nrInstr', 'n_trades', 'ppt']
-OUTLIER_TOP_K                = 3        # highs & lows per metric
-OUTLIER_TABLES_PER_PAGE      = 3        # stacked vertically per page
+OUTLIER_METRICS_FOR_TABLES   = ['pnl','ppd','sizeNotional','nrInstr','n_trades','ppt']
+OUTLIER_TOP_K                = 3
+OUTLIER_TABLES_PER_PAGE      = 3
+
+# Distributions (fret_* and betsize_*), from DAILY_STATS
+DIST_BINS        = 60
 
 # Styles / colors
-STYLE_FIRST  = '-'    # solid
-STYLE_SECOND = '--'   # dashed
-quantile_colors = {'qr_100': 'red', 'qr_75': 'green', 'qr_50': 'blue', 'qr_25': 'black'}
+STYLE_FIRST  = '-'
+STYLE_SECOND = '--'
+# Base colors for the common four; any extra will be auto-assigned.
+quantile_colors = {'qr_100':'red','qr_75':'green','qr_50':'blue','qr_25':'black'}
 
-# Silence scipy constant-input spam in correlation loops
-warnings.filterwarnings("ignore", category=ConstantInputWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # =========================
-# ---- LOAD & PREP --------
+# ----- LOAD & PREP -------
 # =========================
 
 def _load_stats_df():
-    daily_dir = "output/DAILY_STATS"
+    daily_dir   = "output/DAILY_STATS"
     summary_dir = "output/SUMMARY_STATS"
-
     if not os.path.isdir(daily_dir):
-        raise FileNotFoundError("Expected 'output/DAILY_STATS' with per-day pickles (stats_*.pkl).")
-
+        raise FileNotFoundError("Expected 'output/DAILY_STATS' with stats_*.pkl files.")
     daily_paths = sorted(glob.glob(os.path.join(daily_dir, "stats_*.pkl")))
     if not daily_paths:
         raise FileNotFoundError("No daily files found in 'output/DAILY_STATS'.")
 
-    daily_frames = [pd.read_pickle(p) for p in daily_paths]
+    daily_frames = []
+    for p in daily_paths:
+        try:
+            df = pd.read_pickle(p)
+        except Exception:
+            continue
+        if df is None or df.empty: continue
+        if not {'date','value'}.issubset(df.columns): continue
+        daily_frames.append(df)
+    if not daily_frames:
+        raise FileNotFoundError("All daily files were empty or missing required columns.")
+
     stats_daily = pd.concat(daily_frames, ignore_index=True)
 
-    summary_paths = sorted(glob.glob(os.path.join(summary_dir, "summary_stats_*.pkl"))) if os.path.isdir(summary_dir) else []
-    stats_summary = pd.read_pickle(summary_paths[-1]) if summary_paths else pd.DataFrame()
+    if os.path.isdir(summary_dir):
+        summary_paths = sorted(glob.glob(os.path.join(summary_dir, "summary_stats_*.pkl")))
+        stats_summary = pd.read_pickle(summary_paths[-1]) if summary_paths else pd.DataFrame()
+    else:
+        stats_summary = pd.DataFrame()
 
     parts = [df for df in (stats_daily, stats_summary) if not df.empty]
     out = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
-    out['date'] = pd.to_datetime(out['date'], errors='coerce')
-    out = out.dropna(subset=['date', 'value'])
+    out['date']  = pd.to_datetime(out['date'], errors='coerce')
+    out['value'] = pd.to_numeric(out['value'], errors='coerce')
+    out = out.dropna(subset=['date','value'])
+
+    for col in ['signal','target','bet_size_col','qrank','stat_type']:
+        if col not in out.columns: out[col] = pd.NA
+        out[col] = out[col].astype('string')
+
+    # Guardrails: clamp to observed min/max
+    dmin, dmax = out['date'].min(), out['date'].max()
+    if pd.notna(dmin) and pd.notna(dmax) and dmax > dmin:
+        out = out[(out['date'] >= dmin) & (out['date'] <= dmax)]
+
     return out
 
 stats_df = _load_stats_df()
 
-targets   = stats_df['target'].dropna().unique().tolist()
-signals   = stats_df['signal'].dropna().unique().tolist()
-bet_sizes = stats_df['bet_size_col'].dropna().unique().tolist()
+# All unique values (includes __ALL__)
+signals_all   = sorted([s for s in stats_df['signal'].dropna().unique()])
+targets_all   = sorted([t for t in stats_df['target'].dropna().unique()])
+bet_sizes_all = sorted([b for b in stats_df['bet_size_col'].dropna().unique()])
 
-_qr_raw = [q for q in stats_df['qrank'].dropna().unique().tolist() if isinstance(q, str)]
+_qr_raw = [q for q in stats_df['qrank'].dropna().unique()]
 try:
-    qranks = sorted(_qr_raw, key=lambda x: float(x.split('_')[1]) if '_' in x else x)
+    qranks_all = sorted(_qr_raw, key=lambda x: float(str(x).split('_')[1]) if '_' in str(x) else str(x))
 except Exception:
-    qranks = sorted(_qr_raw)
+    qranks_all = sorted(_qr_raw)
 
+# ---- Apply user's QR selection (up to 4) ----
+if isinstance(QR, (list, tuple)):
+    selected = [str(q) for q in QR][:4]  # hard cap at 4
+else:
+    selected = []
+
+if not selected:
+    qranks = qranks_all
+else:
+    if not ALLOW_MISSING_QRANKS:
+        missing = [q for q in selected if q not in qranks_all]
+        if missing:
+            print(f"[WARN] These qranks not found in data and will be ignored: {missing}")
+    qranks = [q for q in selected if (ALLOW_MISSING_QRANKS or q in qranks_all)]
+    if not qranks:
+        print("[WARN] None of the requested qranks were present; falling back to available.")
+        qranks = qranks_all
+
+# Extend the color map so every shown qrank has a color (no deprecated API)
+def _ensure_quantile_colors(labels, base_map):
+    cmap = mpl.colormaps.get_cmap('tab20')
+    out = dict(base_map)
+    i = 0
+    for lab in labels:
+        if lab not in out:
+            out[lab] = cmap(i % cmap.N)
+            i += 1
+    return out
+
+quantile_colors = _ensure_quantile_colors(qranks, quantile_colors)
 bar_width = 0.15
-q_offsets = np.arange(-(len(qranks)-1)/2, (len(qranks)+1)/2) * bar_width
 
-LEVELS = {
-    'signal': signals,
-    'target': targets,
-    'bet_size_col': bet_sizes,
-}
+# =========================
+# ---- FIXED FILTERS RESOLVE (no ALL) ----
+# =========================
 
-# ================
-# Helper functions
-# ================
+def _as_list(x):
+    if isinstance(x, str):
+        return [x]
+    if isinstance(x, (list, tuple, set, pd.Series, np.ndarray)):
+        return [str(v) for v in x]
+    raise ValueError("Expected string or list-like.")
+
+def _resolve_fixed(name, desired, series_values, prefer_prefix=None, top_k=1):
+    """
+    Resolve desired -> list of valid tokens from series_values.
+    If desired == 'AUTO', pick the most frequent (optionally filtered by prefix), up to top_k.
+    """
+    vals = pd.Series(series_values).dropna().astype(str)
+    if vals.empty:
+        raise ValueError(f"No available values to resolve {name}.")
+    if isinstance(desired, str) and desired.upper() == "AUTO":
+        if prefer_prefix:
+            vsub = vals[vals.str.startswith(prefer_prefix)]
+            if not vsub.empty:
+                top = vsub.value_counts().index.tolist()[:top_k]
+                return top
+        return vals.value_counts().index.tolist()[:top_k]
+    # explicit
+    out = _as_list(desired)
+    missing = [v for v in out if v not in set(vals)]
+    if missing:
+        avail = ", ".join(sorted(set(vals)))
+        raise ValueError(f"{name} contains unknown token(s): {missing}. Available: {avail}")
+    return out
+
+def _ensure_min_cross_section(df_q, targ_sel, bet_sel, auto_targ, auto_bet, min_rows=2):
+    """
+    For per-day cross-section corr, we need at least 2 index rows:
+      rows index = (target, bet, qrank) with qrank fixed to one q
+      => need len(targets)*len(bets) >= 2
+    If AUTO was used, expand selections from df_q to meet min_rows when possible.
+    """
+    t = list(targ_sel)
+    b = list(bet_sel)
+    if len(t)*len(b) >= min_rows:
+        return t, b, None
+
+    # available in df_q
+    avail_t = df_q['target'].dropna().astype(str).value_counts().index.tolist()
+    avail_b = df_q['bet_size_col'].dropna().astype(str).value_counts().index.tolist()
+
+    msg = None
+
+    if auto_targ and auto_bet:
+        if len(avail_t) >= 2:
+            t = avail_t[:2]
+            b = avail_b[:1] if avail_b else b
+        elif len(avail_b) >= 2:
+            t = avail_t[:1] if avail_t else t
+            b = avail_b[:2]
+        if len(t)*len(b) < min_rows:
+            msg = "[WARN] Cross-section: only one (target, bet) combination exists for this quantile; cross-section corr unavailable."
+        return t, b, msg
+
+    if auto_targ and not auto_bet:
+        if len(avail_t) >= 2:   t = avail_t[:2]
+        elif len(avail_t) >= 1: t = avail_t[:1]
+        if len(t)*len(b) < min_rows:
+            msg = "[WARN] Cross-section: insufficient rows with fixed bet(s); consider adding more targets."
+        return t, b, msg
+
+    if not auto_targ and auto_bet:
+        if len(avail_b) >= 2:   b = avail_b[:2]
+        elif len(avail_b) >= 1: b = avail_b[:1]
+        if len(t)*len(b) < min_rows:
+            msg = "[WARN] Cross-section: insufficient rows with fixed target(s); consider adding more bets."
+        return t, b, msg
+
+    # Explicit-explicit and still < min_rows => can't fix automatically
+    msg = "[INFO] Cross-section: explicit filters yield <2 rows; cannot compute cross-section correlation."
+    return t, b, msg
+
+# Track whether user set AUTO
+H2_AUTO_TARGETS = isinstance(H2_TARGETS, str) and H2_TARGETS.upper() == "AUTO"
+H2_AUTO_BETS    = isinstance(H2_BETS,    str) and H2_BETS.upper()    == "AUTO"
+H3_AUTO_TARGETS = isinstance(H3_TARGETS, str) and H3_TARGETS.upper() == "AUTO"
+H3_AUTO_BETS    = isinstance(H3_BETS,    str) and H3_BETS.upper()    == "AUTO"
+
+# =========================
+# ---- EXCLUDE __ALL__ ----
+# =========================
+def _exclude_all_rows(df: pd.DataFrame) -> pd.DataFrame:
+    m = (
+        df['target'].ne('__ALL__') &
+        df['bet_size_col'].ne('__ALL__') &
+        df['qrank'].ne('__ALL__')
+    )
+    return df[m].copy()
+
+stats_df_plot = _exclude_all_rows(stats_df)
+
+# Page levels for BAR/CUM plots (no __ALL__)
+plot_signals   = sorted(stats_df_plot['signal'].dropna().unique())
+plot_targets   = sorted(stats_df_plot['target'].dropna().unique())
+plot_bets      = sorted(stats_df_plot['bet_size_col'].dropna().unique())
+PLOT_LEVELS    = {'signal': plot_signals, 'target': plot_targets, 'bet_size_col': plot_bets}
+
+# =========================
+# ---- ALPHA AUTODETECT ---
+# =========================
+def _autodetect_alphas(df, max_k=16):
+    df = df[df['signal'].notna()]
+    base = df[df['stat_type']=='pnl']
+    day_counts = (base.groupby('signal')['date'].nunique()).sort_values(ascending=False)
+    if day_counts.empty:
+        day_counts = (df.groupby('signal')['date'].nunique()).sort_values(ascending=False)
+    candidates = day_counts[day_counts >= 5].index.tolist() or day_counts.index.tolist()
+    return candidates[:max_k]
+
+ALPHAS = _autodetect_alphas(stats_df, max_k=16)
+if len(ALPHAS) < 2:
+    raise ValueError("Not enough signals in DAILY_STATS to build heatmaps/lines (need ≥2).")
+print(f"[INFO] Using {len(ALPHAS)} alphas:", list(ALPHAS))
+
+available_stats = set(stats_df['stat_type'].dropna().unique())
+H1_BASE_STAT = 'alpha_sum' if 'alpha_sum' in available_stats else ('alpha_strength' if 'alpha_strength' in available_stats else None)
+if H1_BASE_STAT is None:
+    raise ValueError("Heatmap 1 requires 'alpha_sum' (or 'alpha_strength') in DAILY_STATS.")
+print(f"[INFO] Alpha stat for Heatmap 1: {H1_BASE_STAT}")
+
+# Whether to emit temporal plots alongside heatmaps
+DO_TEMPORAL = (len(ALPHAS) <= 6)
+if not DO_TEMPORAL:
+    print(f"[INFO] {len(ALPHAS)} alphas detected (>6). Skipping temporal line plots for heatmaps.")
+
+# =========================
+# ------- HELPERS ---------
+# =========================
 
 def _plot_date_axis(ax):
-    ax.grid(True, linestyle='--', alpha=0.4)
+    ax.set_axisbelow(True)  # grid below lines/bars
+    ax.grid(True, linestyle='--', alpha=0.35)
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
 
 def _merge_two_stats(subset, stat_a, stat_b, name_a, name_b):
-    a_df = subset[subset['stat_type'] == stat_a][['date','value']].rename(columns={'value': name_a})
-    b_df = subset[subset['stat_type'] == stat_b][['date','value']].rename(columns={'value': name_b})
-    merged = pd.merge(a_df, b_df, on='date', how='outer').sort_values('date')
-    for col in [name_a, name_b]:
-        if col not in merged:
-            merged[col] = 0.0
-    merged[[name_a, name_b]] = merged[[name_a, name_b]].fillna(0.0)
+    a = subset[subset['stat_type']==stat_a][['date','value']].rename(columns={'value':name_a})
+    b = subset[subset['stat_type']==stat_b][['date','value']].rename(columns={'value':name_b})
+    merged = pd.merge(a, b, on='date', how='outer').sort_values('date')
+    for c in [name_a,name_b]:
+        if c not in merged: merged[c] = 0.0
+    merged[[name_a,name_b]] = merged[[name_a,name_b]].fillna(0.0)
     merged[f'cum_{name_a}'] = merged[name_a].cumsum()
     merged[f'cum_{name_b}'] = merged[name_b].cumsum()
     return merged
 
 def _add_dual_legends(ax, qranks, color_map, style_descs):
-    quant_handles = [Line2D([0],[0], color=color_map.get(q, 'gray'), lw=2, label=q) for q in qranks]
-    leg_colors = ax.legend(handles=quant_handles, title='Quantile (color)', loc='upper left', fontsize=9)
-    if style_descs:
-        style_handles = [Line2D([0],[0], color='gray', lw=2, linestyle=ls, label=lab) for (lab, ls) in style_descs]
-        ax.legend(handles=style_handles, title='Series (style / axis)', loc='upper right', fontsize=9, frameon=True)
-        ax.add_artist(leg_colors)
+    handles = [Line2D([0],[0], color=color_map.get(q,'gray'), lw=2, label=q) for q in qranks] if qranks else []
+    if handles:
+        leg_colors = ax.legend(handles=handles, title='Quantile (color)',
+                               loc='upper left', fontsize=9)
+        if style_descs:
+            style_handles = [Line2D([0],[0], color='gray', lw=2, linestyle=ls, label=lab) for (lab,ls) in style_descs]
+            ax.legend(handles=style_handles, title='Series (style/axis)',
+                      loc='upper right', fontsize=9, frameon=True)
+            ax.add_artist(leg_colors)
+    elif style_descs:
+        style_handles = [Line2D([0],[0], color='gray', lw=2, linestyle=ls, label=lab) for (lab,ls) in style_descs]
+        ax.legend(handles=style_handles, title='Series (style/axis)', loc='upper right', fontsize=9, frameon=True)
 
-def _infer_alphas_from_columns(cols, explicit=None, prefix="pret_"):
-    if explicit:
-        return [c for c in explicit if c in cols]
-    return sorted([c for c in cols if str(c).startswith(prefix)])
+def _heatmap_figure_size(k):
+    s = max(10, min(28, 0.6 * k + 8))
+    return (s, s)
 
-def _spearman_corr_across_stocks(mat):
-    """
-    mat: (n_stocks × k) values for a single day (alphas or per-stock pnl).
-    Returns k×k Spearman correlation across stocks (NaN if <3 overlapping obs).
-    """
-    k = mat.shape[1]
-    M = np.full((k, k), np.nan, float)
-    for i in range(k):
-        xi = mat[:, i]
-        for j in range(i, k):
-            xj = mat[:, j]
-            m = np.isfinite(xi) & np.isfinite(xj)
-            if m.sum() >= 3:
-                rho = spearmanr(xi[m], xj[m], nan_policy='omit').correlation
-                if np.isfinite(rho):
-                    M[i, j] = M[j, i] = float(rho)
-    return M
+def _plot_matrix_heatmap(fig, ax, M, labels, title, vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"):
+    if M is None or labels is None or len(labels) == 0:
+        ax.axis('off'); ax.set_title(title, fontsize=13, weight='bold')
+        ax.text(0.5,0.5,"No data",ha='center',va='center'); return
+    k = len(labels)
+    fs_labels = 9 if k <= 18 else (7 if k <= 30 else 6)
+    fs_cells  = 8 if k <= 18 else (6 if k <= 30 else 5)
 
-def _plot_matrix_heatmap(fig, ax, M: np.ndarray, labels, title: str,
-                         vmin=-1, vmax=1, cmap='coolwarm'):
-    im = ax.imshow(M, vmin=vmin, vmax=vmax, cmap=cmap)
-    ax.set_title(title, fontsize=13, weight='bold')
-    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=9)
-    ax.set_yticks(range(len(labels))); ax.set_yticklabels(labels, fontsize=9)
+    im = ax.imshow(M, vmin=vmin, vmax=vmax, cmap='coolwarm', aspect='equal')
+    ax.set_title(title, fontsize=14, weight='bold', pad=10)
+    ax.set_xticks(range(k)); ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=fs_labels)
+    ax.set_yticks(range(k)); ax.set_yticklabels(labels, fontsize=fs_labels)
+    ax.set_xlim(-0.5, k-0.5); ax.set_ylim(k-0.5, -0.5)
+    ax.set_xticks(np.arange(-.5, k, 1), minor=True)
+    ax.set_yticks(np.arange(-.5, k, 1), minor=True)
+    ax.grid(which='minor', color='white', linestyle='-', linewidth=0.8)
+    for spine in ax.spines.values(): spine.set_visible(False)
+
+    if annotate_lower:
+        for i in range(k):
+            for j in range(i+1):
+                val = M[i, j]
+                if np.isfinite(val):
+                    ax.text(j, i, format(val, fmt),
+                            ha='center', va='center',
+                            fontsize=fs_cells,
+                            color=('white' if abs(val) >= 0.5 else 'black'))
     cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.ax.tick_params(labelsize=9)
 
-def _placeholder(ax, title, msg):
-    ax.axis('off')
-    ax.set_title(title, fontsize=13, weight='bold')
-    ax.text(0.5, 0.5, msg, ha='center', va='center', fontsize=11)
+# ---- Min-periods helper (prevents "min_periods > window" errors) ----
+def _minp(window, floor=3):
+    if window is None:
+        return 1
+    w = int(max(1, window))
+    return min(w, max(1, w//5, floor))
 
-# =========================================================
-# ====== Heatmap computations (H1 & H2) — H1 FIXED ========
-# =========================================================
+# ---- Rolling sum helper for normalization ----
+def _roll_sum(s: pd.Series, window: int):
+    mp = _minp(window, floor=3)
+    return s.rolling(window, min_periods=mp).sum()
 
-def _discover_alpha_union(panel_daily_dir, alpha_prefix, alpha_cols_explicit=None):
+# =========================
+# ---- HEATMAP BUILDERS ---
+# =========================
+
+def _build_daily_cross_section(df_day, alphas, stat_type, qfilter=None,
+                               targets=None, bets=None):
     """
-    Return (labels, day_files) where labels is the UNION of alpha cols across all sidecars
-    (or the explicit list if provided).
+    Cross-section for a given day:
+      rows: (target, bet, qrank) optionally filtered by qfilter/targets/bets
+      cols: signals (alphas)
+      values: stat_type's 'value'
     """
-    day_files = sorted(glob.glob(os.path.join(panel_daily_dir, "panel_*.pkl")))
-    if not day_files:
-        return [], []
+    d = df_day[df_day['stat_type'] == stat_type]
+    if qfilter:   d = d[d['qrank'].isin(qfilter)]
+    if targets:   d = d[d['target'].isin(targets)]
+    if bets:      d = d[d['bet_size_col'].isin(bets)]
+    if d.empty: return None
+    piv = d.pivot_table(index=['target','bet_size_col','qrank'],
+                        columns='signal', values='value', aggfunc='sum')
+    cols_present = [a for a in alphas if a in piv.columns]
+    if not cols_present:
+        return None
+    piv = piv[cols_present].dropna(how='all')
+    if piv.shape[0] < 2:  # need at least 2 rows for per-day cross-section corr
+        return None
+    return pd.to_numeric(piv.stack(), errors='coerce').unstack().astype(float)
 
-    if alpha_cols_explicit:
-        return list(alpha_cols_explicit), day_files
-
-    cols_union = set()
-    for p in day_files:
-        try:
-            d = pd.read_pickle(p)
-        except Exception:
-            continue
-        cols_union.update(c for c in d.columns if str(c).startswith(alpha_prefix))
-    return sorted(cols_union), day_files
-
-def _avg_matrices_ignore_nan(mats):
-    """
-    Element-wise average of square matrices, ignoring NaNs.
-    Returns (H, n_used_per_cell), where H has NaNs where no finite obs exist.
-    """
-    if not mats:
-        return None, None
+def _avg_mats_ignore_nan(mats):
+    if not mats: return None
     k = mats[0].shape[0]
-    sumM = np.zeros((k, k), float)
-    cntM = np.zeros((k, k), int)
+    sumM = np.zeros((k,k), float); cntM = np.zeros((k,k), int)
     for M in mats:
+        if M is None or M.shape != (k,k): continue
         m = np.isfinite(M)
-        sumM[m] += M[m]
-        cntM[m] += 1
+        sumM[m] += M[m]; cntM[m] += 1
     with np.errstate(invalid='ignore', divide='ignore'):
-        H = sumM / cntM
-    H[cntM == 0] = np.nan
-    return H, cntM
-
-def compute_heatmap1_alpha_space(panel_daily_dir, alpha_prefix, alpha_cols_explicit=None):
-    """
-    H1: Alpha space correlation across stocks averaged over days.
-    Uses the UNION of alpha columns across all sidecars and fills missing with NaN per day.
-    Averages cell-wise while ignoring NaNs. If any cell remains NaN, fill with a pooled (all-days)
-    Spearman fallback for that pair.
-    """
-    labels, day_files = _discover_alpha_union(panel_daily_dir, alpha_prefix, alpha_cols_explicit)
-    if len(labels) < 2 or not day_files:
-        return None, (labels if labels else None), 0
-
-    day_mats = []
-    per_day_blocks = []  # keep alpha values for fallback
-
-    for p in day_files:
-        try:
-            d = pd.read_pickle(p)
-        except Exception:
-            continue
-        if d is None or len(d) < 3:
-            continue
-
-        # Build a full block with all labels; missing columns -> NaN
-        n = len(d)
-        block = {c: (pd.to_numeric(d[c], errors='coerce') if c in d.columns else pd.Series([np.nan]*n)) for c in labels}
-        DF = pd.DataFrame(block)[labels]
-        per_day_blocks.append(DF)
-
-        X = DF.to_numpy()
-        M = _spearman_corr_across_stocks(X)
-        if np.isfinite(M).any():
-            day_mats.append(M)
-
-    if not day_mats:
-        return None, labels, 0
-
-    H1, _ = _avg_matrices_ignore_nan(day_mats)
-    k = len(labels)
-
-    # ---- pooled fallback for cells still NaN ----
-    if np.isnan(H1).any():
-        for i in range(k):
-            for j in range(i, k):
-                if np.isfinite(H1[i, j]):
-                    continue
-                xi_all, xj_all = [], []
-                for DF in per_day_blocks:
-                    if DF.shape[0] < 3:
-                        continue
-                    xi = pd.to_numeric(DF[labels[i]], errors='coerce')
-                    xj = pd.to_numeric(DF[labels[j]], errors='coerce')
-                    m = np.isfinite(xi) & np.isfinite(xj)
-                    if m.sum() >= 3:
-                        xi_all.append(xi[m].to_numpy())
-                        xj_all.append(xj[m].to_numpy())
-                if xi_all:
-                    a = np.concatenate(xi_all)
-                    b = np.concatenate(xj_all)
-                    if a.size >= 3:
-                        rho = spearmanr(a, b, nan_policy='omit').correlation
-                        if np.isfinite(rho):
-                            H1[i, j] = H1[j, i] = float(rho)
-
-    # ensure diagonal is 1 (in case of rare constant-column days + no fallback)
+        H = sumM / np.where(cntM==0, np.nan, cntM)
+    H[cntM==0] = np.nan
     for i in range(k):
-        if not np.isfinite(H1[i, i]):
-            H1[i, i] = 1.0
+        if not np.isfinite(H[i,i]): H[i,i] = 1.0
+    return H
 
-    n_days_used = len(day_mats)
-    return H1, labels, n_days_used
-
-def compute_heatmap2_pnl_across_stocks_avg(panel_daily_dir, alpha_prefix, target_col, bet_col=None, alpha_cols_explicit=None):
+def compute_heatmap_daily_avg(stats_df, alphas, stat_type, min_pairs=2,
+                              qfilter=None, targets=None, bets=None):
     """
-    H2: PnL space correlation across stocks averaged over days.
-    For each alpha column a, per-stock PnL is sign(a) * target * bet (bet=1 if None).
-    Uses UNION of alpha labels and averages cell-wise ignoring NaNs.
-    (Unchanged here)
+    Heatmap logic (cross-section):
+    - For each day, compute the cross-sectional corr across (target, bet, qrank) rows
+      between alpha columns (or PnL per alpha when stat_type='pnl').
+    - Then average the correlation matrices across days (element-wise).
     """
-    labels, day_files = _discover_alpha_union(panel_daily_dir, alpha_prefix, alpha_cols_explicit)
-    if len(labels) < 2 or not day_files:
-        return None, (labels if labels else None), 0
+    alphas = list(alphas)
+    if len(alphas) < 2: return None, alphas, 0
+    mats = []
+    for _, df_day in stats_df.groupby('date'):
+        X = _build_daily_cross_section(df_day, alphas, stat_type,
+                                       qfilter=qfilter, targets=targets, bets=bets)
+        if X is None: continue
+        C = X.corr(method='pearson', min_periods=min_pairs)
+        C = C.reindex(index=alphas, columns=alphas)
+        mats.append(C.to_numpy(dtype=float))
+    if not mats: return None, alphas, 0
+    H = _avg_mats_ignore_nan(mats)
+    return H, alphas, len(mats)
 
-    day_mats = []
-    for p in day_files:
-        try:
-            d = pd.read_pickle(p)
-        except Exception:
+def compute_timeseries_heatmap(stats_df, alphas, stat_type, min_days=5, agg='sum',
+                               qfilter=None, targets=None, bets=None):
+    """
+    Time-series heatmap:
+    - Build daily series per alpha from `stat_type` and compute a single correlation matrix.
+    - Filters by qfilter / targets / bets if provided.
+    - For alpha_* use mean across duplicates; for pnl use sum.
+    """
+    df = stats_df[stats_df['stat_type'] == stat_type].copy()
+    if qfilter: df = df[df['qrank'].isin(qfilter)]
+    if targets: df = df[df['target'].isin(targets)]
+    if bets:    df = df[df['bet_size_col'].isin(bets)]
+    if df.empty: return None, alphas, 0
+
+    gb = df.groupby(['date','signal'])['value']
+    daily = (gb.sum() if agg == 'sum' else gb.mean()).unstack('signal')
+    daily = daily.reindex(columns=alphas).dropna(axis=1, how='all').sort_index()
+
+    if daily.shape[1] < 2 or daily.shape[0] < min_days:
+        return None, list(daily.columns), int(daily.shape[0])
+
+    C = daily.corr(method='pearson', min_periods=min_days)
+    return C.values, C.columns.tolist(), int(daily.shape[0])
+
+# =========================
+# -- TEMPORAL LINES -------
+# =========================
+
+def compute_daily_pair_corr_series(stats_df, alphas, stat_type, min_pairs=2,
+                                   qfilter=None, targets=None, bets=None):
+    """
+    For each date, compute cross-sectional Pearson corr for each (alpha_i, alpha_j).
+    Optionally filters to rows where qrank/target/bet match provided filters.
+    Returns dict: ("a|b") -> pd.Series indexed by date.
+    """
+    alphas = [a for a in alphas]
+    pairs = list(combinations(alphas, 2))
+    dates = sorted(stats_df['date'].dropna().unique())
+    out = {f"{a}|{b}": pd.Series(index=pd.DatetimeIndex(dates, name='date', dtype='datetime64[ns]'),
+                                 dtype='float64') for a, b in pairs}
+
+    for dt, df_day in stats_df.groupby('date'):
+        X = _build_daily_cross_section(df_day, alphas, stat_type,
+                                       qfilter=qfilter, targets=targets, bets=bets)
+        if X is None:
             continue
-        if d is None or len(d) < 3 or (target_col not in d.columns):
-            continue
-
-        Y = pd.to_numeric(d[target_col], errors='coerce')
-        if bet_col and (bet_col in d.columns):
-            B = np.abs(pd.to_numeric(d[bet_col], errors='coerce'))
-        else:
-            B = pd.Series(np.ones(len(d), dtype=float), index=d.index)
-
-        cols = []
-        for col in labels:
-            if col in d.columns:
-                E = pd.to_numeric(d[col], errors='coerce')
-                pnl = np.sign(E) * Y * B
+        cols = set(X.columns)
+        for a, b in pairs:
+            if (a not in cols) or (b not in cols):
+                continue
+            xa = pd.to_numeric(X[a], errors='coerce')
+            xb = pd.to_numeric(X[b], errors='coerce')
+            m = xa.notna() & xb.notna()
+            if m.sum() >= min_pairs and xa[m].std(ddof=0) > 0 and xb[m].std(ddof=0) > 0:
+                r = np.corrcoef(xa[m].values, xb[m].values)[0,1]
+                out[f"{a}|{b}"].loc[dt] = float(r)
             else:
-                pnl = pd.Series(np.nan, index=d.index)
-            cols.append(pnl.to_numpy(dtype=float))
+                out[f"{a}|{b}"].loc[dt] = np.nan
+    return out
 
-        X = np.column_stack(cols)
-        M = _spearman_corr_across_stocks(X)
-        if np.isfinite(M).any():
-            day_mats.append(M)
+def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix,
+                                  smooth_window=60, height=5.8,
+                                  qfilter=None, targets=None, bets=None):
+    """
+    Temporal lines for per-day cross-section corr:
+    - If smooth_window <= 1: plot raw per-day values (no smoothing).
+    - Else: rolling-mean smoothing over `smooth_window`.
+    """
+    corr_map = compute_daily_pair_corr_series(
+        stats_df, alphas, stat_type, min_pairs=2,
+        qfilter=qfilter, targets=targets, bets=bets
+    )
+    if not corr_map:
+        fig, ax = plt.subplots(figsize=(17, height))
+        ax.axis('off'); ax.set_title(f"{title_prefix} — Daily Cross-Section Corr (no data)", fontsize=14, weight='bold')
+        savefig_white(pdf, fig); return
 
-    if not day_mats:
-        return None, labels, 0
+    coverage = [(k, v.notna().sum()) for k, v in corr_map.items()]
+    coverage.sort(key=lambda x: x[1], reverse=True)
+    chosen = [k for k,cnt in coverage[:8] if cnt > 0]
 
-    H2, _ = _avg_matrices_ignore_nan(day_mats)
-    n_days_used = len(day_mats)
-    return H2, labels, n_days_used
+    dates_all = sorted(stats_df['date'].dropna().unique())
+    if len(dates_all) == 0 or not chosen:
+        fig, ax = plt.subplots(figsize=(17, height))
+        ax.axis('off'); ax.set_title(f"{title_prefix} — Daily Cross-Section Corr (insufficient)", fontsize=14, weight='bold')
+        savefig_white(pdf, fig); return
+
+    fig, ax = plt.subplots(figsize=(17.5, height))
+    fil_str = []
+    if qfilter: fil_str.append(f"qranks={', '.join(qfilter)}")
+    if targets: fil_str.append(f"target={', '.join(targets)}")
+    if bets:    fil_str.append(f"bet={', '.join(bets)}")
+    suffix = (" | " + " | ".join(fil_str)) if fil_str else ""
+
+    if (smooth_window is None) or int(smooth_window) <= 1:
+        ax.set_title(f"{title_prefix} — daily (no smoothing){suffix}",
+                     fontsize=15, weight='bold', pad=10)
+        apply_smoothing = False
+    else:
+        ax.set_title(f"{title_prefix} — (smoothed {int(smooth_window)}D mean){suffix}",
+                     fontsize=15, weight='bold', pad=10)
+        apply_smoothing = True
+
+    cmap = mpl.colormaps.get_cmap('tab20')
+    x_min, x_max = pd.to_datetime(dates_all[0]), pd.to_datetime(dates_all[-1])
+    all_vals = []
+
+    for i, key in enumerate(chosen):
+        s = corr_map[key].copy().sort_index()
+        if apply_smoothing:
+            win = int(smooth_window)
+            mp = _minp(win, floor=3)
+            sm = s.rolling(win, min_periods=mp).mean()
+        else:
+            sm = s  # raw daily values
+        color = cmap(i % cmap.N)
+        ax.plot(sm.index, sm.values, lw=1.8, alpha=0.95, color=color)
+        v = sm.values
+        if np.isfinite(v).any():
+            all_vals.append(v[np.isfinite(v)])
+        finite_idx = np.where(np.isfinite(sm.values))[0]
+        if finite_idx.size:
+            j = finite_idx[-1]
+            ax.text(sm.index[j], sm.values[j], f"  {key}", color=color, fontsize=9, va='center')
+
+    if all_vals:
+        vals = np.concatenate(all_vals)
+        vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+        span = max(vmax - vmin, 1e-6); pad = 0.08 * span
+        y0 = max(-1.05, vmin - pad); y1 = min(1.05, vmax + pad)
+        if (y1 - y0) < 0.2:
+            mid = 0.5*(y0 + y1); y0, y1 = mid - 0.1, mid + 0.1
+        ax.set_ylim(y0, y1)
+    else:
+        ax.set_ylim(-1.05, 1.05)
+
+    ax.set_ylabel("Pearson corr")
+    ax.set_xlim(x_min, x_max)
+    ax.margins(x=0.03)
+    _plot_date_axis(ax)
+    savefig_white(pdf, fig)
+
+# ---- Rolling/Expanding TIME correlation lines (used for H3 time-series) ----
+def compute_pairwise_rolling_time_corr(stats_df, alphas, stat_type, window=60, min_periods=None,
+                                       qfilter=None, targets=None, bets=None, agg='mean'):
+    """
+    If window <= 1, returns **expanding** correlation (min_periods ≥ 2) so you get a daily series.
+    Otherwise, a fixed rolling correlation with given window is returned.
+    """
+    df = stats_df[stats_df['stat_type'] == stat_type].copy()
+    if qfilter: df = df[df['qrank'].isin(qfilter)]
+    if targets: df = df[df['target'].isin(targets)]
+    if bets:    df = df[df['bet_size_col'].isin(bets)]
+    if df.empty: return {}
+
+    gb = df.groupby(['date','signal'])['value']
+    daily = (gb.sum() if agg == 'sum' else gb.mean()).unstack('signal')
+    daily = daily.reindex(columns=alphas).dropna(axis=1, how='all').sort_index()
+    if daily.shape[1] < 2: return {}
+
+    out = {}
+    if (window is None) or int(window) <= 1:
+        mp = 2  # need at least 2 points
+        cols = [c for c in daily.columns if daily[c].notna().sum() >= mp]
+        pairs = list(combinations(cols, 2))
+        for a, b in pairs:
+            s = daily[a].expanding(min_periods=mp).corr(daily[b])
+            out[f"{a}|{b}"] = s
+        return out
+
+    win = int(window)
+    if min_periods is None:
+        min_periods = _minp(win, floor=3)
+    cols = [c for c in daily.columns if daily[c].notna().sum() >= min_periods]
+    pairs = list(combinations(cols, 2))
+    for a, b in pairs:
+        s = daily[a].rolling(win, min_periods=min_periods).corr(daily[b])
+        out[f"{a}|{b}"] = s
+    return out
+
+def plot_pairwise_timecorr_lines(pdf, stats_df, alphas, stat_type, title_prefix,
+                                 window=60, height=5.8, qfilter=None, targets=None, bets=None, agg='mean'):
+    corr_map = compute_pairwise_rolling_time_corr(
+        stats_df, alphas, stat_type, window=window, qfilter=qfilter,
+        targets=targets, bets=bets, agg=agg
+    )
+    if not corr_map:
+        fig, ax = plt.subplots(figsize=(17, height))
+        lbl = "Expanding corr" if (window is None or int(window) <= 1) else f"Rolling time corr ({int(window)}D)"
+        ax.axis('off'); ax.set_title(f"{title_prefix} — {lbl} (no data)", fontsize=14, weight='bold')
+        savefig_white(pdf, fig); return
+
+    coverage = [(k, v.notna().sum()) for k, v in corr_map.items()]
+    coverage.sort(key=lambda x: x[1], reverse=True)
+    chosen = [k for k,cnt in coverage[:8] if cnt > 0]
+
+    dates_all = sorted(stats_df['date'].dropna().unique())
+    if len(dates_all) == 0 or not chosen:
+        fig, ax = plt.subplots(figsize=(17, height))
+        lbl = "Expanding corr" if (window is None or int(window) <= 1) else f"Rolling time corr ({int(window)}D)"
+        ax.axis('off'); ax.set_title(f"{title_prefix} — {lbl} (insufficient)", fontsize=14, weight='bold')
+        savefig_white(pdf, fig); return
+
+    fig, ax = plt.subplots(figsize=(17.5, height))
+    fil_str = []
+    if qfilter: fil_str.append(f"qranks={', '.join(qfilter)}")
+    if targets: fil_str.append(f"target={', '.join(targets)}")
+    if bets:    fil_str.append(f"bet={', '.join(bets)}")
+    suffix = (" | " + " | ".join(fil_str)) if fil_str else ""
+    if (window is None) or int(window) <= 1:
+        ax.set_title(f"{title_prefix} — Expanding corr{suffix}", fontsize=15, weight='bold', pad=10)
+    else:
+        ax.set_title(f"{title_prefix} — Rolling time corr ({int(window)}D){suffix}", fontsize=15, weight='bold', pad=10)
+
+    cmap = mpl.colormaps.get_cmap('tab20')
+    x_min, x_max = pd.to_datetime(dates_all[0]), pd.to_datetime(dates_all[-1])
+    all_vals = []
+
+    for i, key in enumerate(chosen):
+        s = corr_map[key].copy().sort_index()
+        color = cmap(i % cmap.N)
+        ax.plot(s.index, s.values, lw=1.8, alpha=0.95, color=color)
+        v = s.values
+        if np.isfinite(v).any():
+            all_vals.append(v[np.isfinite(v)])
+        finite_idx = np.where(np.isfinite(s.values))[0]
+        if finite_idx.size:
+            j = finite_idx[-1]
+            ax.text(s.index[j], s.values[j], f"  {key}", color=color, fontsize=9, va='center')
+
+    if all_vals:
+        vals = np.concatenate(all_vals)
+        vmin, vmax = np.nanmin(vals), np.nanmax(vals)
+        span = max(vmax - vmin, 1e-6); pad = 0.08 * span
+        y0 = max(-1.05, vmin - pad); y1 = min(1.05, vmax + pad)
+        if (y1 - y0) < 0.2:
+            mid = 0.5*(y0 + y1); y0, y1 = mid - 0.1, mid + 0.1
+        ax.set_ylim(y0, y1)
+    else:
+        ax.set_ylim(-1.05, 1.05)
+
+    ax.set_ylabel("Pearson corr (time)")
+    ax.set_xlim(x_min, x_max)
+    ax.margins(x=0.03)
+    _plot_date_axis(ax)
+    savefig_white(pdf, fig)
 
 # =========================
-# Heatmap computations (H3+ use stats_df)
-# =========================
-
-def compute_timecorr_from_daily_pkls(stats_df, target: str, bet: str, qrank: str):
-    df = stats_df[(stats_df['stat_type'] == 'pnl') &
-                  (stats_df['target'] == target) &
-                  (stats_df['bet_size_col'] == bet) &
-                  (stats_df['qrank'] == qrank)].copy()
-    if df.empty:
-        return None, None
-    mat = (df.pivot_table(index='date', columns='signal', values='value', aggfunc='sum')
-             .sort_index())
-    mat = mat.apply(pd.to_numeric, errors='coerce').dropna(axis=1, how='all')
-    if mat.shape[1] < 2 or mat.shape[0] < 5:
-        return None, None
-    C = mat.corr(method='pearson', min_periods=5)
-    return C.values, mat.columns.tolist()
-
-# =========================
-# Outlier Tables (PKL)
+# ---- OUTLIER TABLES -----
 # =========================
 
 def _find_latest_outliers_pkl(root=OUTLIERS_DIR):
-    if not os.path.isdir(root):
-        return None
+    if not os.path.isdir(root): return None
     cand = sorted(glob.glob(os.path.join(root, "outliers_*.pkl")))
     return cand[-1] if cand else None
 
-def _ellipsis(s: str, maxlen: int) -> str:
-    s = "" if s is None else str(s)
-    return s if len(s) <= maxlen else (s[:maxlen-1] + "…")
+def _ellipsis(s, n): s = "" if s is None else str(s); return s if len(s)<=n else s[:n-1]+"…"
 
-def _metric_table_rows(odf: pd.DataFrame, metric: str, top_k: int, have_z: bool, have_rule: bool):
-    sub = odf[odf['stat_type'] == metric].copy()
-    if sub.empty:
-        return None, None
-
+def _metric_table_rows(odf, metric, top_k, have_z, have_rule):
+    sub = odf[odf['stat_type']==metric].copy()
+    if sub.empty: return None, None
     sub = sub.sort_values('value')
     lows  = sub.head(top_k).copy()
     highs = sub.tail(top_k).iloc[::-1].copy()
-
-    labels_tbl = ["Type", "Date", "Signal", "Bet", "Target", "Q", "Value"]
-    if have_z:    labels_tbl.append("z")
-    if have_rule: labels_tbl.append("Rule")
-
-    def row_from_series(r, kind):
-        return [
+    labels_tbl = ["Type","Date","Signal","Bet","Target","Q","Value"] + (["z"] if have_z else []) + (["Rule"] if have_rule else [])
+    def row(r, kind):
+        base = [
             kind,
             r['date'].strftime('%Y-%m-%d') if pd.notna(r['date']) else "NaT",
-            _ellipsis(r['signal'], 18),
-            _ellipsis(r['bet_size_col'], 16),
-            _ellipsis(r['target'], 16),
-            str(r['qrank']),
-            f"{r['value']:.6g}",
-        ] + (
-            [f"{r.get('z'):.2f}"] if have_z and pd.notna(r.get('z')) else ([""] if have_z else [])
-        ) + (
-            [_ellipsis(r.get('rule', ''), 18)] if have_rule else []
-        )
-
-    rows = []
-    for _, r in highs.iterrows():
-        rows.append(row_from_series(r, "High"))
-    for _, r in lows.iterrows():
-        rows.append(row_from_series(r, "Low"))
-
+            _ellipsis(r['signal'],18), _ellipsis(r['bet_size_col'],16),
+            _ellipsis(r['target'],16), str(r['qrank']), f"{r['value']:.6g}",
+        ]
+        if have_z:    base.append("" if pd.isna(r.get('z')) else f"{r.get('z'):.2f}")
+        if have_rule: base.append(_ellipsis(r.get('rule',''),18))
+        return base
+    rows = [row(r,"High") for _,r in highs.iterrows()] + [row(r,"Low") for _,r in lows.iterrows()]
     return labels_tbl, rows
 
-def _draw_table_in_axis(ax, title: str, col_labels, rows, fontsize=9):
-    ax.axis('off')
-    ax.set_title(title, fontsize=13, weight='bold', loc='left', pad=6)
-
-    base_colwidths = {
-        "Type": 0.08, "Date": 0.11, "Signal": 0.18, "Bet": 0.14,
-        "Target": 0.14, "Q": 0.06, "Value": 0.11, "z": 0.06, "Rule": 0.12
-    }
-    colWidths = [base_colwidths.get(lbl, 0.10) for lbl in col_labels]
+def _draw_table_in_axis(ax, title, col_labels, rows, fontsize=9):
+    ax.axis('off'); ax.set_title(title, fontsize=13, weight='bold', loc='left', pad=6)
+    base_w = {"Type":0.08,"Date":0.11,"Signal":0.18,"Bet":0.14,"Target":0.14,"Q":0.06,"Value":0.11,"z":0.06,"Rule":0.12}
+    colWidths = [base_w.get(lbl,0.10) for lbl in col_labels]
     s = sum(colWidths)
-    if s > 0.98:
-        colWidths = [w * 0.98 / s for w in colWidths]
-
-    table = ax.table(
-        cellText=rows,
-        colLabels=col_labels,
-        colWidths=colWidths,
-        loc='upper left',
-        cellLoc='left',
-        bbox=[0.0, 0.0, 1.0, 0.92]
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(fontsize)
-    table.scale(1.0, 1.15)
-
-    header_color = (0.9, 0.9, 0.92)
-    even_color   = (0.98, 0.98, 0.985)
-    odd_color    = (1.0, 1.0, 1.0)
-
-    for (row, col), cell in table.get_celld().items():
-        if row == 0:
-            cell.set_text_props(weight='bold', ha='left')
-            cell.set_facecolor(header_color)
-            cell.set_edgecolor('0.75')
-        else:
-            cell.set_edgecolor('0.85')
-            cell.set_facecolor(even_color if row % 2 == 0 else odd_color)
+    if s>0.98: colWidths = [w*0.98/s for w in colWidths]
+    tb = ax.table(cellText=rows, colLabels=col_labels, colWidths=colWidths,
+                  loc='upper left', cellLoc='left', bbox=[0.0, 0.0, 1.0, 0.92])
+    tb.auto_set_font_size(False); tb.set_fontsize(fontsize); tb.scale(1.0, 1.15)
+    header_color=(0.9,0.9,0.92); even=(0.98,0.98,0.985); odd=(1.0,1.0,1.0)
+    for (r,c), cell in tb.get_celld().items():
+        if r==0: cell.set_text_props(weight='bold', ha='left'); cell.set_facecolor(header_color); cell.set_edgecolor('0.75')
+        else:    cell.set_edgecolor('0.85'); cell.set_facecolor(even if r%2==0 else odd)
 
 def append_outlier_pages(outliers_pkl_path: str, pdf,
                          metrics=None, top_k: int = 3, tables_per_page: int = 3):
@@ -454,20 +780,16 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
             raise FileNotFoundError("Outliers PKL not found.")
         odf = pd.read_pickle(outliers_pkl_path)
     except Exception as e:
-        fig, ax = plt.subplots(figsize=(14, 4))
-        ax.axis('off')
+        fig, ax = plt.subplots(figsize=(14, 4)); ax.axis('off')
         fig.suptitle("Outlier Tables", fontsize=18, weight='bold')
         ax.text(0.5, 0.5, f"No outlier tables appended:\n{e}", ha='center', va='center', fontsize=12)
-        plt.tight_layout(); pdf.savefig(fig); plt.close()
-        return
+        savefig_white(pdf, fig); return
 
     if odf is None or len(odf) == 0:
-        fig, ax = plt.subplots(figsize=(14, 4))
-        ax.axis('off')
+        fig, ax = plt.subplots(figsize=(14, 4)); ax.axis('off')
         fig.suptitle("Outlier Tables", fontsize=18, weight='bold')
         ax.text(0.5, 0.5, "No outliers found.", ha='center', va='center', fontsize=12)
-        plt.tight_layout(); pdf.savefig(fig); plt.close()
-        return
+        savefig_white(pdf, fig); return
 
     odf = odf.copy()
     odf['date'] = pd.to_datetime(odf['date'], errors='coerce')
@@ -480,12 +802,10 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
     else:
         metrics = [m for m in metrics if m in odf['stat_type'].unique()]
         if not metrics:
-            fig, ax = plt.subplots(figsize=(14, 4))
-            ax.axis('off')
+            fig, ax = plt.subplots(figsize=(14, 4)); ax.axis('off')
             fig.suptitle("Outlier Tables", fontsize=18, weight='bold')
             ax.text(0.5, 0.5, "Selected outlier metrics not present in file.", fontsize=12)
-            plt.tight_layout(); pdf.savefig(fig); plt.close()
-            return
+            savefig_white(pdf, fig); return
 
     date_min = odf['date'].min()
     date_max = odf['date'].max()
@@ -493,485 +813,496 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
 
     tables = []
     for m in metrics:
-        labels_tbl, rows = _metric_table_rows(odf, m, top_k=top_k, have_z=have_z, have_rule=have_rule)
-        if labels_tbl is None or not rows:
-            continue
-        tables.append((m, labels_tbl, rows))
-    if not tables:
-        return
+        col_labels, rows = _metric_table_rows(odf, m, top_k=top_k, have_z=have_z, have_rule=have_rule)
+        if col_labels is None or not rows: continue
+        tables.append((m, col_labels, rows))
+    if not tables: return
 
     per_page = max(1, int(tables_per_page))
     for page_idx in range(0, len(tables), per_page):
         chunk = tables[page_idx:page_idx+per_page]
-
         fig = plt.figure(figsize=(14, 8.5))
         fig.suptitle("Outlier Tables", fontsize=18, weight='bold', y=0.985)
         if page_idx == 0:
             fig.text(0.03, 0.955, subtitle, ha='left', va='top', fontsize=11, color='0.25')
-
-        gs = GridSpec(
-            nrows=len(chunk), ncols=1, figure=fig,
-            left=0.03, right=0.97, top=0.90, bottom=0.06, hspace=0.35
-        )
-
-        for row_idx, (metric_name, labels_tbl, rows) in enumerate(chunk):
+        gs = GridSpec(nrows=len(chunk), ncols=1, figure=fig, left=0.03, right=0.97, top=0.90, bottom=0.06, hspace=0.35)
+        for row_idx, (metric_name, col_labels, rows) in enumerate(chunk):
             ax = fig.add_subplot(gs[row_idx, 0])
-            _draw_table_in_axis(
-                ax,
-                title=f"{metric_name} — Top {top_k} Highs & Lows",
-                col_labels=labels_tbl,
-                rows=rows,
-                fontsize=9
-            )
-
-        pdf.savefig(fig)
-        plt.close(fig)
+            _draw_table_in_axis(ax, title=f"{metric_name} — Top {top_k} Highs & Lows",
+                                col_labels=col_labels, rows=rows, fontsize=9)
+        savefig_white(pdf, fig)
 
 # =========================
-# Distribution helpers (sidecars) — FRETs + bet sizes
+# ---- DISTRIBUTIONS -------
+# (fret_* & betsize_* only)
 # =========================
-
-def _gather_sidecars(panel_dir):
-    return sorted(glob.glob(os.path.join(panel_dir, "panel_*.pkl")))
-
-def _infer_cols_from_sidecars(files, prefix, explicit_list):
-    """Return sorted list of columns matching prefix across sidecars, unless explicit_list is given."""
-    if explicit_list:
-        return [c for c in explicit_list]
-    cols = set()
-    for f in files:
-        try:
-            d = pd.read_pickle(f)
-        except Exception:
-            continue
-        cols |= {c for c in d.columns if str(c).startswith(prefix)}
-    return sorted(cols)
-
-def _concat_columns(files, col_list, max_samples=None):
-    """
-    Concatenate exactly the requested columns across all sidecars.
-    IMPORTANT: we always include ALL requested columns and fill missing with NaN,
-    so nothing disappears even if absent in some files.
-    """
-    if not col_list:
-        return pd.DataFrame()
-
-    parts = []
-    for f in files:
-        try:
-            d = pd.read_pickle(f)
-        except Exception:
-            continue
-
-        # Build a frame with ALL requested columns; fill missing with NaN
-        block = pd.DataFrame(index=np.arange(len(d)), columns=col_list, dtype=float)
-        for c in col_list:
-            if c in d.columns:
-                block[c] = pd.to_numeric(d[c], errors='coerce')
-        parts.append(block)
-
-    if not parts:
-        # Return a DF that still has the columns (so plotting shows "(no data)")
-        return pd.DataFrame(columns=col_list)
-
-    big = pd.concat(parts, axis=0, ignore_index=True)
-
-    # Drop rows where *all requested columns* are NaN; keep rows if any requested col has data
-    big = big.dropna(how='all', subset=col_list)
-
-    if (max_samples is not None) and (len(big) > max_samples):
-        big = big.sample(int(max_samples), random_state=42)
-
-    return big
+'''''
+def _collect_prefixed_series(df, prefix, cols=('stat_type','target','bet_size_col')):
+    """Scan df and gather value series where any of the listed columns starts with prefix."""
+    series_map = {}
+    for col in cols:
+        vals = df[col].dropna().astype(str)
+        tokens = sorted([t for t in vals.unique() if t.startswith(prefix)])
+        for tok in tokens:
+            s = df.loc[df[col]==tok, 'value']
+            s = pd.to_numeric(s, errors='coerce').dropna()
+            if s.empty: continue
+            series_map[tok] = (pd.concat([series_map[tok], s], ignore_index=True)
+                               if tok in series_map else s)
+    return series_map
 
 def _nice_grid(n):
     c = min(3, max(1, int(np.ceil(np.sqrt(n)))))
     r = int(np.ceil(n / c))
     return r, c
 
-def _plot_hist_percent(ax, x: pd.Series, bins=60, title="", label_min_pct=3.0):
-    """
-    Histogram where bar heights are percentages, with 1–99% clipping for scale.
-    Adds labels to bars with >= label_min_pct and mean/median guide lines.
-    """
-    x = pd.to_numeric(pd.Series(x), errors='coerce').dropna()
+def _plot_hist_percent(ax, x, bins=60, title="", label_min_pct=3.0):
+    # x = value, y = percent of values
+    x = pd.to_numeric(pd.Series(x), errors='coerce').replace([np.inf,-np.inf], np.nan).dropna()
     if x.empty:
         ax.set_title(f"{title} (no data)", fontsize=11)
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Percent of values")
         ax.yaxis.set_major_formatter(mtick.PercentFormatter())
         ax.grid(True, axis='y', linestyle='--', alpha=0.3)
-        ax.text(0.5, 0.5, "No data", transform=ax.transAxes, ha='center', va='center', fontsize=10, color='0.4')
+        ax.text(0.5,0.5,"No data", transform=ax.transAxes, ha='center', va='center', fontsize=10, color='0.4')
         return
-
-    p1, p99 = np.nanpercentile(x, [1, 99])
-    use_clip = np.isfinite(p1) and np.isfinite(p99) and p1 < p99
-    x_clip = x[(x >= p1) & (x <= p99)] if use_clip else x
-
+    p1,p99 = np.nanpercentile(x, [1,99])
+    x_clip = x[(x>=p1)&(x<=p99)] if np.isfinite(p1) and np.isfinite(p99) and p1<p99 else x
     edges = np.histogram_bin_edges(x_clip, bins=bins)
     counts, edges = np.histogram(x_clip, bins=edges)
-    total = max(len(x_clip), 1)
-    perc = counts * 100.0 / total
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    widths = np.diff(edges)
-
+    perc = counts * 100.0 / max(len(x_clip),1)
+    centers = 0.5*(edges[:-1]+edges[1:]); widths = np.diff(edges)
     bars = ax.bar(centers, perc, width=widths, align='center', alpha=0.9, edgecolor='white', linewidth=0.4)
-
-    for b, p in zip(bars, perc):
-        if p >= label_min_pct:
-            ax.text(b.get_x() + b.get_width()/2.0, p, f"{p:.0f}%", ha='center', va='bottom', fontsize=8)
-
-    mu = np.nanmean(x_clip)
-    med = np.nanmedian(x_clip)
-    ax.axvline(mu,  linestyle='--', linewidth=1.2, alpha=0.9)
+    for b,pct in zip(bars, perc):
+        if pct >= label_min_pct:
+            ax.text(b.get_x()+b.get_width()/2.0, pct, f"{pct:.0f}%", ha='center', va='bottom', fontsize=8)
+    mu = np.nanmean(x_clip); med = np.nanmedian(x_clip)
+    ax.axvline(mu, linestyle='--', linewidth=1.2, alpha=0.9)
     ax.axvline(med, linestyle=':',  linewidth=1.2, alpha=0.9)
     ax.text(mu, ax.get_ylim()[1]*0.95, "mean", rotation=90, va='top', ha='right', fontsize=8, alpha=0.8)
     ax.text(med, ax.get_ylim()[1]*0.95, "median", rotation=90, va='top', ha='left',  fontsize=8, alpha=0.8)
-
     ax.set_title(title, fontsize=11)
+    ax.set_xlabel("Value")
+    ax.set_ylabel("Percent of values")
     ax.yaxis.set_major_formatter(mtick.PercentFormatter())
     ax.grid(True, axis='y', linestyle='--', alpha=0.3)
-
-    if use_clip:
-        clipped_pct = (1.0 - len(x_clip) / len(x)) * 100.0
-        footer = f"N={len(x):,}  (clipped {clipped_pct:.1f}% to 1–99 pct)"
-    else:
-        footer = f"N={len(x):,}"
+    footer = (f"N={len(x):,}  (clipped {(1.0 - len(x_clip)/len(x))*100:.1f}% to 1–99 pct)"
+              if len(x_clip)!=len(x) else f"N={len(x):,}")
     ax.text(0.99, -0.12, footer, transform=ax.transAxes, ha='right', va='top', fontsize=8, color='0.35')
 
-def _render_distribution_block(pdf, title, files, requested_cols, bins, label_min_pct=3.0):
-    if not requested_cols:
-        fig, ax = plt.subplots(figsize=(12, 2.6))
-        ax.axis('off')
+def _render_distribution_block_series(pdf, title, series_map, bins, per_page=12, label_min_pct=3.0):
+    names = [n for n,s in series_map.items() if pd.Series(s).notna().any()]
+    if not names:
+        fig, ax = plt.subplots(figsize=(12, 2.6)); ax.axis('off')
         fig.suptitle(title, fontsize=14, weight='bold')
-        ax.text(0.03, 0.5, "No columns requested.", fontsize=11)
-        plt.tight_layout(); pdf.savefig(fig); plt.close(fig)
-        return
-
-    df = _concat_columns(files, requested_cols, max_samples=MAX_SAMPLES)
-    n = len(requested_cols)
-    r, c = _nice_grid(n)
-    fig, axes = plt.subplots(r, c, figsize=(5*c + 1.2, 3.6*r + 1.0))
-    axes = np.atleast_1d(axes).ravel()
-    fig.suptitle(title, fontsize=16, weight='bold', y=0.98)
-
-    for ax, col in zip(axes, requested_cols):
-        if (df is not None) and (col in df.columns):
-            _plot_hist_percent(ax, df[col], bins=bins, title=col, label_min_pct=label_min_pct)
-        else:
-            _plot_hist_percent(ax, pd.Series(dtype=float), bins=bins, title=col, label_min_pct=label_min_pct)
-
-    for j in range(n, len(axes)):
-        axes[j].axis('off')
-
-    plt.tight_layout(rect=[0, 0.02, 1, 0.96])
-    pdf.savefig(fig); plt.close(fig)
+        ax.text(0.03, 0.5, "No series found.", fontsize=11)
+        savefig_white(pdf, fig); return
+    for s in range(0, len(names), per_page):
+        chunk = names[s:s+per_page]
+        r, c = _nice_grid(len(chunk))
+        fig, axes = plt.subplots(r, c, figsize=(5*c + 1.2, 3.6*r + 1.0))
+        axes = np.atleast_1d(axes).ravel()
+        fig.suptitle(title, fontsize=16, weight='bold', y=0.98)
+        for ax, name in zip(axes, chunk):
+            _plot_hist_percent(ax, series_map[name], bins=bins, title=name, label_min_pct=label_min_pct)
+        for j in range(len(chunk), len(axes)): axes[j].axis('off')
+        plt.tight_layout(rect=[0, 0.02, 1, 0.96]); savefig_white(pdf, fig)
 
 def add_distribution_pages(pdf):
-    files = _gather_sidecars(PANEL_DAILY_DIR)
-    if not files:
-        fig, ax = plt.subplots(figsize=(12, 2.6))
-        ax.axis('off')
-        fig.suptitle("Distribution Plots", fontsize=14, weight='bold')
-        ax.text(0.03, 0.5, f"No sidecars found in {PANEL_DAILY_DIR}. Skipping distributions.", fontsize=11)
-        plt.tight_layout(); pdf.savefig(fig); plt.close(fig)
-        return
+    # Prefer raw rows if present (from daily_stats: stat_type in {'fret_value','betsize_value'})
+    st = stats_df['stat_type'].dropna().unique().tolist()
 
-    # Auto-discover lists if the user left them empty
-    fret_cols = _infer_cols_from_sidecars(files, "fret_", DIST_FRET_LIST)
-    bet_cols  = _infer_cols_from_sidecars(files, "betsize_", DIST_BET_LIST)
+    if 'fret_value' in st:
+        df_fret = stats_df[stats_df['stat_type']=='fret_value']
+        series_map_fret = _collect_prefixed_series(df_fret, 'fret_', cols=('target',))
+        title_fret = "Realized Return Distributions (fret_*) — raw values"
+    else:
+        series_map_fret = _collect_prefixed_series(stats_df, 'fret_', cols=('target',))
+        title_fret = "Realized Return Distributions (fret_*) — from DAILY_STATS"
 
-    # FRET distributions
-    _render_distribution_block(
-        pdf,
-        "Realized Return Distributions (fret_*)",
-        files,
-        fret_cols,
-        bins=DIST_BINS,
-        label_min_pct=3.0
-    )
+    _render_distribution_block_series(pdf, title_fret,
+                                      series_map_fret, bins=DIST_BINS, per_page=12, label_min_pct=3.0)
 
-    # Bet size distributions
-    _render_distribution_block(
-        pdf,
-        "Bet Size Distributions (betsize_*)",
-        files,
-        bet_cols,
-        bins=DIST_BINS,
-        label_min_pct=4.0
-    )
+    if 'betsize_value' in st:
+        df_bet = stats_df[stats_df['stat_type']=='betsize_value']
+        series_map_bet = _collect_prefixed_series(df_bet, 'betsize_', cols=('bet_size_col',))
+        title_bet = "Bet Size Distributions (betsize_*) — raw |bet|"
+    else:
+        series_map_bet = _collect_prefixed_series(stats_df, 'betsize_', cols=('bet_size_col',))
+        title_bet = "Bet Size Distributions (betsize_*) — from DAILY_STATS"
 
+    _render_distribution_block_series(pdf, title_bet,
+                                      series_map_bet, bins=DIST_BINS, per_page=12, label_min_pct=4.0)
+'''''
 # =========================
-# ---- BUILD THE PDF -------
+# ------- BUILD PDF -------
 # =========================
+
+# Resolve base fixed selections (initial)
+H2_TARGETS_RES = _resolve_fixed("H2_TARGETS", H2_TARGETS, stats_df['target'], prefer_prefix="fret_", top_k=1)
+H2_BETS_RES    = _resolve_fixed("H2_BETS",    H2_BETS,    stats_df['bet_size_col'], prefer_prefix="betsize_", top_k=1)
+H3_TARGETS_RES = _resolve_fixed("H3_TARGETS", H3_TARGETS, stats_df['target'], prefer_prefix="fret_", top_k=1)
+H3_BETS_RES    = _resolve_fixed("H3_BETS",    H3_BETS,    stats_df['bet_size_col'], prefer_prefix="betsize_", top_k=1)
 
 os.makedirs("output", exist_ok=True)
 with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
 
-    # -------- Bar Plots (from stats_df) --------
-    if BAR_PAGE_VARS:
-        page_levels = [LEVELS[var] for var in BAR_PAGE_VARS]
-        page_iter = list(product(*page_levels))
+    print(f"[INFO] Requested QR: {QR}")
+    print(f"[INFO] Using qranks in plots: {', '.join(qranks) or '(none)'}")
+    print(f"[INFO] Heatmap2 fixed (base): target={H2_TARGETS_RES} | bet={H2_BETS_RES}")
+    print(f"[INFO] Heatmap3 fixed (base): target={H3_TARGETS_RES} | bet={H3_BETS_RES}")
+    print(f"[INFO] Rolling windows — H1:{ROLL_H1_LINES}  H2:{ROLL_H2_LINES}  H3:{ROLL_H3_LINES}")
+    print(f"[INFO] Bottom windows — P&L|nrInstr:{ROLL_PNL_NRINSTR}  PPD|Notional:{ROLL_PPD_NOTIONAL}  PPT|Trades:{ROLL_PPT_TRADES}")
+    print(f"[INFO] Normalize-left-with-roll: {NORMALIZE_LEFT_WITH_ROLL}")
+
+    # ---------- Bar Plots (NO __ALL__) ----------
+    if all(PLOT_LEVELS[v] for v in BAR_PAGE_VARS):
+        page_iter = list(product(*[PLOT_LEVELS[v] for v in BAR_PAGE_VARS]))
     else:
-        page_iter = [()]
+        page_iter = []
 
     for page_vals in page_iter:
-        subset = stats_df.copy()
+        subset = stats_df_plot.copy()  # filtered (no __ALL__)
+        if qranks:
+            subset = subset[subset['qrank'].isin(qranks)]
         title_bits = []
         for var, val in zip(BAR_PAGE_VARS, page_vals):
-            subset = subset[subset[var] == val]
-            title_bits.append(f"{var}: {val}")
-
-        if subset.empty:
-            continue
+            subset = subset[subset[var]==val]; title_bits.append(f"{var}: {val}")
+        if subset.empty: continue
 
         if BAR_X_VARS:
             subset = subset.copy()
             subset['x_key'] = subset[BAR_X_VARS].astype(str).agg('|'.join, axis=1)
             x_levels = sorted(subset['x_key'].unique().tolist())
         else:
-            subset['x_key'] = "ALL"
-            x_levels = ["ALL"]
+            subset['x_key'] = "ALL"; x_levels = ["ALL"]
 
-        fig, axs = plt.subplots(len(metrics_to_plot), 1, figsize=(14, 2.7 * len(metrics_to_plot)))
-        if len(metrics_to_plot) == 1:
-            axs = [axs]
-        fig.suptitle(" | ".join(["Bar Plots"] + title_bits), fontsize=18, weight='bold')
+        fig, axs = plt.subplots(len(metrics_to_plot), 1, figsize=(14, 2.7*len(metrics_to_plot)))
+        axs = np.atleast_1d(axs)
+        fig.suptitle("Bar Plots | " + " | ".join(title_bits), fontsize=18, weight='bold')
 
         for i, metric in enumerate(metrics_to_plot):
             ax = axs[i]
-            data = subset[subset['stat_type'] == metric]
+            data = subset[subset['stat_type']==metric].copy()
             if data.empty:
-                ax.set_title(f"{metric}: no data")
-                ax.axis('off')
-                continue
+                ax.set_title(f"{metric}: no data"); ax.axis('off'); continue
 
-            pivot = data.pivot_table(index='x_key', columns='qrank', values='value',
-                                     aggfunc='mean', fill_value=0.0)
-            x = np.arange(len(x_levels))
-
-            use_q = [q for q in qranks if q in pivot.columns]
-            q_offsets_local = np.arange(-(len(use_q)-1)/2, (len(use_q)+1)/2) * bar_width if use_q else []
-
-            for j, qrank in enumerate(use_q):
-                values = pivot[qrank].reindex(x_levels).fillna(0.0).values
-                color = quantile_colors.get(qrank, 'gray')
-                ax.bar(x + q_offsets_local[j], values, width=bar_width, color=color, label=qrank)
+            if data['qrank'].notna().any():
+                pivot = data.pivot_table(index='x_key', columns='qrank', values='value',
+                                         aggfunc='mean', fill_value=np.nan)
+                use_q = [q for q in qranks if q in pivot.columns]
+                x = np.arange(len(x_levels))
+                plotted = False
+                if use_q:
+                    q_offsets = np.arange(-(len(use_q)-1)/2, (len(use_q)+1)/2) * bar_width
+                    for j, q in enumerate(use_q):
+                        vals = pd.to_numeric(pivot.get(q), errors='coerce').reindex(x_levels).astype(float)
+                        if vals.notna().any():
+                            ax.bar(x + q_offsets[j], vals.fillna(0.0).values,
+                                   width=bar_width, color=quantile_colors.get(q,'gray'), label=q)
+                            plotted = True
+                if plotted:
+                    ax.legend(title='Quantile (color)', bbox_to_anchor=(1.01,1), loc='upper left', fontsize=9)
+            else:
+                vals = (data.groupby('x_key')['value'].mean()).reindex(x_levels).fillna(0.0).values
+                ax.bar(np.arange(len(x_levels)), vals, width=bar_width, color='gray')
 
             ax.set_ylabel(metric)
-            ax.set_xticks(x)
+            ax.set_xticks(np.arange(len(x_levels)))
             ax.set_xticklabels([str(v) for v in x_levels], rotation=45, ha='right')
-            ax.grid(axis='y', linestyle='--', alpha=0.4)
-            if i == 0 and use_q:
-                ax.legend(title='Quantile (color)', bbox_to_anchor=(1.01, 1), loc='upper left', fontsize=9)
+            ax.grid(axis='y', linestyle='--', alpha=0.35)
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-        pdf.savefig(fig)
-        plt.close()
+        plt.tight_layout(rect=[0,0.03,1,0.97]); savefig_white(pdf, fig)
 
-    # =========================
-    # HEATMAPS (six total, after bar plots)
-    # =========================
-
-    # Heatmap 1 & 2 (side-by-side) — USE SIDECARS
-    H1, labels1, n_days1 = compute_heatmap1_alpha_space(
-        PANEL_DAILY_DIR, ALPHA_PREFIX, ALPHA_COLS_EXPLICIT
+    # ---------- HEATMAP 1 (ALPHA) — CROSS-SECTION AVERAGED OVER DAYS ----------
+    H1, labels1, n_days1 = compute_heatmap_daily_avg(
+        stats_df, ALPHAS, stat_type=H1_BASE_STAT, min_pairs=2, qfilter=qranks
     )
-    H2, labels2, n_days2 = compute_heatmap2_pnl_across_stocks_avg(
-        PANEL_DAILY_DIR, ALPHA_PREFIX, TARGET_COL_FOR_PNL, bet_col=BET_COL_FOR_PNL,
-        alpha_cols_explicit=ALPHA_COLS_EXPLICIT
-    )
-    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-    if H1 is None or labels1 is None or n_days1 == 0:
-        _placeholder(
-            axes[0],
-            "Heatmap 1 — Alpha Space",
-            f"Missing or insufficient sidecars in {PANEL_DAILY_DIR} "
-            f"(need per-stock alpha columns like '{ALPHA_PREFIX}*')."
+    k1 = len(labels1) if labels1 else 0
+    fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k1))
+    if H1 is None or n_days1 == 0:
+        ax.axis('off'); ax.set_title("Heatmap 1 — Alpha Cross-Section Corr (avg over days)", fontsize=13, weight='bold')
+        ax.text(0.5,0.5,"No sufficient daily cross-sections for alpha metric.\nTip: include ≥2 quantiles in QR.", ha='center', va='center')
+    else:
+        _plot_matrix_heatmap(
+            fig, ax, H1, labels1,
+            f"Heatmap 1 — Cross-section corr of daily {H1_BASE_STAT} (avg over {n_days1} days) [qranks={', '.join(qranks)}]",
+            vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
         )
-    else:
-        _plot_matrix_heatmap(fig, axes[0], H1, labels1,
-            f"Heatmap 1 — Alpha Space (Spearman across stocks; avg over {n_days1} days)")
-    if H2 is None or labels2 is None or n_days2 == 0:
-        msg = (f"Need per-stock target '{TARGET_COL_FOR_PNL}' in sidecars."
-               f"{'' if BET_COL_FOR_PNL is None else f' Optional bet: {BET_COL_FOR_PNL}.'}")
-        _placeholder(axes[1], "Heatmap 2 — PnL Space", msg)
-    else:
-        _plot_matrix_heatmap(fig, axes[1], H2, labels2,
-            f"Heatmap 2 — PnL Space (Spearman across stocks; avg over {n_days2} days)")
-    plt.tight_layout()
-    pdf.savefig(fig); plt.close(fig)
+    plt.tight_layout(); savefig_white(pdf, fig)
 
-    # Heatmaps 3–6 (2×2 grid): time corr of summed PnL per quantile — FROM stats_df
-    target_for_hmaps = targets[0] if targets else None
-    bet_for_hmaps    = bet_sizes[0] if bet_sizes else None
+    # Temporal plot for H1
+    if DO_TEMPORAL:
+        plot_cross_section_corr_lines(
+            pdf, stats_df, ALPHAS, stat_type=H1_BASE_STAT,
+            title_prefix=f"[H1] Alpha vs Alpha — Daily Cross-Section Corr",
+            smooth_window=int(ROLL_H1_LINES),
+            height=6.0, qfilter=qranks
+        )
 
-    H_time = []
-    L_time = []
-    if (target_for_hmaps is not None) and (bet_for_hmaps is not None):
-        for q in HEATMAP_QRANKS:
-            C, labels = compute_timecorr_from_daily_pkls(stats_df, target_for_hmaps, bet_for_hmaps, q)
-            H_time.append(C); L_time.append(labels)
-    else:
-        H_time = [None, None, None, None]; L_time = [None, None, None, None]
+    # ---------- Per-Quantile HEATMAPS 2 & 3 (and their temporal plots) ----------
+    for q in qranks:
+        q_masked_df = stats_df[stats_df['qrank'] == q].copy()
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    titles = [f"Heatmap 3 — {HEATMAP_QRANKS[0]}",
-              f"Heatmap 4 — {HEATMAP_QRANKS[1]}",
-              f"Heatmap 5 — {HEATMAP_QRANKS[2]}",
-              f"Heatmap 6 — {HEATMAP_QRANKS[3]}"]
-    for ax, C, labels, ttl in zip(axes.flatten(), H_time, L_time, titles):
-        if C is None or labels is None:
-            _placeholder(ax, ttl + " (PnL Time Corr)",
-                         "No data for chosen target/bet/qrank.\n"
-                         f"target={target_for_hmaps} | bet={bet_for_hmaps}")
+        # ---- Heatmap 2: Cross-section corr of PnL (daily avg), FIXED target/bet (ensure >=2 rows if AUTO) ----
+        df_q_pnl = q_masked_df[q_masked_df['stat_type']=='pnl']
+        t2, b2, msg2 = _ensure_min_cross_section(
+            df_q_pnl, H2_TARGETS_RES, H2_BETS_RES, H2_AUTO_TARGETS, H2_AUTO_BETS, min_rows=2
+        )
+        if msg2: print(msg2)
+        H2, labels2, n_days2 = compute_heatmap_daily_avg(
+            q_masked_df, ALPHAS, stat_type='pnl', min_pairs=2,
+            qfilter=[q], targets=t2, bets=b2
+        )
+        k2 = len(labels2) if labels2 else 0
+        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k2))
+        tdesc2 = f"target={', '.join(t2)}"
+        bdesc2 = f"bet={', '.join(b2)}"
+        if H2 is None or n_days2 == 0:
+            ax.axis('off'); ax.set_title(f"Heatmap 2 — PnL Cross-Section Corr (daily avg) [{q}] [{tdesc2} | {bdesc2}]",
+                                         fontsize=13, weight='bold')
+            ax.text(0.5,0.5,"No sufficient daily cross-sections for 'pnl' with fixed filters.", ha='center', va='center')
         else:
-            _plot_matrix_heatmap(fig, ax, C, labels,
-                                 f"{ttl} — PnL Time Corr | target={target_for_hmaps} | bet={bet_for_hmaps}",
-                                 vmin=-1, vmax=1, cmap='coolwarm')
-    plt.tight_layout()
-    pdf.savefig(fig); plt.close(fig)
+            _plot_matrix_heatmap(
+                fig, ax, H2, labels2,
+                f"Heatmap 2 — Cross-section corr of 'pnl' (avg over {n_days2} days) [{q}] [{tdesc2} | {bdesc2}]",
+                vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
+            )
+        plt.tight_layout(); savefig_white(pdf, fig)
 
-    # =========================
-    # DISTRIBUTION PAGES (FRETs + bet sizes)
-    # =========================
-    if RENDER_DISTRIBUTION_PAGES:
-        add_distribution_pages(pdf)
+        # Temporal lines for H2
+        if DO_TEMPORAL:
+            plot_cross_section_corr_lines(
+                pdf, q_masked_df, ALPHAS, stat_type='pnl',
+                title_prefix=f"[H2 | {q}] PnL vs PnL — Daily Cross-Section Corr",
+                smooth_window=int(ROLL_H2_LINES),
+                height=6.0, qfilter=[q], targets=t2, bets=b2
+            )
 
-    # =========================
-    # CUMULATIVE PAGES (from stats_df)
-    # =========================
-    for target in targets:
-        for signal in signals:
-            for bet_strategy in bet_sizes:
-                base_filter = (
-                    (stats_df['target'] == target) &
-                    (stats_df['signal'] == signal) &
-                    (stats_df['bet_size_col'] == bet_strategy)
-                )
-                if not base_filter.any():
-                    continue
+        # ---- Heatmap 3: TIME-SERIES corr of daily summed PnL (per-quantile), FIXED target/bet ----
+        C3, labels3, n_days3 = compute_timeseries_heatmap(
+            q_masked_df, ALPHAS, stat_type='pnl', min_days=5, agg='sum',
+            qfilter=[q], targets=H3_TARGETS_RES, bets=H3_BETS_RES
+        )
+        k3 = len(labels3) if labels3 else 0
+        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k3))
+        tdesc3 = f"target={', '.join(H3_TARGETS_RES)}"
+        bdesc3 = f"bet={', '.join(H3_BETS_RES)}"
+        if C3 is None or n_days3 < 5:
+            ax.axis('off'); ax.set_title(f"Heatmap 3 — PnL Time-Series Corr [{q}] [{tdesc3} | {bdesc3}]",
+                                         fontsize=13, weight='bold')
+            ax.text(0.5,0.5,"Not enough days (need ≥5) for time-series correlations.", ha='center', va='center')
+        else:
+            _plot_matrix_heatmap(
+                fig, ax, C3, labels3,
+                f"Heatmap 3 — corr of daily summed PnL across days (n_days={n_days3}) [{q}] [{tdesc3} | {bdesc3}]",
+                vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
+            )
+        plt.tight_layout(); savefig_white(pdf, fig)
 
-                def want(token: str):
-                    return token in CUM_SECTIONS
+        # Temporal lines for H3
+        if DO_TEMPORAL:
+            plot_pairwise_timecorr_lines(
+                pdf, q_masked_df, ALPHAS, stat_type='pnl',
+                title_prefix=f"[H3 | {q}] Alpha vs Alpha — Time correlation (P&L)",
+                window=int(ROLL_H3_LINES), height=6.0,
+                qfilter=[q], targets=H3_TARGETS_RES, bets=H3_BETS_RES, agg='sum'
+            )
 
-                # Pair 1: Cum PnL vs Daily nrInstr
-                want_left = want('pnl'); want_right = want('nrInstr')
-                if want_left or want_right:
-                    fig, ax = plt.subplots(figsize=(14, 5.8))
-                    title_bits = []
-                    if want_left: title_bits.append('Cum P&L (left, solid)')
-                    if want_right: title_bits.append('Daily nrInstr (right, dashed)')
-                    fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(title_bits),
+    # ---------- Distributions ----------
+    #add_distribution_pages(pdf)
+
+    # ---------- Bottom pages (NO __ALL__), overlay *selected* quantiles ----------
+    # roll_k_* behavior: 1 -> left series classic cumulative; right series daily
+    #                    >1 -> left series cumulative of rolling-normalized increments; right series rolling sums
+    rk_pnl  = None if int(ROLL_PNL_NRINSTR)  <= 1 else int(ROLL_PNL_NRINSTR)
+    rk_ppd  = None if int(ROLL_PPD_NOTIONAL) <= 1 else int(ROLL_PPD_NOTIONAL)
+    rk_ppt  = None if int(ROLL_PPT_TRADES)   <= 1 else int(ROLL_PPT_TRADES)
+
+    for target in plot_targets:
+        for signal in plot_signals:
+            for bet_strategy in plot_bets:
+                base = ((stats_df_plot['target']==target) &
+                        (stats_df_plot['signal']==signal) &
+                        (stats_df_plot['bet_size_col']==bet_strategy))
+                if not base.any(): continue
+
+                def want(tok): return tok in CUM_SECTIONS
+
+                # ----------------- PnL (left) vs nrInstr (right) -----------------
+                if want('pnl') or want('nrInstr'):
+                    fig, ax = plt.subplots(figsize=(14,5.8))
+
+                    left_title = (
+                        "Cum P&L"
+                        if (not NORMALIZE_LEFT_WITH_ROLL or rk_pnl is None)
+                        else f"Cum P&L per rolling {rk_pnl}D nrInstr"
+                    )
+                    right_title = "Daily nrInstr" if rk_pnl is None else f"Rolling {rk_pnl}D nrInstr"
+
+                    ttl = [t for t, ok in [
+                        (f"{left_title} (left, solid)", want('pnl')),
+                        (f"{right_title} (right, dashed)", want('nrInstr'))
+                    ] if ok]
+                    fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(ttl),
                                  fontsize=16, weight='bold')
-                    subset_pair1 = stats_df[base_filter & stats_df['stat_type'].isin(['pnl','nrInstr'])]
-                    ax_right = ax.twinx(); ax_right.grid(False)
 
-                    any_left=False; any_right=False
-                    for qrank in qranks:
-                        sub_q = subset_pair1[subset_pair1['qrank'] == qrank].sort_values('date')
-                        if sub_q.empty: continue
-                        color = quantile_colors.get(qrank, 'gray')
-                        if want_left:
-                            pnl = sub_q[sub_q['stat_type']=='pnl'][['date','value']]
-                            if not pnl.empty:
-                                ax.plot(pnl['date'], pnl['value'].cumsum(), color=color, linestyle=STYLE_FIRST, linewidth=1.8)
-                                any_left=True
-                        if want_right:
-                            nrin = sub_q[sub_q['stat_type']=='nrInstr'][['date','value']]
-                            if not nrin.empty:
-                                ax_right.plot(nrin['date'], nrin['value'], color=color, linestyle=STYLE_SECOND, linewidth=1.8)
-                                any_right=True
+                    sub = stats_df_plot[base & stats_df_plot['stat_type'].isin(['pnl','nrInstr'])]
+                    if qranks: sub = sub[sub['qrank'].isin(qranks)]
+                    ax_r = ax.twinx(); ax_r.grid(False)
+                    anyL=anyR=False
 
-                    if any_left: ax.set_ylabel("Cumulative P&L")
-                    if any_right: ax_right.set_ylabel("Daily nrInstr")
+                    for q in qranks:
+                        sq = sub[sub['qrank']==q].sort_values('date')
+                        if sq.empty: continue
+                        color = quantile_colors.get(q,'gray')
+
+                        pnl  = sq[sq['stat_type']=='pnl'][['date','value']].set_index('date')['value'].astype(float)
+                        nrin = sq[sq['stat_type']=='nrInstr'][['date','value']].set_index('date')['value'].astype(float)
+
+                        # LEFT: cumulative, optionally normalized by rolling nrInstr
+                        if want('pnl') and not pnl.empty:
+                            if NORMALIZE_LEFT_WITH_ROLL and rk_pnl is not None and not nrin.empty:
+                                denom = _roll_sum(nrin, rk_pnl)
+                                # zero contribution when denom<=0 or NaN
+                                contrib = np.where((denom > 0) & np.isfinite(denom), pnl/denom, 0.0)
+                                y = pd.Series(contrib, index=pnl.index).cumsum()
+                            else:
+                                y = pnl.cumsum()
+                            ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
+
+                        # RIGHT: daily or rolling nrInstr
+                        if want('nrInstr') and not nrin.empty:
+                            y2 = nrin if rk_pnl is None else _roll_sum(nrin, rk_pnl)
+                            ax_r.plot(y2.index, y2.values, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
+
+                    if anyL: ax.set_ylabel(left_title)
+                    if anyR: ax_r.set_ylabel(right_title)
                     _plot_date_axis(ax)
-                    style_descs = []
-                    if any_left: style_descs.append(('Cum P&L (left, solid)', STYLE_FIRST))
-                    if any_right: style_descs.append(('Daily nrInstr (right, dashed)', STYLE_SECOND))
-                    _add_dual_legends(ax, qranks, quantile_colors, style_descs)
-                    plt.tight_layout(); pdf.savefig(fig); plt.close()
+                    styles=[]
+                    if anyL: styles.append((f"{left_title} (left, solid)", STYLE_FIRST))
+                    if anyR: styles.append((f"{right_title} (right, dashed)", STYLE_SECOND))
+                    _add_dual_legends(ax, qranks, quantile_colors, styles)
+                    plt.tight_layout(); savefig_white(pdf, fig)
 
-                # Pair 2: Cum PPD vs Daily Notional
-                want_left = want('ppd'); want_right = want('sizeNotional')
-                if want_left or want_right:
-                    fig, ax = plt.subplots(figsize=(14, 5.8))
-                    title_bits = []
-                    if want_left: title_bits.append('Cum PPD (left, solid)')
-                    if want_right: title_bits.append('Daily Notional (right, dashed)')
-                    fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(title_bits),
+                # ----------------- PPD (left) vs Notional (right) -----------------
+                if want('ppd') or want('sizeNotional'):
+                    fig, ax = plt.subplots(figsize=(14,5.8))
+
+                    left_title = (
+                        "Cum PPD"
+                        if (not NORMALIZE_LEFT_WITH_ROLL or rk_ppd is None)
+                        else f"Cum (P&L / rolling {rk_ppd}D Notional)"
+                    )
+                    right_title = "Daily Notional" if rk_ppd is None else f"Rolling {rk_ppd}D Notional"
+
+                    ttl = [t for t, ok in [
+                        (f"{left_title} (left, solid)", want('ppd')),
+                        (f"{right_title} (right, dashed)", want('sizeNotional'))
+                    ] if ok]
+                    fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(ttl),
                                  fontsize=16, weight='bold')
-                    subset_pair2 = stats_df[base_filter & stats_df['stat_type'].isin(['pnl','sizeNotional'])]
-                    ax_right = ax.twinx(); ax_right.grid(False)
 
-                    any_left=False; any_right=False
-                    for qrank in qranks:
-                        sub_q = subset_pair2[subset_pair2['qrank'] == qrank]
-                        if sub_q.empty: continue
-                        color = quantile_colors.get(qrank, 'gray')
-                        merged = _merge_two_stats(sub_q, 'pnl', 'sizeNotional', 'pnl', 'notional')
-                        merged['cum_ppd'] = np.where(merged['cum_notional']>0, merged['cum_pnl']/merged['cum_notional'], np.nan)
-                        if want_left:
-                            ax.plot(merged['date'], merged['cum_ppd'], color=color, linestyle=STYLE_FIRST, linewidth=1.8)
-                            any_left=True
-                        if want_right:
-                            ax_right.plot(merged['date'], merged['notional'], color=color, linestyle=STYLE_SECOND, linewidth=1.8)
-                            any_right=True
+                    sub = stats_df_plot[base & stats_df_plot['stat_type'].isin(['pnl','sizeNotional'])]
+                    if qranks: sub = sub[sub['qrank'].isin(qranks)]
+                    ax_r = ax.twinx(); ax_r.grid(False)
+                    anyL=anyR=False
 
-                    if any_left: ax.set_ylabel("Cumulative PPD")
-                    if any_right: ax_right.set_ylabel("Daily Notional")
+                    for q in qranks:
+                        sq = sub[sub['qrank']==q]
+                        if sq.empty: continue
+                        color = quantile_colors.get(q,'gray')
+
+                        m = _merge_two_stats(sq, 'pnl', 'sizeNotional', 'pnl', 'notional')
+
+                        # LEFT: cumulative PPD variant (classic or rolling-normalized contributions)
+                        if want('ppd'):
+                            if NORMALIZE_LEFT_WITH_ROLL and rk_ppd is not None:
+                                rn = _roll_sum(m['notional'], rk_ppd)
+                                contrib = np.where((rn > 0) & np.isfinite(rn), m['pnl']/rn, 0.0)
+                                y = pd.Series(contrib, index=m['date']).cumsum()
+                            else:
+                                m['cum_ppd'] = np.where(m['cum_notional']>0, m['cum_pnl']/m['cum_notional'], np.nan)
+                                y = m.set_index('date')['cum_ppd'].fillna(method='ffill')
+                            ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
+
+                        # RIGHT: Notional (daily/rolling)
+                        if want('sizeNotional'):
+                            rn = m['notional'] if rk_ppd is None else _roll_sum(m['notional'], rk_ppd)
+                            ax_r.plot(m['date'], rn, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
+
+                    if anyL: ax.set_ylabel(left_title)
+                    if anyR: ax_r.set_ylabel(right_title)
                     _plot_date_axis(ax)
-                    style_descs = []
-                    if any_left: style_descs.append(('Cum PPD (left, solid)', STYLE_FIRST))
-                    if any_right: style_descs.append(('Daily Notional (right, dashed)', STYLE_SECOND))
-                    _add_dual_legends(ax, qranks, quantile_colors, style_descs)
-                    plt.tight_layout(); pdf.savefig(fig); plt.close()
+                    styles=[]
+                    if anyL: styles.append((f"{left_title} (left, solid)", STYLE_FIRST))
+                    if anyR: styles.append((f"{right_title} (right, dashed)", STYLE_SECOND))
+                    _add_dual_legends(ax, qranks, quantile_colors, styles)
+                    plt.tight_layout(); savefig_white(pdf, fig)
 
-                # Pair 3: Cum PPT vs Daily Trades
-                want_left = want('ppt'); want_right = want('n_trades')
-                if want_left or want_right:
-                    fig, ax = plt.subplots(figsize=(14, 5.8))
-                    title_bits = []
-                    if want_left: title_bits.append('Cum PPT (left, solid)')
-                    if want_right: title_bits.append('Daily Trades (right, dashed)')
-                    fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(title_bits),
+                # ----------------- PPT (left) vs Trades (right) -----------------
+                if want('ppt') or want('n_trades'):
+                    fig, ax = plt.subplots(figsize=(14,5.8))
+
+                    left_title = (
+                        "Cum PPT"
+                        if (not NORMALIZE_LEFT_WITH_ROLL or rk_ppt is None)
+                        else f"Cum (P&L / rolling {rk_ppt}D Trades)"
+                    )
+                    right_title = "Daily Trades" if rk_ppt is None else f"Rolling {rk_ppt}D Trades"
+
+                    ttl = [t for t, ok in [
+                        (f"{left_title} (left, solid)", want('ppt')),
+                        (f"{right_title} (right, dashed)", want('n_trades'))
+                    ] if ok]
+                    fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(ttl),
                                  fontsize=16, weight='bold')
-                    subset_pair3 = stats_df[base_filter & stats_df['stat_type'].isin(['pnl','n_trades'])]
-                    ax_right = ax.twinx(); ax_right.grid(False)
 
-                    any_left=False; any_right=False
-                    for qrank in qranks:
-                        sub_q = subset_pair3[subset_pair3['qrank'] == qrank].sort_values('date')
-                        if sub_q.empty: continue
-                        color = quantile_colors.get(qrank, 'gray')
-                        trades = sub_q[sub_q['stat_type']=='n_trades'][['date','value']].rename(columns={'value':'trades'})
-                        pnl = sub_q[sub_q['stat_type']=='pnl'][['date','value']].rename(columns={'value':'pnl'})
-                        merged = pd.merge(pnl, trades, on='date', how='outer').fillna(0.0).sort_values('date')
-                        merged['cum_pnl'] = merged['pnl'].cumsum()
-                        merged['cum_trades'] = merged['trades'].cumsum()
-                        merged['cum_ppt'] = np.where(merged['cum_trades']>0, merged['cum_pnl']/merged['cum_trades'], np.nan)
-                        if want_left:
-                            ax.plot(merged['date'], merged['cum_ppt'], color=color, linestyle=STYLE_FIRST, linewidth=1.8)
-                            any_left=True
-                        if want_right:
-                            ax_right.plot(merged['date'], merged['trades'], color=color, linestyle=STYLE_SECOND, linewidth=1.8)
-                            any_right=True
+                    sub = stats_df_plot[base & stats_df_plot['stat_type'].isin(['pnl','n_trades'])]
+                    if qranks: sub = sub[sub['qrank'].isin(qranks)]
+                    ax_r = ax.twinx(); ax_r.grid(False)
+                    anyL=anyR=False
 
-                    if any_left: ax.set_ylabel("Cumulative PPT")
-                    if any_right: ax_right.set_ylabel("Daily Trades")
+                    for q in qranks:
+                        sq = sub[sub['qrank']==q].sort_values('date')
+                        if sq.empty: continue
+                        color = quantile_colors.get(q,'gray')
+
+                        trades = sq[sq['stat_type']=='n_trades'][['date','value']].set_index('date')['value'].astype(float)
+                        pnl    = sq[sq['stat_type']=='pnl'][['date','value']].set_index('date')['value'].astype(float)
+
+                        # LEFT: cumulative PPT variant
+                        if want('ppt'):
+                            if NORMALIZE_LEFT_WITH_ROLL and rk_ppt is not None:
+                                rt = _roll_sum(trades, rk_ppt)
+                                contrib = np.where((rt > 0) & np.isfinite(rt), pnl/rt, 0.0)
+                                y = pd.Series(contrib, index=pnl.index).cumsum()
+                            else:
+                                cum_pnl = pnl.cumsum(); cum_tr = trades.cumsum()
+                                y = np.where(cum_tr>0, cum_pnl/cum_tr, np.nan)
+                                y = pd.Series(y, index=pnl.index).fillna(method='ffill')
+                            ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
+
+                        # RIGHT: Trades (daily/rolling)
+                        if want('n_trades') and not trades.empty:
+                            y2 = trades if rk_ppt is None else _roll_sum(trades, rk_ppt)
+                            ax_r.plot(y2.index, y2.values, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
+
+                    if anyL: ax.set_ylabel(left_title)
+                    if anyR: ax_r.set_ylabel(right_title)
                     _plot_date_axis(ax)
-                    style_descs = []
-                    if any_left: style_descs.append(('Cum PPT (left, solid)', STYLE_FIRST))
-                    if any_right: style_descs.append(('Daily Trades (right, dashed)', STYLE_SECOND))
-                    _add_dual_legends(ax, qranks, quantile_colors, style_descs)
-                    plt.tight_layout(); pdf.savefig(fig); plt.close()
+                    styles=[]
+                    if anyL: styles.append((f"{left_title} (left, solid)", STYLE_FIRST))
+                    if anyR: styles.append((f"{right_title} (right, dashed)", STYLE_SECOND))
+                    _add_dual_legends(ax, qranks, quantile_colors, styles)
+                    plt.tight_layout(); savefig_white(pdf, fig)
 
-    # =========================
-    # OUTLIER TABLE PAGES (last)
-    # =========================
+    # ---------- Outlier tables (last) ----------
     latest_outliers = _find_latest_outliers_pkl(OUTLIERS_DIR)
-    append_outlier_pages(
-        latest_outliers,
-        pdf,
-        metrics=OUTLIER_METRICS_FOR_TABLES,
-        top_k=OUTLIER_TOP_K,
-        tables_per_page=OUTLIER_TABLES_PER_PAGE
-    )
+    append_outlier_pages(latest_outliers, pdf,
+                         metrics=OUTLIER_METRICS_FOR_TABLES,
+                         top_k=OUTLIER_TOP_K,
+                         tables_per_page=OUTLIER_TABLES_PER_PAGE)
+
+print("✅ Saved to output/Quantile_Combined_Report.pdf")

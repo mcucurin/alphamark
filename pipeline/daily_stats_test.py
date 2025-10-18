@@ -90,6 +90,37 @@ def compute_daily_stats(
     # Clean but DO NOT drop rows globally (we'll drop per-need later)
     df = df.replace([np.inf, -np.inf], np.nan).copy()
 
+    # -------------------------------------------------------------------------
+    # RAW DISTRIBUTIONS (once per day; independent of quantile masks)
+    # -------------------------------------------------------------------------
+    if enable_distributions:
+        # --- FRET raw values (targets like "fret_*") ---
+        for target in target_cols:
+            if isinstance(target, str) and target.startswith('fret_') and target in df.columns:
+                y = pd.to_numeric(df[target], errors='coerce').to_numpy(float)
+                y = y[np.isfinite(y)]
+                if y.size:
+                    # sample down per day to avoid explosion
+                    if y.size > max_dist_samples_per_series:
+                        idx = rng.choice(y.size, size=max_dist_samples_per_series, replace=False)
+                        y = y[idx]
+                    # Store each value as its own "signal" to preserve multiplicity
+                    for i, val in enumerate(y):
+                        stats['fret_value'][f'__S{i:06d}']['__ALL__'][target]['__ALL__'] = float(val)
+
+        # --- Bet size raw values (abs bet sizes for each bet column) ---
+        for bet in bet_size_cols:
+            if bet in df.columns:
+                b = pd.to_numeric(df[bet], errors='coerce').to_numpy(float)
+                b = np.abs(b)
+                b = b[np.isfinite(b)]
+                if b.size:
+                    if b.size > max_dist_samples_per_series:
+                        idx = rng.choice(b.size, size=max_dist_samples_per_series, replace=False)
+                        b = b[idx]
+                    for i, val in enumerate(b):
+                        stats['betsize_value'][f'__B{i:06d}']['__ALL__']['__ALL__'][bet] = float(val)
+
     trades_cache = {}
 
     for signal in signal_cols:
