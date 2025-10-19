@@ -10,6 +10,9 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.gridspec import GridSpec
 from itertools import product, combinations
+import time
+
+start = time.perf_counter()
 
 # =====================================================
 # Clean white backgrounds everywhere (fixes gray pages)
@@ -69,11 +72,13 @@ ROLL_H3_LINES = 1
 # 1 = left series cumulative (Cum P&L / Cum PPD / Cum PPT) with daily right-axis
 # >1 = left series stays cumulative; each day's left increment is normalized by a rolling denominator,
 #      while the right-axis uses rolling sums over that window.
-ROLL_PNL_NRINSTR  = 30   # affects: left=P&L (cum or cum of PnL/roll nrInstr), right=nrInstr (daily/rolling)
+# NOTE: In the PnL vs nrInstr panel below, PnL is ALWAYS pure cumulative (never normalized).
+ROLL_PNL_NRINSTR  = 30   # affects: right=nrInstr (daily/rolling). Left PnL is never normalized.
 ROLL_PPD_NOTIONAL = 30   # affects: left=PPD (cum or cum of PnL/roll Notional), right=Notional (daily/rolling)
 ROLL_PPT_TRADES   = 30   # affects: left=PPT (cum or cum of PnL/roll Trades), right=Trades (daily/rolling)
 
 # Keep left series cumulative but let the rolling window normalize each daily increment (when window > 1).
+# NOTE: This flag has NO effect on the PnL vs nrInstr panel (PnL left stays pure cumulative).
 NORMALIZE_LEFT_WITH_ROLL = True
 
 # =========================
@@ -85,14 +90,15 @@ BAR_X_VARS    = ['target']                     # x-axis grouping
 
 metrics_to_plot = [
     'pnl','ppd','sharpe','hit_ratio','long_ratio',
-    'nrInstr','sizeNotional','r2','t_stat','n_trades','ppt','spearman','dcor'
+    'nrInstr','sizeNotional','r2','t_stat','n_trades','ppt','spearman'
+    #,'dcor'
 ]
 
 CUM_SECTIONS = ['pnl','ppd','sizeNotional','nrInstr','n_trades','ppt']
 
 # Outlier tables
 OUTLIERS_DIR                 = "output/OUTLIERS"
-OUTLIER_METRICS_FOR_TABLES   = ['pnl','ppd','sizeNotional','nrInstr','n_trades','ppt']
+OUTLIER_METRICS_FOR_TABLES   = ['pnl','ppd','ppt','sizeNotional','nrInstr','n_trades']
 OUTLIER_TOP_K                = 3
 OUTLIER_TABLES_PER_PAGE      = 3
 
@@ -371,20 +377,24 @@ def _add_dual_legends(ax, qranks, color_map, style_descs):
         style_handles = [Line2D([0],[0], color='gray', lw=2, linestyle=ls, label=lab) for (lab,ls) in style_descs]
         ax.legend(handles=style_handles, title='Series (style/axis)', loc='upper right', fontsize=9, frameon=True)
 
-def _heatmap_figure_size(k):
+def _heatmap_figure_size(k, widen=1.18, extra_height=0.0):
+    """
+    Make heatmaps a touch wider so long titles don't clip.
+    Height stays the same as before; width is scaled by `widen`.
+    """
     s = max(10, min(28, 0.6 * k + 8))
-    return (s, s)
+    return (s * widen, s + extra_height)
 
 def _plot_matrix_heatmap(fig, ax, M, labels, title, vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"):
     if M is None or labels is None or len(labels) == 0:
-        ax.axis('off'); ax.set_title(title, fontsize=13, weight='bold')
+        ax.axis('off'); ax.set_title(title, fontsize=13, weight='bold', wrap=True)
         ax.text(0.5,0.5,"No data",ha='center',va='center'); return
     k = len(labels)
     fs_labels = 9 if k <= 18 else (7 if k <= 30 else 6)
     fs_cells  = 8 if k <= 18 else (6 if k <= 30 else 5)
 
     im = ax.imshow(M, vmin=vmin, vmax=vmax, cmap='coolwarm', aspect='equal')
-    ax.set_title(title, fontsize=14, weight='bold', pad=10)
+    ax.set_title(title, fontsize=14, weight='bold', pad=12, wrap=True)
     ax.set_xticks(range(k)); ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=fs_labels)
     ax.set_yticks(range(k)); ax.set_yticklabels(labels, fontsize=fs_labels)
     ax.set_xlim(-0.5, k-0.5); ax.set_ylim(k-0.5, -0.5)
@@ -838,102 +848,7 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
 # =========================
 '''''
 def _collect_prefixed_series(df, prefix, cols=('stat_type','target','bet_size_col')):
-    """Scan df and gather value series where any of the listed columns starts with prefix."""
-    series_map = {}
-    for col in cols:
-        vals = df[col].dropna().astype(str)
-        tokens = sorted([t for t in vals.unique() if t.startswith(prefix)])
-        for tok in tokens:
-            s = df.loc[df[col]==tok, 'value']
-            s = pd.to_numeric(s, errors='coerce').dropna()
-            if s.empty: continue
-            series_map[tok] = (pd.concat([series_map[tok], s], ignore_index=True)
-                               if tok in series_map else s)
-    return series_map
-
-def _nice_grid(n):
-    c = min(3, max(1, int(np.ceil(np.sqrt(n)))))
-    r = int(np.ceil(n / c))
-    return r, c
-
-def _plot_hist_percent(ax, x, bins=60, title="", label_min_pct=3.0):
-    # x = value, y = percent of values
-    x = pd.to_numeric(pd.Series(x), errors='coerce').replace([np.inf,-np.inf], np.nan).dropna()
-    if x.empty:
-        ax.set_title(f"{title} (no data)", fontsize=11)
-        ax.set_xlabel("Value")
-        ax.set_ylabel("Percent of values")
-        ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-        ax.grid(True, axis='y', linestyle='--', alpha=0.3)
-        ax.text(0.5,0.5,"No data", transform=ax.transAxes, ha='center', va='center', fontsize=10, color='0.4')
-        return
-    p1,p99 = np.nanpercentile(x, [1,99])
-    x_clip = x[(x>=p1)&(x<=p99)] if np.isfinite(p1) and np.isfinite(p99) and p1<p99 else x
-    edges = np.histogram_bin_edges(x_clip, bins=bins)
-    counts, edges = np.histogram(x_clip, bins=edges)
-    perc = counts * 100.0 / max(len(x_clip),1)
-    centers = 0.5*(edges[:-1]+edges[1:]); widths = np.diff(edges)
-    bars = ax.bar(centers, perc, width=widths, align='center', alpha=0.9, edgecolor='white', linewidth=0.4)
-    for b,pct in zip(bars, perc):
-        if pct >= label_min_pct:
-            ax.text(b.get_x()+b.get_width()/2.0, pct, f"{pct:.0f}%", ha='center', va='bottom', fontsize=8)
-    mu = np.nanmean(x_clip); med = np.nanmedian(x_clip)
-    ax.axvline(mu, linestyle='--', linewidth=1.2, alpha=0.9)
-    ax.axvline(med, linestyle=':',  linewidth=1.2, alpha=0.9)
-    ax.text(mu, ax.get_ylim()[1]*0.95, "mean", rotation=90, va='top', ha='right', fontsize=8, alpha=0.8)
-    ax.text(med, ax.get_ylim()[1]*0.95, "median", rotation=90, va='top', ha='left',  fontsize=8, alpha=0.8)
-    ax.set_title(title, fontsize=11)
-    ax.set_xlabel("Value")
-    ax.set_ylabel("Percent of values")
-    ax.yaxis.set_major_formatter(mtick.PercentFormatter())
-    ax.grid(True, axis='y', linestyle='--', alpha=0.3)
-    footer = (f"N={len(x):,}  (clipped {(1.0 - len(x_clip)/len(x))*100:.1f}% to 1–99 pct)"
-              if len(x_clip)!=len(x) else f"N={len(x):,}")
-    ax.text(0.99, -0.12, footer, transform=ax.transAxes, ha='right', va='top', fontsize=8, color='0.35')
-
-def _render_distribution_block_series(pdf, title, series_map, bins, per_page=12, label_min_pct=3.0):
-    names = [n for n,s in series_map.items() if pd.Series(s).notna().any()]
-    if not names:
-        fig, ax = plt.subplots(figsize=(12, 2.6)); ax.axis('off')
-        fig.suptitle(title, fontsize=14, weight='bold')
-        ax.text(0.03, 0.5, "No series found.", fontsize=11)
-        savefig_white(pdf, fig); return
-    for s in range(0, len(names), per_page):
-        chunk = names[s:s+per_page]
-        r, c = _nice_grid(len(chunk))
-        fig, axes = plt.subplots(r, c, figsize=(5*c + 1.2, 3.6*r + 1.0))
-        axes = np.atleast_1d(axes).ravel()
-        fig.suptitle(title, fontsize=16, weight='bold', y=0.98)
-        for ax, name in zip(axes, chunk):
-            _plot_hist_percent(ax, series_map[name], bins=bins, title=name, label_min_pct=label_min_pct)
-        for j in range(len(chunk), len(axes)): axes[j].axis('off')
-        plt.tight_layout(rect=[0, 0.02, 1, 0.96]); savefig_white(pdf, fig)
-
-def add_distribution_pages(pdf):
-    # Prefer raw rows if present (from daily_stats: stat_type in {'fret_value','betsize_value'})
-    st = stats_df['stat_type'].dropna().unique().tolist()
-
-    if 'fret_value' in st:
-        df_fret = stats_df[stats_df['stat_type']=='fret_value']
-        series_map_fret = _collect_prefixed_series(df_fret, 'fret_', cols=('target',))
-        title_fret = "Realized Return Distributions (fret_*) — raw values"
-    else:
-        series_map_fret = _collect_prefixed_series(stats_df, 'fret_', cols=('target',))
-        title_fret = "Realized Return Distributions (fret_*) — from DAILY_STATS"
-
-    _render_distribution_block_series(pdf, title_fret,
-                                      series_map_fret, bins=DIST_BINS, per_page=12, label_min_pct=3.0)
-
-    if 'betsize_value' in st:
-        df_bet = stats_df[stats_df['stat_type']=='betsize_value']
-        series_map_bet = _collect_prefixed_series(df_bet, 'betsize_', cols=('bet_size_col',))
-        title_bet = "Bet Size Distributions (betsize_*) — raw |bet|"
-    else:
-        series_map_bet = _collect_prefixed_series(stats_df, 'betsize_', cols=('bet_size_col',))
-        title_bet = "Bet Size Distributions (betsize_*) — from DAILY_STATS"
-
-    _render_distribution_block_series(pdf, title_bet,
-                                      series_map_bet, bins=DIST_BINS, per_page=12, label_min_pct=4.0)
+    ...
 '''''
 # =========================
 # ------- BUILD PDF -------
@@ -954,7 +869,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
     print(f"[INFO] Heatmap3 fixed (base): target={H3_TARGETS_RES} | bet={H3_BETS_RES}")
     print(f"[INFO] Rolling windows — H1:{ROLL_H1_LINES}  H2:{ROLL_H2_LINES}  H3:{ROLL_H3_LINES}")
     print(f"[INFO] Bottom windows — P&L|nrInstr:{ROLL_PNL_NRINSTR}  PPD|Notional:{ROLL_PPD_NOTIONAL}  PPT|Trades:{ROLL_PPT_TRADES}")
-    print(f"[INFO] Normalize-left-with-roll: {NORMALIZE_LEFT_WITH_ROLL}")
+    print(f"[INFO] Note: PnL left axis is always pure cumulative; rolling applies only to the right-axis activity series.")
 
     # ---------- Bar Plots (NO __ALL__) ----------
     if all(PLOT_LEVELS[v] for v in BAR_PAGE_VARS):
@@ -1020,17 +935,18 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
         stats_df, ALPHAS, stat_type=H1_BASE_STAT, min_pairs=2, qfilter=qranks
     )
     k1 = len(labels1) if labels1 else 0
-    fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k1))
+    fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k1), constrained_layout=True)
     if H1 is None or n_days1 == 0:
-        ax.axis('off'); ax.set_title("Heatmap 1 — Alpha Cross-Section Corr (avg over days)", fontsize=13, weight='bold')
+        ax.axis('off'); ax.set_title("Heatmap 1 — Alpha Cross-Section Corr (avg over days)", fontsize=13, weight='bold', wrap=True)
         ax.text(0.5,0.5,"No sufficient daily cross-sections for alpha metric.\nTip: include ≥2 quantiles in QR.", ha='center', va='center')
     else:
         _plot_matrix_heatmap(
             fig, ax, H1, labels1,
-            f"Heatmap 1 — Cross-section corr of daily {H1_BASE_STAT} (avg over {n_days1} days) [qranks={', '.join(qranks)}]",
+            f"Heatmap 1 — Cross-section corr of daily alphas",
             vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
         )
-    plt.tight_layout(); savefig_white(pdf, fig)
+    # no tight_layout here; constrained_layout handles it
+    savefig_white(pdf, fig)
 
     # Temporal plot for H1
     if DO_TEMPORAL:
@@ -1056,20 +972,20 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             qfilter=[q], targets=t2, bets=b2
         )
         k2 = len(labels2) if labels2 else 0
-        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k2))
+        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k2), constrained_layout=True)
         tdesc2 = f"target={', '.join(t2)}"
         bdesc2 = f"bet={', '.join(b2)}"
         if H2 is None or n_days2 == 0:
             ax.axis('off'); ax.set_title(f"Heatmap 2 — PnL Cross-Section Corr (daily avg) [{q}] [{tdesc2} | {bdesc2}]",
-                                         fontsize=13, weight='bold')
+                                         fontsize=13, weight='bold', wrap=True)
             ax.text(0.5,0.5,"No sufficient daily cross-sections for 'pnl' with fixed filters.", ha='center', va='center')
         else:
             _plot_matrix_heatmap(
                 fig, ax, H2, labels2,
-                f"Heatmap 2 — Cross-section corr of 'pnl' (avg over {n_days2} days) [{q}] [{tdesc2} | {bdesc2}]",
+                f"Heatmap 2 — Cross-section corr of daily PnLs [{q}] [{tdesc2} | {bdesc2}]",
                 vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
             )
-        plt.tight_layout(); savefig_white(pdf, fig)
+        savefig_white(pdf, fig)
 
         # Temporal lines for H2
         if DO_TEMPORAL:
@@ -1086,20 +1002,20 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             qfilter=[q], targets=H3_TARGETS_RES, bets=H3_BETS_RES
         )
         k3 = len(labels3) if labels3 else 0
-        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k3))
+        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k3), constrained_layout=True)
         tdesc3 = f"target={', '.join(H3_TARGETS_RES)}"
         bdesc3 = f"bet={', '.join(H3_BETS_RES)}"
         if C3 is None or n_days3 < 5:
             ax.axis('off'); ax.set_title(f"Heatmap 3 — PnL Time-Series Corr [{q}] [{tdesc3} | {bdesc3}]",
-                                         fontsize=13, weight='bold')
+                                         fontsize=13, weight='bold', wrap=True)
             ax.text(0.5,0.5,"Not enough days (need ≥5) for time-series correlations.", ha='center', va='center')
         else:
             _plot_matrix_heatmap(
                 fig, ax, C3, labels3,
-                f"Heatmap 3 — corr of daily summed PnL across days (n_days={n_days3}) [{q}] [{tdesc3} | {bdesc3}]",
+                f"Heatmap 3 — corr of daily summed PnL across days [{q}] [{tdesc3} | {bdesc3}]",
                 vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
             )
-        plt.tight_layout(); savefig_white(pdf, fig)
+        savefig_white(pdf, fig)
 
         # Temporal lines for H3
         if DO_TEMPORAL:
@@ -1114,8 +1030,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
     #add_distribution_pages(pdf)
 
     # ---------- Bottom pages (NO __ALL__), overlay *selected* quantiles ----------
-    # roll_k_* behavior: 1 -> left series classic cumulative; right series daily
-    #                    >1 -> left series cumulative of rolling-normalized increments; right series rolling sums
     rk_pnl  = None if int(ROLL_PNL_NRINSTR)  <= 1 else int(ROLL_PNL_NRINSTR)
     rk_ppd  = None if int(ROLL_PPD_NOTIONAL) <= 1 else int(ROLL_PPD_NOTIONAL)
     rk_ppt  = None if int(ROLL_PPT_TRADES)   <= 1 else int(ROLL_PPT_TRADES)
@@ -1130,53 +1044,33 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
 
                 def want(tok): return tok in CUM_SECTIONS
 
-                # ----------------- PnL (left) vs nrInstr (right) -----------------
+                # ----------------- PnL vs nrInstr -----------------
                 if want('pnl') or want('nrInstr'):
                     fig, ax = plt.subplots(figsize=(14,5.8))
-
-                    left_title = (
-                        "Cum P&L"
-                        if (not NORMALIZE_LEFT_WITH_ROLL or rk_pnl is None)
-                        else f"Cum P&L per rolling {rk_pnl}D nrInstr"
-                    )
+                    left_title  = "Cum P&L"
                     right_title = "Daily nrInstr" if rk_pnl is None else f"Rolling {rk_pnl}D nrInstr"
-
                     ttl = [t for t, ok in [
                         (f"{left_title} (left, solid)", want('pnl')),
                         (f"{right_title} (right, dashed)", want('nrInstr'))
                     ] if ok]
                     fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(ttl),
                                  fontsize=16, weight='bold')
-
                     sub = stats_df_plot[base & stats_df_plot['stat_type'].isin(['pnl','nrInstr'])]
                     if qranks: sub = sub[sub['qrank'].isin(qranks)]
                     ax_r = ax.twinx(); ax_r.grid(False)
                     anyL=anyR=False
-
                     for q in qranks:
                         sq = sub[sub['qrank']==q].sort_values('date')
                         if sq.empty: continue
                         color = quantile_colors.get(q,'gray')
-
                         pnl  = sq[sq['stat_type']=='pnl'][['date','value']].set_index('date')['value'].astype(float)
                         nrin = sq[sq['stat_type']=='nrInstr'][['date','value']].set_index('date')['value'].astype(float)
-
-                        # LEFT: cumulative, optionally normalized by rolling nrInstr
                         if want('pnl') and not pnl.empty:
-                            if NORMALIZE_LEFT_WITH_ROLL and rk_pnl is not None and not nrin.empty:
-                                denom = _roll_sum(nrin, rk_pnl)
-                                # zero contribution when denom<=0 or NaN
-                                contrib = np.where((denom > 0) & np.isfinite(denom), pnl/denom, 0.0)
-                                y = pd.Series(contrib, index=pnl.index).cumsum()
-                            else:
-                                y = pnl.cumsum()
+                            y = pnl.cumsum()
                             ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
-
-                        # RIGHT: daily or rolling nrInstr
                         if want('nrInstr') and not nrin.empty:
                             y2 = nrin if rk_pnl is None else _roll_sum(nrin, rk_pnl)
                             ax_r.plot(y2.index, y2.values, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
-
                     if anyL: ax.set_ylabel(left_title)
                     if anyR: ax_r.set_ylabel(right_title)
                     _plot_date_axis(ax)
@@ -1186,37 +1080,30 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                     _add_dual_legends(ax, qranks, quantile_colors, styles)
                     plt.tight_layout(); savefig_white(pdf, fig)
 
-                # ----------------- PPD (left) vs Notional (right) -----------------
+                # ----------------- PPD vs Notional -----------------
                 if want('ppd') or want('sizeNotional'):
                     fig, ax = plt.subplots(figsize=(14,5.8))
-
                     left_title = (
                         "Cum PPD"
                         if (not NORMALIZE_LEFT_WITH_ROLL or rk_ppd is None)
-                        else f"Cum (P&L / rolling {rk_ppd}D Notional)"
+                        else f"Cum PPD (P&L / rolling {rk_ppd}D Notional)"
                     )
                     right_title = "Daily Notional" if rk_ppd is None else f"Rolling {rk_ppd}D Notional"
-
                     ttl = [t for t, ok in [
                         (f"{left_title} (left, solid)", want('ppd')),
                         (f"{right_title} (right, dashed)", want('sizeNotional'))
                     ] if ok]
                     fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(ttl),
                                  fontsize=16, weight='bold')
-
                     sub = stats_df_plot[base & stats_df_plot['stat_type'].isin(['pnl','sizeNotional'])]
                     if qranks: sub = sub[sub['qrank'].isin(qranks)]
                     ax_r = ax.twinx(); ax_r.grid(False)
                     anyL=anyR=False
-
                     for q in qranks:
                         sq = sub[sub['qrank']==q]
                         if sq.empty: continue
                         color = quantile_colors.get(q,'gray')
-
                         m = _merge_two_stats(sq, 'pnl', 'sizeNotional', 'pnl', 'notional')
-
-                        # LEFT: cumulative PPD variant (classic or rolling-normalized contributions)
                         if want('ppd'):
                             if NORMALIZE_LEFT_WITH_ROLL and rk_ppd is not None:
                                 rn = _roll_sum(m['notional'], rk_ppd)
@@ -1226,12 +1113,9 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                                 m['cum_ppd'] = np.where(m['cum_notional']>0, m['cum_pnl']/m['cum_notional'], np.nan)
                                 y = m.set_index('date')['cum_ppd'].fillna(method='ffill')
                             ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
-
-                        # RIGHT: Notional (daily/rolling)
                         if want('sizeNotional'):
                             rn = m['notional'] if rk_ppd is None else _roll_sum(m['notional'], rk_ppd)
                             ax_r.plot(m['date'], rn, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
-
                     if anyL: ax.set_ylabel(left_title)
                     if anyR: ax_r.set_ylabel(right_title)
                     _plot_date_axis(ax)
@@ -1241,54 +1125,48 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                     _add_dual_legends(ax, qranks, quantile_colors, styles)
                     plt.tight_layout(); savefig_white(pdf, fig)
 
-                # ----------------- PPT (left) vs Trades (right) -----------------
+                # ----------------- PPT vs Trades -----------------
                 if want('ppt') or want('n_trades'):
                     fig, ax = plt.subplots(figsize=(14,5.8))
-
                     left_title = (
                         "Cum PPT"
                         if (not NORMALIZE_LEFT_WITH_ROLL or rk_ppt is None)
-                        else f"Cum (P&L / rolling {rk_ppt}D Trades)"
+                        else f"Cum PPT (P&L / rolling {rk_ppt}D Trades)"
                     )
                     right_title = "Daily Trades" if rk_ppt is None else f"Rolling {rk_ppt}D Trades"
-
                     ttl = [t for t, ok in [
                         (f"{left_title} (left, solid)", want('ppt')),
                         (f"{right_title} (right, dashed)", want('n_trades'))
                     ] if ok]
                     fig.suptitle(f"{target} | {signal} | {bet_strategy}\n" + " vs ".join(ttl),
                                  fontsize=16, weight='bold')
-
                     sub = stats_df_plot[base & stats_df_plot['stat_type'].isin(['pnl','n_trades'])]
                     if qranks: sub = sub[sub['qrank'].isin(qranks)]
                     ax_r = ax.twinx(); ax_r.grid(False)
                     anyL=anyR=False
-
                     for q in qranks:
                         sq = sub[sub['qrank']==q].sort_values('date')
                         if sq.empty: continue
                         color = quantile_colors.get(q,'gray')
-
                         trades = sq[sq['stat_type']=='n_trades'][['date','value']].set_index('date')['value'].astype(float)
                         pnl    = sq[sq['stat_type']=='pnl'][['date','value']].set_index('date')['value'].astype(float)
-
-                        # LEFT: cumulative PPT variant
                         if want('ppt'):
                             if NORMALIZE_LEFT_WITH_ROLL and rk_ppt is not None:
                                 rt = _roll_sum(trades, rk_ppt)
-                                contrib = np.where((rt > 0) & np.isfinite(rt), pnl/rt, 0.0)
-                                y = pd.Series(contrib, index=pnl.index).cumsum()
+                                rt = rt.reindex(pnl.index)
+                                contrib = pd.Series(0.0, index=pnl.index)
+                                mask = (rt > 0) & rt.notna() & pnl.notna()
+                                contrib[mask] = pnl[mask] / rt[mask]
+                                y = contrib.cumsum()
                             else:
-                                cum_pnl = pnl.cumsum(); cum_tr = trades.cumsum()
-                                y = np.where(cum_tr>0, cum_pnl/cum_tr, np.nan)
-                                y = pd.Series(y, index=pnl.index).fillna(method='ffill')
+                                cum_pnl = pnl.cumsum()
+                                cum_tr  = trades.cumsum().reindex(cum_pnl.index).ffill()
+                                ratio   = np.where((cum_tr > 0) & np.isfinite(cum_tr), cum_pnl / cum_tr, np.nan)
+                                y = pd.Series(ratio, index=cum_pnl.index).ffill()
                             ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
-
-                        # RIGHT: Trades (daily/rolling)
                         if want('n_trades') and not trades.empty:
                             y2 = trades if rk_ppt is None else _roll_sum(trades, rk_ppt)
                             ax_r.plot(y2.index, y2.values, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
-
                     if anyL: ax.set_ylabel(left_title)
                     if anyR: ax_r.set_ylabel(right_title)
                     _plot_date_axis(ax)
@@ -1306,3 +1184,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                          tables_per_page=OUTLIER_TABLES_PER_PAGE)
 
 print("✅ Saved to output/Quantile_Combined_Report.pdf")
+
+end = time.perf_counter()
+print(f"Time taken: {end - start} seconds")

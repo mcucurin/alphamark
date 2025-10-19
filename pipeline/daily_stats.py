@@ -1,19 +1,25 @@
 # =============================
-# daily_stats.py (updated)
+# daily_stats.py (fast, safe)
 # =============================
+from __future__ import annotations
+
 import os
 import pickle
 import numpy as np
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence
 from collections import defaultdict
 
+# -----------------------------------------------------------------------------
+# Nested metrics store:
+# stats[stat_type][signal][qrank][target][bet] -> value
+# -----------------------------------------------------------------------------
 def create_5d_stats():
-    # stats[stat_type][signal][qrank][target][bet] -> value
     return defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(dict))))
 
 # -----------------------------------------------------------------------------
 # GLOBAL PERSISTENT STATE (kept in-memory + optional on-disk persistence)
 # -----------------------------------------------------------------------------
-_GLOBAL_PREV_STATE = {}
+_GLOBAL_PREV_STATE: Dict = {}
 
 def get_trading_state():
     return _GLOBAL_PREV_STATE
@@ -21,8 +27,6 @@ def get_trading_state():
 def reset_trading_state():
     """No-op to avoid unintended resets; kept for API compatibility."""
     pass
-
-# ---- Persistence helpers (optional) ----
 
 def save_trading_state(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -42,17 +46,20 @@ def load_trading_state(path: str, strict: bool=False):
 
 # ========================= DAILY (single-date snapshot) =======================
 
+def _label_for_quantile(q: float) -> str:
+    return f'qr_{int(round(q * 100))}'
+
 def compute_daily_stats(
     df,
-    signal_cols,
-    target_cols,
-    quantiles=[1.0, 0.75, 0.5, 0.25],
-    bet_size_cols=['betsize_equal'],
-    prev_state=None,
-    type_quantile='cumulative',  # 'cumulative' (>=thr) or 'quantEach' (bucket)
+    signal_cols: Sequence[str],
+    target_cols: Sequence[str],
+    quantiles: Sequence[float] = (1.0, 0.75, 0.5, 0.25),
+    bet_size_cols: Sequence[str] = ('betsize_equal',),
+    prev_state: MutableMapping | None = None,
+    type_quantile: str = 'cumulative',  # 'cumulative' (>=thr) or 'quantEach' (bucket)
     # ---- RAW distribution rows (for plotting histograms) ----
-    enable_distributions=True,
-    max_dist_samples_per_series=50000,  # cap per day per series (fret_* and each betsize_*)
+    enable_distributions: bool = False,
+    max_dist_samples_per_series: int = 50_000,
     random_state=None,
 ):
     """
@@ -63,13 +70,6 @@ def compute_daily_stats(
 
     Alpha metric stored once per (signal, qrank) under target='__ALL__', bet='__ALL__':
       - alpha_sum : sum(signal) over the selected quantile (signed)
-
-    RAW SERIES for histograms (added once per day; NOT tied to quantiles):
-      - stat_type='fret_value'    with target='fret_*',  signal='__S######', qrank='__ALL__', bet='__ALL__', value=raw fret
-      - stat_type='betsize_value' with bet_size_col name in 'bet', signal='__B######', qrank='__ALL__', target='__ALL__', value=|bet|
-
-    Continuity: pass the same `prev_state` dict across all days/years.
-    If None, a process-global dict `_GLOBAL_PREV_STATE` is used.
 
     nrInstr:
       Count of instruments with finite and non-zero s_i within the quantile portfolio,
@@ -84,156 +84,248 @@ def compute_daily_stats(
     if prev_state is None:
         prev_state = _GLOBAL_PREV_STATE
 
-    # instrument id (optional, for exact trade counting)
+    # ----------------------------
+    # Column preparation (FAST)
+    # ----------------------------
+    # Identify instrument id (optional, for exact trade counting)
     id_col = 'ticker' if 'ticker' in df.columns else None
 
-    # Clean but DO NOT drop rows globally (we'll drop per-need later)
-    df = df.replace([np.inf, -np.inf], np.nan).copy()
+    # Convert only numeric metric columns to float64 once; exclude the ID column.
+    want_numeric = (set(signal_cols) | set(target_cols) | set(bet_size_cols)) - ({id_col} if id_col else set())
+    df_np: Dict[str, np.ndarray] = {}
 
-    trades_cache = {}
+    for col in want_numeric:
+        if col not in df.columns:
+            continue
+        # Force float64 so we can safely assign NaN; then scrub non-finite.
+        arr = pd.to_numeric(df[col], errors='coerce').to_numpy()
+        arr = arr.astype('float64', copy=False)
+        # Replace +/-inf with NaN (and keep existing NaNs)
+        arr[~np.isfinite(arr)] = np.nan
+        df_np[col] = arr
 
+    # Keep the instrument IDs as-is (object/str); do NOT coerce to numeric.
+    id_arr = df[id_col].to_numpy() if id_col else None
+
+    n = len(df)
+    if n == 0:
+        return stats
+
+    # Precompute absolute bet arrays
+    bet_abs: Dict[str, np.ndarray] = {}
+    for b in bet_size_cols:
+        if b in df_np:
+            bet_abs[b] = np.abs(df_np[b])
+        else:
+            bet_abs[b] = np.full(n, np.nan, dtype='float64')
+
+    # ----------------------------
+    # Main loops (signals -> q -> bets -> targets)
+    # ----------------------------
     for signal in signal_cols:
-        if signal not in df.columns:
+        if signal not in df_np:
             continue
 
-        s_all = df[signal].to_numpy(float)  # raw signal vector (can be signed)
-        m_fin = np.isfinite(s_all)
-        sabs_all = np.abs(s_all[m_fin])
-        if sabs_all.size == 0:
+        s = df_np[signal]                              # float64
+        m_s_fin = np.isfinite(s)
+        if not m_s_fin.any():
             continue
 
-        # thresholds/buckets for this signal on this day
-        day_thresholds = {f'qr_{int(q*100)}': np.nanquantile(sabs_all, 1.0 - q) for q in quantiles}
-        if type_quantile == 'quantEach':
+        s_abs = np.abs(s[m_s_fin])
+        if s_abs.size == 0:
+            continue
+
+        # Prepare quantile logic for this signal/day
+        if type_quantile == 'cumulative':
+            # thresholds dict: qlabel -> cut
+            thresholds = {
+                _label_for_quantile(q): float(np.nanquantile(s_abs, 1.0 - q))
+                for q in quantiles
+            }
+            # Edges unused in cumulative mode
+            edges = None
+        else:
+            # quantEach: split |s| into K equal buckets
             K = len(quantiles)
-            probs = [i / K for i in range(K + 1)]
-            edges = np.nanquantile(sabs_all, probs)
+            probs = np.linspace(0.0, 1.0, K + 1, dtype='float64')
+            edges = np.nanquantile(s_abs, probs)
+            thresholds = None  # unused
 
-        for bet in bet_size_cols:
-            if bet not in df.columns:
+        # Cache sign(s) for PnL
+        sgn = np.sign(s)
+
+        # We will store alpha_sum once per (signal, qlabel)
+        alpha_written = set()
+
+        # Iterate quantiles in the given order
+        for q in quantiles:
+            qlabel = _label_for_quantile(q)
+
+            if type_quantile == 'cumulative':
+                thr = thresholds[qlabel]
+                # mask_q: finite s and abs(s) >= thr
+                # NOTE: include zeros only if thr==0 (rare); consistent with original.
+                mask_q = m_s_fin & (np.abs(s) >= thr)
+            else:
+                # 'quantEach' — place into K buckets; this q is bucket j
+                j = quantiles.index(q) + 1  # 1..K
+                lo, hi = edges[j-1], edges[j]
+                mask_q = m_s_fin & (np.abs(s) >= lo) & (np.abs(s) <= hi)
+
+            if not mask_q.any():
                 continue
 
-            for q in quantiles:
-                qlabel = f'qr_{int(q*100)}'
-                if type_quantile == 'cumulative':
-                    mask = m_fin & (np.abs(s_all) >= day_thresholds[qlabel])
-                else:  # 'quantEach'
-                    j = quantiles.index(q) + 1
-                    lo, hi = edges[j-1], edges[j]
-                    mask = m_fin & (np.abs(s_all) >= lo) & (np.abs(s_all) <= hi)
+            # -------- alpha_sum (store once per (signal, q)) --------
+            if qlabel not in alpha_written:
+                alpha_sum_today = float(np.nansum(s[mask_q]))
+                stats['alpha_sum'][signal][qlabel]['__ALL__']['__ALL__'] = alpha_sum_today
+                alpha_written.add(qlabel)
 
-                if not np.any(mask):
+            # -------- nrInstr (bet-independent) --------
+            m_nz = mask_q & (s != 0.0)
+            if id_arr is not None:
+                # unique instrument count among non-zero positions
+                nr_instr_today = int(pd.Series(id_arr[m_nz]).dropna().nunique())
+            else:
+                nr_instr_today = int(np.sum(m_nz))
+
+            # ----------------------------
+            # Per-bet work (trades, sizeNotional part of PPD/PPT)
+            # ----------------------------
+            for bet in bet_size_cols:
+                b = bet_abs.get(bet)
+                if b is None:
                     continue
 
-                # -------- alpha_sum (stored once per (signal,q)) --------
-                alpha_sum_today = float(np.nansum(s_all[mask]))  # sum alpha (signed)
-                stats['alpha_sum'][signal][qlabel]['__ALL__']['__ALL__'] = alpha_sum_today
+                b_fin = np.isfinite(b)
+                mask_qb = mask_q & b_fin
 
-                # -------- nrInstr (bet-independent) --------
-                m_nz = mask & (s_all != 0.0)
-                if id_col:
-                    nr_instr_today = int(df.loc[m_nz, id_col].dropna().nunique())
-                else:
-                    nr_instr_today = int(np.sum(m_nz))
-
-                # -------- base arrays for trade counting (needs bet) --------
-                base_cols = [signal, bet] + ([id_col] if id_col else [])
-                sub_base = df.loc[mask, base_cols].dropna(how='any')
-                if not sub_base.empty:
-                    s_base = sub_base[signal].to_numpy(float)
-                    b_abs  = np.abs(sub_base[bet].to_numpy(float))
-                    ids    = sub_base[id_col].to_numpy() if id_col else None
-                else:
-                    s_base = np.array([], float)
-                    b_abs  = np.array([], float)
-                    ids    = None
-
+                # ---- Trades counting (exact with IDs, fallback proxy) ----
                 key_sb = (signal, qlabel, bet)
-                if key_sb not in trades_cache:
-                    Bt_today = float(b_abs.sum()) if b_abs.size else 0.0
-                    mean_bet = float(np.nanmean(b_abs)) if b_abs.size else 0.0
+                prev = prev_state.get(key_sb, {})
 
-                    prev = prev_state.get(key_sb, {})
-                    prev_Bt = prev.get('Bt', np.nan)
-                    prev_mb = prev.get('mean_bet', np.nan)
+                if id_arr is not None:
+                    # exact: build today's pos per instrument within the quantile
+                    pos_today = (sgn[mask_qb] * b[mask_qb]).astype('float64', copy=False)
+                    ids_today = id_arr[mask_qb]
+
+                    # Build map of id -> position (last one wins if duplicates)
+                    pos_map_today = {}
+                    # small, fast loop (vectorizing dict assignment is not worth it)
+                    for inst, pos in zip(ids_today, pos_today):
+                        pos_map_today[inst] = float(pos)
+
                     prev_map = prev.get('pos_map', {}) if isinstance(prev.get('pos_map', {}), dict) else {}
 
-                    if id_col and ids is not None and ids.size:
-                        # exact per-instrument changed-position count
-                        pos_today = (np.sign(s_base) * b_abs).astype(float)
-                        pos_map_today = {inst: float(pos) for inst, pos in zip(ids, pos_today)}
+                    # Count changes vs. previous map
+                    day_trades = 0
+                    for inst, pos in pos_map_today.items():
+                        prev_pos = float(prev_map.get(inst, 0.0))
+                        if pos != prev_pos:
+                            day_trades += 1
+                    # positions that disappeared
+                    if prev_map:
+                        day_trades += len(set(prev_map.keys()) - set(pos_map_today.keys()))
 
-                        day_trades = 0
-                        for inst, pos in pos_map_today.items():
-                            prev_pos = float(prev_map.get(inst, 0.0))
-                            if abs(pos - prev_pos) > 0.0:
-                                day_trades += 1
-                        if prev_map:
-                            gone = set(prev_map.keys()) - set(pos_map_today.keys())
-                            day_trades += len(gone)
+                    n_trades_today = float(day_trades)
 
-                        n_trades_today = float(day_trades)
-                        trades_cache[key_sb] = {
-                            'n_trades': n_trades_today,
-                            'Bt_today': Bt_today,
-                            'pos_map_today': pos_map_today,
-                            'mean_bet_today': mean_bet,
-                        }
-                        prev_state[key_sb] = {
-                            'Bt': Bt_today,
-                            'mean_bet': mean_bet,
-                            'pos_map': pos_map_today,
-                        }
+                    # Update state
+                    prev_state[key_sb] = {
+                        'Bt': float(np.nansum(b[mask_qb])) if mask_qb.any() else 0.0,
+                        'mean_bet': float(np.nanmean(b[mask_qb])) if mask_qb.any() else 0.0,
+                        'pos_map': pos_map_today,
+                    }
+                else:
+                    # proxy using |ΔBt| / mean_bet
+                    Bt_today = float(np.nansum(b[mask_qb])) if mask_qb.any() else 0.0
+                    mean_bet = float(np.nanmean(b[mask_qb])) if mask_qb.any() else 0.0
+
+                    prev_Bt = float(prev.get('Bt', np.nan)) if prev and 'Bt' in prev else np.nan
+                    prev_mb = float(prev.get('mean_bet', np.nan)) if prev and 'mean_bet' in prev else np.nan
+
+                    if np.isfinite(prev_Bt):
+                        dBt = abs(Bt_today - prev_Bt)
+                        denom = mean_bet if mean_bet > 0 else (prev_mb if np.isfinite(prev_mb) and prev_mb > 0 else np.nan)
+                        n_trades_today = (dBt / denom) if np.isfinite(denom) and denom > 0 else 0.0
                     else:
-                        # proxy using |ΔBt| / mean_bet
-                        if np.isfinite(prev_Bt):
-                            dBt = abs(Bt_today - prev_Bt)
-                            denom = mean_bet if mean_bet > 0 else (prev_mb if np.isfinite(prev_mb) and prev_mb > 0 else np.nan)
-                            n_trades_today = (dBt / denom) if np.isfinite(denom) and denom > 0 else 0.0
-                        else:
-                            n_trades_today = (Bt_today / mean_bet) if mean_bet > 0 else 0.0
+                        n_trades_today = (Bt_today / mean_bet) if mean_bet > 0 else 0.0
 
-                        trades_cache[key_sb] = {
-                            'n_trades': float(n_trades_today) if np.isfinite(n_trades_today) else np.nan,
-                            'Bt_today': Bt_today,
-                            'pos_map_today': {},
-                            'mean_bet_today': mean_bet,
-                        }
-                        prev_state[key_sb] = {
-                            'Bt': Bt_today,
-                            'mean_bet': mean_bet,
-                            'pos_map': {},
-                        }
+                    prev_state[key_sb] = {
+                        'Bt': Bt_today,
+                        'mean_bet': mean_bet,
+                        'pos_map': {},  # not used in proxy mode
+                    }
 
-                n_trades_today = trades_cache[key_sb]['n_trades']
-
-                # ----- per-target metrics -----
+                # ----------------------------
+                # Per-target metrics
+                # ----------------------------
+                # Shared pieces for all targets for this (signal, q, bet)
+                sign_s = sgn
                 for target in target_cols:
-                    if target not in df.columns:
-                        continue
-                    cols = [signal, target, bet]
-                    if id_col: cols.append(id_col)
-                    sub = df.loc[mask, cols].dropna(how='any')
-                    if sub.empty:
+                    y = df_np.get(target)
+                    if y is None:
                         continue
 
-                    s = sub[signal].to_numpy(float)
-                    y = sub[target].to_numpy(float)
-                    b_abs = np.abs(sub[bet].to_numpy(float))
+                    y_fin = np.isfinite(y)
+                    m = mask_qb & y_fin
+                    if not m.any():
+                        # Write nrInstr (bet-independent), but mark trades as NA for this target-day
+                        # so PPT (pnl/trades) isn't computed on a mismatched universe.
+                        stats['nrInstr'][signal][qlabel][target][bet]  = nr_instr_today
+                        stats['n_trades'][signal][qlabel][target][bet] = np.nan  # <<< key change
+                        # (Optionally also write ppt=np.nan explicitly if you want)
+                        # stats['ppt'][signal][qlabel][target][bet] = np.nan
+                        continue
 
-                    pnl_vec = np.sign(s) * y * b_abs
-                    pnl = float(pnl_vec.sum())
-                    Bt_today = float(b_abs.sum())
 
-                    stats['pnl'][signal][qlabel][target][bet]           = pnl
-                    stats['ppd'][signal][qlabel][target][bet]           = (pnl / Bt_today) if Bt_today > 0 else np.nan
-                    stats['sizeNotional'][signal][qlabel][target][bet]  = Bt_today
-                    stats['nrInstr'][signal][qlabel][target][bet]       = nr_instr_today
-                    stats['n_trades'][signal][qlabel][target][bet]      = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
-                    ppt_today = (pnl / n_trades_today) if (np.isfinite(n_trades_today) and n_trades_today > 1e-12) else np.nan
-                    stats['ppt'][signal][qlabel][target][bet]           = float(ppt_today) if np.isfinite(ppt_today) else np.nan
+                    # pnl = sum(sign(s) * y * |bet|)
+                    pnl_vec = sign_s[m] * y[m] * b[m]
+                    pnl = float(np.nansum(pnl_vec))
+                    notional = float(np.nansum(b[m]))
+
+                    stats['pnl'][signal][qlabel][target][bet]          = pnl
+                    stats['ppd'][signal][qlabel][target][bet]          = (pnl / notional) if notional > 0 else np.nan
+                    stats['sizeNotional'][signal][qlabel][target][bet] = notional
+                    stats['nrInstr'][signal][qlabel][target][bet]      = nr_instr_today
+
+                    ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
+                    stats['n_trades'][signal][qlabel][target][bet]     = ntr
+                    stats['ppt'][signal][qlabel][target][bet]          = (pnl / ntr) if (np.isfinite(ntr) and ntr > 1e-12) else np.nan
+
+        # ----------------------------
+        # Optional raw distributions (thin sampling)
+        # ----------------------------
+        if enable_distributions:
+            # fret_* raw values by target (independent of quantiles/bets)
+            for target in target_cols:
+                if target not in df_np:
+                    continue
+                y = df_np[target]
+                y = y[np.isfinite(y)]
+                if y.size == 0:
+                    continue
+                if y.size > max_dist_samples_per_series:
+                    idx = rng.choice(y.size, size=max_dist_samples_per_series, replace=False)
+                    y = y[idx]
+                # Place under synthetic keys, so downstream can recognize histograms
+                # We store each day's values as a small summary (mean) to keep store tiny;
+                # switch to storing arrays if your downstream expects per-sample rows.
+                stats['fret_value'][f'__S__{signal}']['__ALL__'][target]['__ALL__'] = float(np.nanmean(y))
+            # betsize_* raw |bet|
+            for bet in bet_size_cols:
+                b = bet_abs.get(bet)
+                if b is None:
+                    continue
+                x = b[np.isfinite(b)]
+                if x.size == 0:
+                    continue
+                if x.size > max_dist_samples_per_series:
+                    idx = rng.choice(x.size, size=max_dist_samples_per_series, replace=False)
+                    x = x[idx]
+                stats['betsize_value'][f'__B__{bet}']['__ALL__']['__ALL__'][bet] = float(np.nanmean(x))
 
     return stats
+
 
 # Convenience: iterate across multiple days with continuous state
 def compute_series_continuous(df_sorted_by_date, date_col: str, **kwargs):
@@ -245,6 +337,7 @@ def compute_series_continuous(df_sorted_by_date, date_col: str, **kwargs):
     for d, df_day in df_sorted_by_date.sort_values(date_col).groupby(date_col):
         out.append((pd.Timestamp(d), compute_daily_stats(df_day, prev_state=prev, **kwargs)))
     return out
+
 
 __all__ = [
     'compute_daily_stats',

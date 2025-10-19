@@ -3,6 +3,9 @@ from pipeline.runner import run_pipeline
 import pickle as pkl
 import pandas as pd
 import os, glob
+import time
+
+start = time.perf_counter()
 
 DEFAULT_COLS = ['date','signal','target','qrank','stat_type','bet_size_col','value']
 
@@ -59,3 +62,6 @@ if __name__ == '__main__':
     # obj is already a DataFrame; write again to CSV just to match your original flow
     if isinstance(obj, pd.DataFrame):
         obj.to_csv(compat_csv, index=False)
+
+end = time.perf_counter()
+print(f"Time taken: {end - start} seconds")

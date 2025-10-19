@@ -113,15 +113,17 @@ def run_pipeline():
 
         if sig_list and tgt_list and bet_list:
             summary = compute_summary_stats_over_days(
-                big_df,
-                date_col='date',
-                signal_cols=sig_list,
-                target_cols=tgt_list,
-                quantiles=[1.0, 0.75, 0.5, 0.25],
-                bet_size_cols=bet_list,
-                type_quantile='cumulative',
+                df,
+                date_col="date",
+                signal_cols=["sig1","sig2", ...],
+                target_cols=["fret_1d","fret_5d"],
+                bet_size_cols=["betsize_equal","betsize_vol"],
+                quantiles=[1.0,0.75,0.5,0.25],
+                type_quantile="cumulative",
                 add_spearman=True,
-                add_dcor=False
+                add_dcor=True,
+                n_jobs=-1,                # <- parallel
+                backend="loky",           # process-based
             )
 
             # flatten summary -> rows; tag with date range
