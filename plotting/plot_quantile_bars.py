@@ -70,12 +70,12 @@ ROLL_H3_LINES = 1
 
 # Bottom pages (left series is first metric; right series is the second metric)
 # 1 = left series cumulative (Cum P&L / Cum PPD / Cum PPT) with daily right-axis
-# >1 = left series stays cumulative; each day's left increment is normalized by a rolling denominator,
+# >1 = left series stays cumulative; each day's left increment is normalized by a/;;[[/]] rolling denominator,
 #      while the right-axis uses rolling sums over that window.
 # NOTE: In the PnL vs nrInstr panel below, PnL is ALWAYS pure cumulative (never normalized).
-ROLL_PNL_NRINSTR  = 30   # affects: right=nrInstr (daily/rolling). Left PnL is never normalized.
-ROLL_PPD_NOTIONAL = 30   # affects: left=PPD (cum or cum of PnL/roll Notional), right=Notional (daily/rolling)
-ROLL_PPT_TRADES   = 30   # affects: left=PPT (cum or cum of PnL/roll Trades), right=Trades (daily/rolling)
+ROLL_PNL_NRINSTR  = 15   # affects: right=nrInstr (daily/rolling). Left PnL is never normalized.
+ROLL_PPD_NOTIONAL = 15   # affects: left=PPD (cum or cum of PnL/roll Notional), right=Notional (daily/rolling)
+ROLL_PPT_TRADES   = 15   # affects: left=PPT (cum or cum of PnL/roll Trades), right=Trades (daily/rolling)
 
 # Keep left series cumulative but let the rolling window normalize each daily increment (when window > 1).
 # NOTE: This flag has NO effect on the PnL vs nrInstr panel (PnL left stays pure cumulative).
