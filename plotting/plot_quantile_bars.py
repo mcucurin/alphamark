@@ -36,57 +36,33 @@ def savefig_white(pdf, fig):
 # =========================
 # -------- USER CONFIG ----
 # =========================
-# Choose up to 4 qrank labels to DISPLAY across the whole report.
-# Examples:
-#   QR = ['qr_100','qr_75','qr_50','qr_25']   # all four
-#   QR = ['qr_100','qr_50']                   # only 100 and 50
 QR = ['qr_100','qr_75','qr_50','qr_25']
-
-# If any chosen qrank is missing from the data files:
-# - If False (default): they'll be dropped (and we warn).
-# - If True: they'll still appear in legends (empty where no data).
 ALLOW_MISSING_QRANKS = False
 
 # ---- FIXED filters (no "ALL") for Heatmap 2 and Heatmap 3 ----
-# Provide a string (e.g., 'fret_1d') or a list of strings (e.g., ['fret_1d', 'fret_5d']).
-# Set to "AUTO" to pick the most frequent available value(s) in the data (still fixed, not "ALL").
-# HEATMAP 2 (Cross-section corr of PnL) — must have >=2 (target, bet) rows per day for given quantile
-H2_TARGETS = "AUTO"       # e.g. 'fret_1d' or ['fret_1d','fret_5d']
-H2_BETS    = "AUTO"       # e.g. 'betsize_equal' or ['betsize_equal','betsize_vol']
-# HEATMAP 3 (Time-series corr of PnL) — separate fixed filters allowed
+H2_TARGETS = "AUTO"
+H2_BETS    = "AUTO"
 H3_TARGETS = "AUTO"
 H3_BETS    = "AUTO"
 
 # =========================
 # ---- PER-GRAPH ROLLING WINDOWS ----
 # =========================
-# Temporal lines after Heatmap 1 (alpha metric cross-section corr)
-ROLL_H1_LINES = 30
-# Temporal lines after Heatmap 2 (PnL cross-section corr)
-ROLL_H2_LINES = 30
-# Temporal lines after Heatmap 3 (time correlation of per-alpha PnL across days)
-# NOTE: when set to 1, we use EXPANDING correlation (daily series, no fixed window).
+ROLL_H1_LINES = 1
+ROLL_H2_LINES = 1
 ROLL_H3_LINES = 1
 
-# Bottom pages (left series is first metric; right series is the second metric)
-# 1 = left series cumulative (Cum P&L / Cum PPD / Cum PPT) with daily right-axis
-# >1 = left series stays cumulative; each day's left increment is normalized by a/;;[[/]] rolling denominator,
-#      while the right-axis uses rolling sums over that window.
-# NOTE: In the PnL vs nrInstr panel below, PnL is ALWAYS pure cumulative (never normalized).
-ROLL_PNL_NRINSTR  = 15   # affects: right=nrInstr (daily/rolling). Left PnL is never normalized.
-ROLL_PPD_NOTIONAL = 15   # affects: left=PPD (cum or cum of PnL/roll Notional), right=Notional (daily/rolling)
-ROLL_PPT_TRADES   = 15   # affects: left=PPT (cum or cum of PnL/roll Trades), right=Trades (daily/rolling)
-
-# Keep left series cumulative but let the rolling window normalize each daily increment (when window > 1).
-# NOTE: This flag has NO effect on the PnL vs nrInstr panel (PnL left stays pure cumulative).
+# Bottom pages windows:
+ROLL_PNL_NRINSTR  = 1   # right axis: nrInstr → rolling AVERAGE now
+ROLL_PPD_NOTIONAL = 1   # right axis: Notional → rolling AVERAGE; left PPD normalized by rolling AVG Notional
+ROLL_PPT_TRADES   = 1   # right axis: Trades → rolling AVERAGE; left PPT normalized by rolling AVG Trades
 NORMALIZE_LEFT_WITH_ROLL = True
 
 # =========================
 # -------- CONFIG ---------
 # =========================
-
-BAR_PAGE_VARS = ['signal', 'bet_size_col']     # page split (no __ALL__ here)
-BAR_X_VARS    = ['target']                     # x-axis grouping
+BAR_PAGE_VARS = ['signal', 'bet_size_col']
+BAR_X_VARS    = ['target']
 
 metrics_to_plot = [
     'pnl','ppd','sharpe','hit_ratio','long_ratio',
@@ -96,19 +72,15 @@ metrics_to_plot = [
 
 CUM_SECTIONS = ['pnl','ppd','sizeNotional','nrInstr','n_trades','ppt']
 
-# Outlier tables
-OUTLIERS_DIR                 = "output/OUTLIERS"
-OUTLIER_METRICS_FOR_TABLES   = ['pnl','ppd','ppt','sizeNotional','nrInstr','n_trades']
-OUTLIER_TOP_K                = 3
-OUTLIER_TABLES_PER_PAGE      = 3
+OUTLIERS_DIR               = "output/OUTLIERS"
+OUTLIER_METRICS_FOR_TABLES = ['pnl','ppd','ppt','sizeNotional','nrInstr','n_trades']
+OUTLIER_TOP_K              = 3
+OUTLIER_TABLES_PER_PAGE    = 3
 
-# Distributions (fret_* and betsize_*), from DAILY_STATS
-DIST_BINS        = 60
+DIST_BINS = 60
 
-# Styles / colors
 STYLE_FIRST  = '-'
 STYLE_SECOND = '--'
-# Base colors for the common four; any extra will be auto-assigned.
 quantile_colors = {'qr_100':'red','qr_75':'green','qr_50':'blue','qr_25':'black'}
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -116,7 +88,6 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # =========================
 # ----- LOAD & PREP -------
 # =========================
-
 def _load_stats_df():
     daily_dir   = "output/DAILY_STATS"
     summary_dir = "output/SUMMARY_STATS"
@@ -156,7 +127,6 @@ def _load_stats_df():
         if col not in out.columns: out[col] = pd.NA
         out[col] = out[col].astype('string')
 
-    # Guardrails: clamp to observed min/max
     dmin, dmax = out['date'].min(), out['date'].max()
     if pd.notna(dmin) and pd.notna(dmax) and dmax > dmin:
         out = out[(out['date'] >= dmin) & (out['date'] <= dmax)]
@@ -165,7 +135,6 @@ def _load_stats_df():
 
 stats_df = _load_stats_df()
 
-# All unique values (includes __ALL__)
 signals_all   = sorted([s for s in stats_df['signal'].dropna().unique()])
 targets_all   = sorted([t for t in stats_df['target'].dropna().unique()])
 bet_sizes_all = sorted([b for b in stats_df['bet_size_col'].dropna().unique()])
@@ -176,9 +145,8 @@ try:
 except Exception:
     qranks_all = sorted(_qr_raw)
 
-# ---- Apply user's QR selection (up to 4) ----
 if isinstance(QR, (list, tuple)):
-    selected = [str(q) for q in QR][:4]  # hard cap at 4
+    selected = [str(q) for q in QR][:4]
 else:
     selected = []
 
@@ -194,7 +162,6 @@ else:
         print("[WARN] None of the requested qranks were present; falling back to available.")
         qranks = qranks_all
 
-# Extend the color map so every shown qrank has a color (no deprecated API)
 def _ensure_quantile_colors(labels, base_map):
     cmap = mpl.colormaps.get_cmap('tab20')
     out = dict(base_map)
@@ -211,7 +178,6 @@ bar_width = 0.15
 # =========================
 # ---- FIXED FILTERS RESOLVE (no ALL) ----
 # =========================
-
 def _as_list(x):
     if isinstance(x, str):
         return [x]
@@ -220,10 +186,6 @@ def _as_list(x):
     raise ValueError("Expected string or list-like.")
 
 def _resolve_fixed(name, desired, series_values, prefer_prefix=None, top_k=1):
-    """
-    Resolve desired -> list of valid tokens from series_values.
-    If desired == 'AUTO', pick the most frequent (optionally filtered by prefix), up to top_k.
-    """
     vals = pd.Series(series_values).dropna().astype(str)
     if vals.empty:
         raise ValueError(f"No available values to resolve {name}.")
@@ -234,7 +196,6 @@ def _resolve_fixed(name, desired, series_values, prefer_prefix=None, top_k=1):
                 top = vsub.value_counts().index.tolist()[:top_k]
                 return top
         return vals.value_counts().index.tolist()[:top_k]
-    # explicit
     out = _as_list(desired)
     missing = [v for v in out if v not in set(vals)]
     if missing:
@@ -243,53 +204,36 @@ def _resolve_fixed(name, desired, series_values, prefer_prefix=None, top_k=1):
     return out
 
 def _ensure_min_cross_section(df_q, targ_sel, bet_sel, auto_targ, auto_bet, min_rows=2):
-    """
-    For per-day cross-section corr, we need at least 2 index rows:
-      rows index = (target, bet, qrank) with qrank fixed to one q
-      => need len(targets)*len(bets) >= 2
-    If AUTO was used, expand selections from df_q to meet min_rows when possible.
-    """
     t = list(targ_sel)
     b = list(bet_sel)
     if len(t)*len(b) >= min_rows:
         return t, b, None
-
-    # available in df_q
     avail_t = df_q['target'].dropna().astype(str).value_counts().index.tolist()
     avail_b = df_q['bet_size_col'].dropna().astype(str).value_counts().index.tolist()
-
     msg = None
-
     if auto_targ and auto_bet:
         if len(avail_t) >= 2:
-            t = avail_t[:2]
-            b = avail_b[:1] if avail_b else b
+            t = avail_t[:2]; b = avail_b[:1] if avail_b else b
         elif len(avail_b) >= 2:
-            t = avail_t[:1] if avail_t else t
-            b = avail_b[:2]
+            t = avail_t[:1] if avail_t else t; b = avail_b[:2]
         if len(t)*len(b) < min_rows:
             msg = "[WARN] Cross-section: only one (target, bet) combination exists for this quantile; cross-section corr unavailable."
         return t, b, msg
-
     if auto_targ and not auto_bet:
-        if len(avail_t) >= 2:   t = avail_t[:2]
+        if len(avail_t) >= 2: t = avail_t[:2]
         elif len(avail_t) >= 1: t = avail_t[:1]
         if len(t)*len(b) < min_rows:
             msg = "[WARN] Cross-section: insufficient rows with fixed bet(s); consider adding more targets."
         return t, b, msg
-
     if not auto_targ and auto_bet:
-        if len(avail_b) >= 2:   b = avail_b[:2]
+        if len(avail_b) >= 2: b = avail_b[:2]
         elif len(avail_b) >= 1: b = avail_b[:1]
         if len(t)*len(b) < min_rows:
             msg = "[WARN] Cross-section: insufficient rows with fixed target(s); consider adding more bets."
         return t, b, msg
-
-    # Explicit-explicit and still < min_rows => can't fix automatically
     msg = "[INFO] Cross-section: explicit filters yield <2 rows; cannot compute cross-section correlation."
     return t, b, msg
 
-# Track whether user set AUTO
 H2_AUTO_TARGETS = isinstance(H2_TARGETS, str) and H2_TARGETS.upper() == "AUTO"
 H2_AUTO_BETS    = isinstance(H2_BETS,    str) and H2_BETS.upper()    == "AUTO"
 H3_AUTO_TARGETS = isinstance(H3_TARGETS, str) and H3_TARGETS.upper() == "AUTO"
@@ -308,7 +252,6 @@ def _exclude_all_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 stats_df_plot = _exclude_all_rows(stats_df)
 
-# Page levels for BAR/CUM plots (no __ALL__)
 plot_signals   = sorted(stats_df_plot['signal'].dropna().unique())
 plot_targets   = sorted(stats_df_plot['target'].dropna().unique())
 plot_bets      = sorted(stats_df_plot['bet_size_col'].dropna().unique())
@@ -337,7 +280,6 @@ if H1_BASE_STAT is None:
     raise ValueError("Heatmap 1 requires 'alpha_sum' (or 'alpha_strength') in DAILY_STATS.")
 print(f"[INFO] Alpha stat for Heatmap 1: {H1_BASE_STAT}")
 
-# Whether to emit temporal plots alongside heatmaps
 DO_TEMPORAL = (len(ALPHAS) <= 6)
 if not DO_TEMPORAL:
     print(f"[INFO] {len(ALPHAS)} alphas detected (>6). Skipping temporal line plots for heatmaps.")
@@ -345,9 +287,8 @@ if not DO_TEMPORAL:
 # =========================
 # ------- HELPERS ---------
 # =========================
-
 def _plot_date_axis(ax):
-    ax.set_axisbelow(True)  # grid below lines/bars
+    ax.set_axisbelow(True)
     ax.grid(True, linestyle='--', alpha=0.35)
     ax.xaxis.set_major_locator(mdates.YearLocator())
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
@@ -378,10 +319,6 @@ def _add_dual_legends(ax, qranks, color_map, style_descs):
         ax.legend(handles=style_handles, title='Series (style/axis)', loc='upper right', fontsize=9, frameon=True)
 
 def _heatmap_figure_size(k, widen=1.18, extra_height=0.0):
-    """
-    Make heatmaps a touch wider so long titles don't clip.
-    Height stays the same as before; width is scaled by `widen`.
-    """
     s = max(10, min(28, 0.6 * k + 8))
     return (s * widen, s + extra_height)
 
@@ -412,33 +349,26 @@ def _plot_matrix_heatmap(fig, ax, M, labels, title, vmin=-1, vmax=1, annotate_lo
                             ha='center', va='center',
                             fontsize=fs_cells,
                             color=('white' if abs(val) >= 0.5 else 'black'))
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.4/10)
     cbar.ax.tick_params(labelsize=9)
 
-# ---- Min-periods helper (prevents "min_periods > window" errors) ----
+# ---- Min-periods helper ----
 def _minp(window, floor=3):
     if window is None:
         return 1
     w = int(max(1, window))
     return min(w, max(1, w//5, floor))
 
-# ---- Rolling sum helper for normalization ----
-def _roll_sum(s: pd.Series, window: int):
+# ---- Rolling MEAN helper (used for activity & normalization) ----
+def _roll_mean(s: pd.Series, window: int):
     mp = _minp(window, floor=3)
-    return s.rolling(window, min_periods=mp).sum()
+    return s.rolling(window, min_periods=mp).mean()
 
 # =========================
 # ---- HEATMAP BUILDERS ---
 # =========================
-
 def _build_daily_cross_section(df_day, alphas, stat_type, qfilter=None,
                                targets=None, bets=None):
-    """
-    Cross-section for a given day:
-      rows: (target, bet, qrank) optionally filtered by qfilter/targets/bets
-      cols: signals (alphas)
-      values: stat_type's 'value'
-    """
     d = df_day[df_day['stat_type'] == stat_type]
     if qfilter:   d = d[d['qrank'].isin(qfilter)]
     if targets:   d = d[d['target'].isin(targets)]
@@ -450,7 +380,7 @@ def _build_daily_cross_section(df_day, alphas, stat_type, qfilter=None,
     if not cols_present:
         return None
     piv = piv[cols_present].dropna(how='all')
-    if piv.shape[0] < 2:  # need at least 2 rows for per-day cross-section corr
+    if piv.shape[0] < 2:
         return None
     return pd.to_numeric(piv.stack(), errors='coerce').unstack().astype(float)
 
@@ -471,12 +401,6 @@ def _avg_mats_ignore_nan(mats):
 
 def compute_heatmap_daily_avg(stats_df, alphas, stat_type, min_pairs=2,
                               qfilter=None, targets=None, bets=None):
-    """
-    Heatmap logic (cross-section):
-    - For each day, compute the cross-sectional corr across (target, bet, qrank) rows
-      between alpha columns (or PnL per alpha when stat_type='pnl').
-    - Then average the correlation matrices across days (element-wise).
-    """
     alphas = list(alphas)
     if len(alphas) < 2: return None, alphas, 0
     mats = []
@@ -493,12 +417,6 @@ def compute_heatmap_daily_avg(stats_df, alphas, stat_type, min_pairs=2,
 
 def compute_timeseries_heatmap(stats_df, alphas, stat_type, min_days=5, agg='sum',
                                qfilter=None, targets=None, bets=None):
-    """
-    Time-series heatmap:
-    - Build daily series per alpha from `stat_type` and compute a single correlation matrix.
-    - Filters by qfilter / targets / bets if provided.
-    - For alpha_* use mean across duplicates; for pnl use sum.
-    """
     df = stats_df[stats_df['stat_type'] == stat_type].copy()
     if qfilter: df = df[df['qrank'].isin(qfilter)]
     if targets: df = df[df['target'].isin(targets)]
@@ -518,14 +436,8 @@ def compute_timeseries_heatmap(stats_df, alphas, stat_type, min_days=5, agg='sum
 # =========================
 # -- TEMPORAL LINES -------
 # =========================
-
 def compute_daily_pair_corr_series(stats_df, alphas, stat_type, min_pairs=2,
                                    qfilter=None, targets=None, bets=None):
-    """
-    For each date, compute cross-sectional Pearson corr for each (alpha_i, alpha_j).
-    Optionally filters to rows where qrank/target/bet match provided filters.
-    Returns dict: ("a|b") -> pd.Series indexed by date.
-    """
     alphas = [a for a in alphas]
     pairs = list(combinations(alphas, 2))
     dates = sorted(stats_df['date'].dropna().unique())
@@ -554,11 +466,6 @@ def compute_daily_pair_corr_series(stats_df, alphas, stat_type, min_pairs=2,
 def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix,
                                   smooth_window=60, height=5.8,
                                   qfilter=None, targets=None, bets=None):
-    """
-    Temporal lines for per-day cross-section corr:
-    - If smooth_window <= 1: plot raw per-day values (no smoothing).
-    - Else: rolling-mean smoothing over `smooth_window`.
-    """
     corr_map = compute_daily_pair_corr_series(
         stats_df, alphas, stat_type, min_pairs=2,
         qfilter=qfilter, targets=targets, bets=bets
@@ -605,7 +512,7 @@ def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix
             mp = _minp(win, floor=3)
             sm = s.rolling(win, min_periods=mp).mean()
         else:
-            sm = s  # raw daily values
+            sm = s
         color = cmap(i % cmap.N)
         ax.plot(sm.index, sm.values, lw=1.8, alpha=0.95, color=color)
         v = sm.values
@@ -633,13 +540,8 @@ def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix
     _plot_date_axis(ax)
     savefig_white(pdf, fig)
 
-# ---- Rolling/Expanding TIME correlation lines (used for H3 time-series) ----
 def compute_pairwise_rolling_time_corr(stats_df, alphas, stat_type, window=60, min_periods=None,
                                        qfilter=None, targets=None, bets=None, agg='mean'):
-    """
-    If window <= 1, returns **expanding** correlation (min_periods ≥ 2) so you get a daily series.
-    Otherwise, a fixed rolling correlation with given window is returned.
-    """
     df = stats_df[stats_df['stat_type'] == stat_type].copy()
     if qfilter: df = df[df['qrank'].isin(qfilter)]
     if targets: df = df[df['target'].isin(targets)]
@@ -653,7 +555,7 @@ def compute_pairwise_rolling_time_corr(stats_df, alphas, stat_type, window=60, m
 
     out = {}
     if (window is None) or int(window) <= 1:
-        mp = 2  # need at least 2 points
+        mp = 2
         cols = [c for c in daily.columns if daily[c].notna().sum() >= mp]
         pairs = list(combinations(cols, 2))
         for a, b in pairs:
@@ -741,7 +643,6 @@ def plot_pairwise_timecorr_lines(pdf, stats_df, alphas, stat_type, title_prefix,
 # =========================
 # ---- OUTLIER TABLES -----
 # =========================
-
 def _find_latest_outliers_pkl(root=OUTLIERS_DIR):
     if not os.path.isdir(root): return None
     cand = sorted(glob.glob(os.path.join(root, "outliers_*.pkl")))
@@ -843,18 +744,8 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
         savefig_white(pdf, fig)
 
 # =========================
-# ---- DISTRIBUTIONS -------
-# (fret_* & betsize_* only)
-# =========================
-'''''
-def _collect_prefixed_series(df, prefix, cols=('stat_type','target','bet_size_col')):
-    ...
-'''''
-# =========================
 # ------- BUILD PDF -------
 # =========================
-
-# Resolve base fixed selections (initial)
 H2_TARGETS_RES = _resolve_fixed("H2_TARGETS", H2_TARGETS, stats_df['target'], prefer_prefix="fret_", top_k=1)
 H2_BETS_RES    = _resolve_fixed("H2_BETS",    H2_BETS,    stats_df['bet_size_col'], prefer_prefix="betsize_", top_k=1)
 H3_TARGETS_RES = _resolve_fixed("H3_TARGETS", H3_TARGETS, stats_df['target'], prefer_prefix="fret_", top_k=1)
@@ -878,7 +769,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
         page_iter = []
 
     for page_vals in page_iter:
-        subset = stats_df_plot.copy()  # filtered (no __ALL__)
+        subset = stats_df_plot.copy()
         if qranks:
             subset = subset[subset['qrank'].isin(qranks)]
         title_bits = []
@@ -930,7 +821,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
 
         plt.tight_layout(rect=[0,0.03,1,0.97]); savefig_white(pdf, fig)
 
-    # ---------- HEATMAP 1 (ALPHA) — CROSS-SECTION AVERAGED OVER DAYS ----------
+    # ---------- HEATMAP 1 ----------
     H1, labels1, n_days1 = compute_heatmap_daily_avg(
         stats_df, ALPHAS, stat_type=H1_BASE_STAT, min_pairs=2, qfilter=qranks
     )
@@ -945,10 +836,8 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             f"Heatmap 1 — Cross-section corr of daily alphas",
             vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
         )
-    # no tight_layout here; constrained_layout handles it
     savefig_white(pdf, fig)
 
-    # Temporal plot for H1
     if DO_TEMPORAL:
         plot_cross_section_corr_lines(
             pdf, stats_df, ALPHAS, stat_type=H1_BASE_STAT,
@@ -957,11 +846,11 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             height=6.0, qfilter=qranks
         )
 
-    # ---------- Per-Quantile HEATMAPS 2 & 3 (and their temporal plots) ----------
+    # ---------- Per-Quantile HEATMAPS 2 & 3 ----------
     for q in qranks:
         q_masked_df = stats_df[stats_df['qrank'] == q].copy()
 
-        # ---- Heatmap 2: Cross-section corr of PnL (daily avg), FIXED target/bet (ensure >=2 rows if AUTO) ----
+        # Heatmap 2
         df_q_pnl = q_masked_df[q_masked_df['stat_type']=='pnl']
         t2, b2, msg2 = _ensure_min_cross_section(
             df_q_pnl, H2_TARGETS_RES, H2_BETS_RES, H2_AUTO_TARGETS, H2_AUTO_BETS, min_rows=2
@@ -987,7 +876,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             )
         savefig_white(pdf, fig)
 
-        # Temporal lines for H2
         if DO_TEMPORAL:
             plot_cross_section_corr_lines(
                 pdf, q_masked_df, ALPHAS, stat_type='pnl',
@@ -996,7 +884,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 height=6.0, qfilter=[q], targets=t2, bets=b2
             )
 
-        # ---- Heatmap 3: TIME-SERIES corr of daily summed PnL (per-quantile), FIXED target/bet ----
+        # Heatmap 3
         C3, labels3, n_days3 = compute_timeseries_heatmap(
             q_masked_df, ALPHAS, stat_type='pnl', min_days=5, agg='sum',
             qfilter=[q], targets=H3_TARGETS_RES, bets=H3_BETS_RES
@@ -1017,7 +905,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             )
         savefig_white(pdf, fig)
 
-        # Temporal lines for H3
         if DO_TEMPORAL:
             plot_pairwise_timecorr_lines(
                 pdf, q_masked_df, ALPHAS, stat_type='pnl',
@@ -1026,10 +913,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 qfilter=[q], targets=H3_TARGETS_RES, bets=H3_BETS_RES, agg='sum'
             )
 
-    # ---------- Distributions ----------
-    #add_distribution_pages(pdf)
-
-    # ---------- Bottom pages (NO __ALL__), overlay *selected* quantiles ----------
+    # ---------- Bottom pages (NO __ALL__), overlay selected quantiles ----------
     rk_pnl  = None if int(ROLL_PNL_NRINSTR)  <= 1 else int(ROLL_PNL_NRINSTR)
     rk_ppd  = None if int(ROLL_PPD_NOTIONAL) <= 1 else int(ROLL_PPD_NOTIONAL)
     rk_ppt  = None if int(ROLL_PPT_TRADES)   <= 1 else int(ROLL_PPT_TRADES)
@@ -1048,7 +932,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 if want('pnl') or want('nrInstr'):
                     fig, ax = plt.subplots(figsize=(14,5.8))
                     left_title  = "Cum P&L"
-                    right_title = "Daily nrInstr" if rk_pnl is None else f"Rolling {rk_pnl}D nrInstr"
+                    right_title = "Daily nrInstr" if rk_pnl is None else f"Rolling {rk_pnl}D avg nrInstr"
                     ttl = [t for t, ok in [
                         (f"{left_title} (left, solid)", want('pnl')),
                         (f"{right_title} (right, dashed)", want('nrInstr'))
@@ -1069,7 +953,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                             y = pnl.cumsum()
                             ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
                         if want('nrInstr') and not nrin.empty:
-                            y2 = nrin if rk_pnl is None else _roll_sum(nrin, rk_pnl)
+                            y2 = nrin if rk_pnl is None else _roll_mean(nrin, rk_pnl)
                             ax_r.plot(y2.index, y2.values, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
                     if anyL: ax.set_ylabel(left_title)
                     if anyR: ax_r.set_ylabel(right_title)
@@ -1086,9 +970,9 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                     left_title = (
                         "Cum PPD"
                         if (not NORMALIZE_LEFT_WITH_ROLL or rk_ppd is None)
-                        else f"Cum PPD (P&L / rolling {rk_ppd}D Notional)"
+                        else f"Cum PPD (P&L / rolling {rk_ppd}D avg Notional)"
                     )
-                    right_title = "Daily Notional" if rk_ppd is None else f"Rolling {rk_ppd}D Notional"
+                    right_title = "Daily Notional" if rk_ppd is None else f"Rolling {rk_ppd}D avg Notional"
                     ttl = [t for t, ok in [
                         (f"{left_title} (left, solid)", want('ppd')),
                         (f"{right_title} (right, dashed)", want('sizeNotional'))
@@ -1106,7 +990,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                         m = _merge_two_stats(sq, 'pnl', 'sizeNotional', 'pnl', 'notional')
                         if want('ppd'):
                             if NORMALIZE_LEFT_WITH_ROLL and rk_ppd is not None:
-                                rn = _roll_sum(m['notional'], rk_ppd)
+                                rn = _roll_mean(m['notional'], rk_ppd)
                                 contrib = np.where((rn > 0) & np.isfinite(rn), m['pnl']/rn, 0.0)
                                 y = pd.Series(contrib, index=m['date']).cumsum()
                             else:
@@ -1114,7 +998,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                                 y = m.set_index('date')['cum_ppd'].fillna(method='ffill')
                             ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
                         if want('sizeNotional'):
-                            rn = m['notional'] if rk_ppd is None else _roll_sum(m['notional'], rk_ppd)
+                            rn = m['notional'] if rk_ppd is None else _roll_mean(m['notional'], rk_ppd)
                             ax_r.plot(m['date'], rn, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
                     if anyL: ax.set_ylabel(left_title)
                     if anyR: ax_r.set_ylabel(right_title)
@@ -1131,9 +1015,9 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                     left_title = (
                         "Cum PPT"
                         if (not NORMALIZE_LEFT_WITH_ROLL or rk_ppt is None)
-                        else f"Cum PPT (P&L / rolling {rk_ppt}D Trades)"
+                        else f"Cum PPT (P&L / rolling {rk_ppt}D avg Trades)"
                     )
-                    right_title = "Daily Trades" if rk_ppt is None else f"Rolling {rk_ppt}D Trades"
+                    right_title = "Daily Trades" if rk_ppt is None else f"Rolling {rk_ppt}D avg Trades"
                     ttl = [t for t, ok in [
                         (f"{left_title} (left, solid)", want('ppt')),
                         (f"{right_title} (right, dashed)", want('n_trades'))
@@ -1152,8 +1036,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                         pnl    = sq[sq['stat_type']=='pnl'][['date','value']].set_index('date')['value'].astype(float)
                         if want('ppt'):
                             if NORMALIZE_LEFT_WITH_ROLL and rk_ppt is not None:
-                                rt = _roll_sum(trades, rk_ppt)
-                                rt = rt.reindex(pnl.index)
+                                rt = _roll_mean(trades, rk_ppt).reindex(pnl.index)
                                 contrib = pd.Series(0.0, index=pnl.index)
                                 mask = (rt > 0) & rt.notna() & pnl.notna()
                                 contrib[mask] = pnl[mask] / rt[mask]
@@ -1165,7 +1048,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                                 y = pd.Series(ratio, index=cum_pnl.index).ffill()
                             ax.plot(y.index, y.values, color=color, linestyle=STYLE_FIRST, linewidth=1.8); anyL=True
                         if want('n_trades') and not trades.empty:
-                            y2 = trades if rk_ppt is None else _roll_sum(trades, rk_ppt)
+                            y2 = trades if rk_ppt is None else _roll_mean(trades, rk_ppt)
                             ax_r.plot(y2.index, y2.values, color=color, linestyle=STYLE_SECOND, linewidth=1.8); anyR=True
                     if anyL: ax.set_ylabel(left_title)
                     if anyR: ax_r.set_ylabel(right_title)
@@ -1176,7 +1059,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                     _add_dual_legends(ax, qranks, quantile_colors, styles)
                     plt.tight_layout(); savefig_white(pdf, fig)
 
-    # ---------- Outlier tables (last) ----------
     latest_outliers = _find_latest_outliers_pkl(OUTLIERS_DIR)
     append_outlier_pages(latest_outliers, pdf,
                          metrics=OUTLIER_METRICS_FOR_TABLES,
