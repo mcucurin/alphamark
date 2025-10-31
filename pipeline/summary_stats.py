@@ -1,12 +1,12 @@
 # =============================
-# summary_stats.py (vectorized, fast + parallel)  — now with efficiencyP
+# summary_stats.py (fast, streaming, memory-light)
 # =============================
 from __future__ import annotations
 
 import numpy as np
 from collections import defaultdict
-from typing import Sequence, List
-from scipy.stats import spearmanr, linregress
+from typing import Sequence, List, Dict, Tuple
+from scipy.stats import spearmanr
 
 # Optional distance correlation
 try:
@@ -22,13 +22,6 @@ except Exception:
     def _distance_correlation(x, y):
         return np.nan
 
-# Joblib for parallelism across days
-try:
-    from joblib import Parallel, delayed
-    _HAS_JOBLIB = True
-except Exception:
-    _HAS_JOBLIB = False
-
 # Reuse nested store
 from .daily_stats import create_5d_stats
 
@@ -39,16 +32,12 @@ from .daily_stats import create_5d_stats
 def _qlabel(q: float) -> str:
     return f"qr_{int(round(q*100))}"
 
-
 def _float_clean(arr: np.ndarray) -> np.ndarray:
-    """Return float64 with non-finites -> NaN."""
     out = np.asarray(arr, dtype="float64")
     out[~np.isfinite(out)] = np.nan
     return out
 
-
 def _sanitize_list(cols: Sequence) -> List[str]:
-    """Drop Ellipsis/None/non-strings; keep order & dedupe."""
     seen = set()
     out: List[str] = []
     for c in cols or []:
@@ -58,223 +47,90 @@ def _sanitize_list(cols: Sequence) -> List[str]:
             out.append(c); seen.add(c)
     return out
 
-
 def _topk_mask_desc(abs_vals: np.ndarray, finite_mask: np.ndarray, q: float) -> np.ndarray:
-    """
-    Rank-based cumulative selection: pick exactly ceil(q * N) largest |s| among finite entries.
-    Deterministic tie handling via stable argsort (mergesort) on the finite slice.
-    """
     idx_fin = np.where(finite_mask)[0]
+    out = np.zeros_like(finite_mask, dtype=bool)
     if idx_fin.size == 0 or q <= 0.0:
-        return np.zeros_like(finite_mask, dtype=bool)
+        return out
     if q >= 1.0:
-        out = np.zeros_like(finite_mask, dtype=bool)
         out[idx_fin] = True
         return out
     k = int(np.ceil(q * idx_fin.size))
     order = np.argsort(-abs_vals[idx_fin], kind="mergesort")
     choose = idx_fin[order[:k]]
-    out = np.zeros_like(finite_mask, dtype=bool)
     out[choose] = True
     return out
 
+# ---------- Online stats ----------
+def _welford_update(state, x):
+    n, mean, M2 = state
+    n += 1
+    delta = x - mean
+    mean += delta / n
+    M2 += delta * (x - mean)
+    return [n, mean, M2]
 
-def _merge_daily_accumulators(
-    dest_daily_ppd, dest_pairs, dest_hit_num, dest_hit_den, dest_long_num, dest_long_den,
-    dest_daily_effp,  # <---- NEW
-    src
-):
-    (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp) = src
-    for k, v in daily_ppd.items():
-        if v:
-            dest_daily_ppd[k].extend(v)
-    for k, d in pooled_pairs.items():
-        if d['s']:
-            dest_pairs[k]['s'].extend(d['s'])
-            dest_pairs[k]['y'].extend(d['y'])
-    for k, c in hit_num.items():
-        if c:
-            dest_hit_num[k] += c
-    for k, c in hit_den.items():
-        if c:
-            dest_hit_den[k] += c
-    for k, c in long_num.items():
-        if c:
-            dest_long_num[k] += c
-    for k, c in long_den.items():
-        if c:
-            dest_long_den[k] += c
-    # NEW: efficiencyP day list
-    for k, v in daily_effp.items():
-        if v:
-            dest_daily_effp[k].extend(v)
+def _welford_finalize(n, mean, M2):
+    if n <= 1:
+        return mean, np.nan
+    var = M2 / n  # population variance (ddof=0)
+    return mean, float(np.sqrt(var))
 
+# Small, bounded sampler for Spearman/DCOR to avoid O(N) memory
+class _Reservoir:
+    def __init__(self, cap: int = 0, seed: int | None = 123):
+        self.cap = int(cap) if cap and cap > 0 else 0
+        self.rng = np.random.default_rng(seed)
+        self.store: Dict[Tuple[str,str,str,str], Tuple[np.ndarray,np.ndarray,int]] = {}
+        # key -> (xs, ys, n_seen)
 
-# -------- Vectorized single-day accumulator --------
-def _summarize_one_day(
-    day_df,
-    signal_cols: Sequence[str],
-    target_cols: Sequence[str],
-    quantiles: Sequence[float],
-    bet_size_cols: Sequence[str],
-    type_quantile: str,
-    add_spearman: bool,
-    add_dcor: bool,
-):
-    """
-    Compute per-day accumulators (not the final summary).
-    Returns:
-      (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp)
-    """
-    import pandas as pd
+    def add(self, key, xs: np.ndarray, ys: np.ndarray):
+        if self.cap <= 0 or xs.size == 0:
+            return
+        m = min(xs.size, ys.size)
+        if m == 0:
+            return
+        xs = xs[:m].astype('float64', copy=False)
+        ys = ys[:m].astype('float64', copy=False)
 
-    d = day_df.copy()
+        if key not in self.store:
+            take = min(self.cap, m)
+            idx = self.rng.choice(m, size=take, replace=False)
+            self.store[key] = (xs[idx].copy(), ys[idx].copy(), m)
+            return
 
-    # Keep only present columns and build 2D blocks (n x ns/nt/nb)
-    sig_names = [c for c in signal_cols if c in d.columns]
-    tgt_names = [c for c in target_cols if c in d.columns]
-    bet_names = [c for c in bet_size_cols if c in d.columns]
+        X, Y, seen = self.store[key]
+        total = seen + m
 
-    if len(sig_names) == 0 or len(tgt_names) == 0 or len(bet_names) == 0 or len(d) == 0:
-        return (
-            defaultdict(list),
-            defaultdict(lambda: {'s': [], 'y': []}),
-            defaultdict(int),
-            defaultdict(int),
-            defaultdict(int),
-            defaultdict(int),
-            defaultdict(list),  # daily_effp
-        )
+        # ensure arrays filled up to cap
+        if X.size < self.cap:
+            need = self.cap - X.size
+            add = min(need, m)
+            idx = self.rng.choice(m, size=add, replace=False)
+            X = np.concatenate([X, xs[idx]])
+            Y = np.concatenate([Y, ys[idx]])
+            seen += m
+            self.store[key] = (X, Y, seen)
+            return
 
-    S = np.column_stack([_float_clean(d[c].to_numpy()) for c in sig_names])              # (n, ns)
-    Y = np.column_stack([_float_clean(d[c].to_numpy()) for c in tgt_names])              # (n, nt)
-    B = np.column_stack([np.abs(_float_clean(d[c].to_numpy())) for c in bet_names])      # (n, nb)
+        # reservoir replacement
+        if total > 0:
+            p = self.cap / float(total)
+            rcount = int(self.rng.binomial(m, p))
+            if rcount > 0:
+                rep_new_idx = self.rng.choice(m, size=rcount, replace=False)
+                rep_old_idx = self.rng.choice(self.cap, size=rcount, replace=False)
+                X[rep_old_idx] = xs[rep_new_idx]
+                Y[rep_old_idx] = ys[rep_new_idx]
 
-    n, ns = S.shape
-    _, nt = Y.shape
-    _, nb = B.shape
+        seen += m
+        self.store[key] = (X, Y, seen)
 
-    daily_ppd    = defaultdict(list)                 # (signal, qlabel, target, bet) -> [ppd_day,...]
-    pooled_pairs = defaultdict(lambda: {'s': [], 'y': []})
-    hit_num      = defaultdict(int)
-    hit_den      = defaultdict(int)
-    long_num     = defaultdict(int)                  # (signal, qlabel, bet)
-    long_den     = defaultdict(int)
-    daily_effp   = defaultdict(list)                 # <--- NEW (signal, qlabel, target, bet) -> [effP_day,...]
-
-    for si, s_name in enumerate(sig_names):
-        s_all = S[:, si]
-        m_fin = np.isfinite(s_all)
-        if not m_fin.any():
-            continue
-
-        sgn = np.sign(s_all)
-        sabs_fin = np.abs(s_all[m_fin])
-
-        # Precompute stable edges only if bucket mode; cumulative uses rank-based top-K
-        if type_quantile != 'cumulative' and sabs_fin.size:
-            K = len(quantiles)
-            probs = np.linspace(0.0, 1.0, K + 1)
-            edges = np.nanquantile(sabs_fin, probs)
-        else:
-            edges = None
-
-        for q in quantiles:
-            qlbl = _qlabel(q)
-
-            if type_quantile == 'cumulative':
-                mask_q = _topk_mask_desc(np.abs(s_all), m_fin, q)
-            else:
-                j = quantiles.index(q) + 1
-                lo, hi = edges[j-1], edges[j]
-                mask_q = m_fin & (np.abs(s_all) >= lo) & (np.abs(s_all) <= hi)
-
-            if not mask_q.any():
-                continue
-
-            # Slice once for this (signal, quantile)
-            s_q   = s_all[mask_q]                          # (m,)
-            sgn_q = sgn[mask_q]                            # (m,)
-            Y_q   = Y[mask_q, :]                           # (m, nt)
-            B_q   = B[mask_q, :]                           # (m, nb)
-
-            # Finite masks and zero-filled views for safe math
-            Y_fin = np.isfinite(Y_q)                       # (m, nt)
-            B_fin = np.isfinite(B_q)                       # (m, nb)
-            Yz    = np.where(Y_fin, Y_q, 0.0)              # (m, nt)
-            Bz    = np.where(B_fin, B_q, 0.0)              # (m, nb)
-
-            # --------- Vectorized PPD per (target, bet) ---------
-            pnl_mat = ( (Yz * sgn_q[:, None]).T @ Bz )     # (nt, nb)
-            not_mat = ( Y_fin.astype(float).T @ Bz )       # (nt, nb)
-            ppd_mat = np.divide(pnl_mat, not_mat, out=np.full_like(pnl_mat, np.nan), where=(not_mat > 0))
-
-            # Save daily PPDs (tiny loops over nt * nb only)
-            for ti, t_name in enumerate(tgt_names):
-                vals = ppd_mat[ti, :]
-                for bi, b_name in enumerate(bet_names):
-                    v = vals[bi]
-                    if np.isfinite(v):
-                        daily_ppd[(s_name, qlbl, t_name, b_name)].append(float(v))
-
-            # --------- Vectorized efficiencyP per (target, bet) ---------
-            # effP_day = |sum_r sgn * y * b| / sum_r |y| * b, using only finite y and b
-            denom_abs = (np.abs(Yz).T @ Bz)                # (nt, nb)
-            effP_mat  = np.divide(np.abs(pnl_mat), denom_abs,
-                                  out=np.full_like(pnl_mat, np.nan),
-                                  where=(denom_abs > 0))
-
-            for ti, t_name in enumerate(tgt_names):
-                vals = effP_mat[ti, :]
-                for bi, b_name in enumerate(bet_names):
-                    v = vals[bi]
-                    if np.isfinite(v):
-                        daily_effp[(s_name, qlbl, t_name, b_name)].append(float(v))
-
-            # --------- Vectorized hit-ratio per (target, bet) ---------
-            y_sign = np.sign(Y_q)                          # (m, nt)
-            nonzero = (y_sign != 0.0) & Y_fin              # valid denom rows (finite and non-zero)
-            denom_mat = (nonzero.astype(float).T @ B_fin.astype(float))   # (nt, nb)
-            eq_sign = ((np.sign(s_q)[:, None] == y_sign) & nonzero)       # (m, nt)
-            numer_mat = (eq_sign.astype(float).T @ B_fin.astype(float))   # (nt, nb)
-
-            for ti, t_name in enumerate(tgt_names):
-                dn = denom_mat[ti, :]
-                nm = numer_mat[ti, :]
-                for bi, b_name in enumerate(bet_names):
-                    d = int(dn[bi])
-                    if d > 0:
-                        hit_den[(s_name, qlbl, t_name, b_name)] += d
-                        hit_num[(s_name, qlbl, t_name, b_name)] += int(nm[bi])
-
-            # --------- Vectorized long-ratio (per bet; independent of target) ---------
-            long_den_vec = np.sum(B_fin, axis=0).astype(int)                        # (nb,)
-            long_num_vec = np.sum((sgn_q > 0)[:, None] & B_fin, axis=0).astype(int) # (nb,)
-            for bi, b_name in enumerate(bet_names):
-                if long_den_vec[bi] > 0:
-                    long_den[(s_name, qlbl, b_name)] += int(long_den_vec[bi])
-                    long_num[(s_name, qlbl, b_name)] += int(long_num_vec[bi])
-
-            # --------- Pooled pairs for r2/t, spearman, dcor (compact append) ---------
-            for bi in range(nb):
-                b_ok = B_fin[:, bi]
-                if not b_ok.any():
-                    continue
-                for ti in range(nt):
-                    y_ok = Y_fin[:, ti]
-                    m = b_ok & y_ok
-                    if not m.any():
-                        continue
-                    xs = s_q[m].astype('float64', copy=False).ravel()
-                    ys = Y_q[m, ti].astype('float64', copy=False).ravel()
-                    key = (s_name, qlbl, tgt_names[ti], bet_names[bi])
-                    pooled_pairs[key]['s'].append(xs)
-                    pooled_pairs[key]['y'].append(ys)
-
-    return (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp)
+    def get(self, key):
+        return self.store.get(key, (np.array([]), np.array([]), 0))[:2]
 
 
-# ===================== SUMMARY over multiple days (parallel) ====================
+# ===================== SUMMARY over multiple days (single-pass) ====================
 def compute_summary_stats_over_days(
     df,
     date_col: str,
@@ -283,15 +139,24 @@ def compute_summary_stats_over_days(
     quantiles: Sequence[float] = (1.0, 0.75, 0.5, 0.25),
     bet_size_cols: Sequence[str] = ('betsize_equal',),
     type_quantile: str = 'cumulative',   # 'cumulative' (>=thr) or 'quantEach' (exact bucket)
-    add_spearman: bool = True,
+    add_spearman: bool = False,
     add_dcor: bool = False,
-    n_jobs: int | None = None,           # None/0 -> serial; -1 -> all cores
-    backend: str = "loky",               # 'loky' (proc), 'threading' if I/O bound
+    n_jobs: int | None = None,           # kept for signature compatibility (unused)
+    backend: str = "loky",               # kept for signature compatibility (unused)
+    # ---- bounded sampling for Spearman/DCOR ----
+    spearman_sample_cap_per_key: int = 10000,
+    random_state: int | None = 123,
 ):
     """
     Returns ONE summary value per (signal, qrank, target, bet).
     Output access pattern:
       out[stat_type][signal][qrank][target][bet] = value
+
+    Fast strategy:
+      • Stream through dates once (no joblib/process pickling).
+      • Welford for daily PPD Sharpe and efficiencyP.
+      • r²/t-stat via pooled sufficient statistics (sx, sy, sxx, syy, sxy).
+      • Spearman/DCOR optionally on a capped reservoir per key.
     """
     import pandas as pd
 
@@ -302,7 +167,6 @@ def compute_summary_stats_over_days(
     target_cols   = _sanitize_list(target_cols)
     bet_size_cols = _sanitize_list(bet_size_cols)
 
-    # Validate date_col & resolve present columns
     if date_col not in df.columns:
         raise KeyError(f"[summary_stats] date_col '{date_col}' not found in DataFrame.")
 
@@ -318,134 +182,257 @@ def compute_summary_stats_over_days(
     if df.empty:
         return out
 
-    # Pre-clean numeric columns to float64 once for all days
+    # Pre-clean numeric columns once
     numeric_cols = [c for c in present if c != date_col]
     for c in numeric_cols:
         df[c] = _float_clean(df[c].to_numpy())
 
-    grouped = list(df.sort_values(date_col).groupby(date_col, sort=True))
+    # Group in chronological order
+    grouped = df.sort_values(date_col).groupby(date_col, sort=True)
 
-    # Accumulators to be merged from per-day pieces
-    daily_ppd    = defaultdict(list)   # (signal, qlabel, target, bet) -> [ppd_day,...]
-    pooled_pairs = defaultdict(lambda: {'s': [], 'y': []})
-    hit_num      = defaultdict(int)
-    hit_den      = defaultdict(int)
-    long_num     = defaultdict(int)    # (signal, qlabel, bet)
-    long_den     = defaultdict(int)
-    daily_effp   = defaultdict(list)   # <--- NEW
-
-    # Run per-day workers (parallel if requested and joblib available)
-    if _HAS_JOBLIB and (n_jobs is not None) and (int(n_jobs) != 0):
-        results = Parallel(n_jobs=n_jobs, backend=backend, prefer="processes")(
-            delayed(_summarize_one_day)(
-                day_df,
-                signal_cols,
-                target_cols,
-                quantiles,
-                bet_size_cols,
-                type_quantile,
-                add_spearman,
-                add_dcor,
-            )
-            for _, day_df in grouped
-        )
-        for part in results:
-            _merge_daily_accumulators(daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp, part)
-    else:
-        for _, day_df in grouped:
-            part = _summarize_one_day(
-                day_df,
-                signal_cols,
-                target_cols,
-                quantiles,
-                bet_size_cols,
-                type_quantile,
-                add_spearman,
-                add_dcor,
-            )
-            _merge_daily_accumulators(daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp, part)
-
-    # ---------- Finalize one value per combo ----------
+    # --------- Streaming accumulators ---------
     sqrt_252 = np.sqrt(252.0)
+    rng = np.random.default_rng(random_state)
 
-    # Sharpe from daily PPD
-    for key_full, series in daily_ppd.items():
-        arr = np.asarray(series, dtype='float64')
-        arr = arr[np.isfinite(arr)]
-        if arr.size >= 2:
-            mu = float(arr.mean())
-            sd = float(arr.std(ddof=0))
-            sharpe = (mu / sd * sqrt_252) if sd > 0 else np.nan
-        else:
-            sharpe = np.nan
-        s, ql, t, b = key_full
-        out['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
+    # Welford stats for daily PPD and efficiencyP
+    ppd_stats = defaultdict(lambda: [0, 0.0, 0.0])   # key=(s,q,t,b)
+    effp_stats = defaultdict(lambda: [0, 0.0, 0.0])  # key=(s,q,t,b)
 
-    # NEW: efficiencyP (average over days)
-    for key_full, series in daily_effp.items():
-        arr = np.asarray(series, dtype='float64')
-        arr = arr[np.isfinite(arr)]
-        val = float(arr.mean()) if arr.size > 0 else np.nan
-        s, ql, t, b = key_full
-        out['efficiencyP'][s][ql][t][b] = val if np.isfinite(val) else np.nan
+    # Regression pooled sufficient stats for r² / t
+    reg = defaultdict(lambda: {'n':0, 'sx':0.0, 'sy':0.0, 'sxx':0.0, 'syy':0.0, 'sxy':0.0})
 
-    # r2, t_stat, spearman, dcor (pooled over all days)
-    for key_full, bits in pooled_pairs.items():
-        x = np.concatenate([np.asarray(a, dtype='float64').ravel() for a in bits['s']]) if bits['s'] else np.array([], dtype='float64')
-        y = np.concatenate([np.asarray(a, dtype='float64').ravel() for a in bits['y']]) if bits['y'] else np.array([], dtype='float64')
-        n = min(x.size, y.size)
+    # Hit / long ratios
+    hit_num = defaultdict(int)         # key=(s,q,t,b)
+    hit_den = defaultdict(int)
+    long_num = defaultdict(int)        # key=(s,q,b)
+    long_den = defaultdict(int)
 
+    # Spearman/DCOR small reservoir
+    sampler = _Reservoir(spearman_sample_cap_per_key if add_spearman or add_dcor else 0,
+                         seed=random_state)
+
+    # --------- Stream each day ---------
+    for _, day in grouped:
+        if day.empty:
+            continue
+
+        # Build matrices
+        sig_names = [c for c in signal_cols if c in day.columns]
+        tgt_names = [c for c in target_cols if c in day.columns]
+        bet_names = [c for c in bet_size_cols if c in day.columns]
+        if not sig_names or not tgt_names or not bet_names:
+            continue
+
+        S = np.column_stack([day[c].to_numpy() for c in sig_names])              # (n, ns)
+        Y = np.column_stack([day[c].to_numpy() for c in tgt_names])              # (n, nt)
+        B = np.column_stack([np.abs(day[c].to_numpy()) for c in bet_names])      # (n, nb)
+
+        n, ns = S.shape
+        _, nt = Y.shape
+        _, nb = B.shape
+
+        for si, s_name in enumerate(sig_names):
+            s_all = S[:, si]
+            m_fin = np.isfinite(s_all)
+            if not m_fin.any():
+                continue
+
+            sgn = np.sign(s_all)
+            abs_s = np.abs(s_all)
+
+            # quantEach edges if needed
+            if type_quantile != 'cumulative':
+                sabs_fin = abs_s[m_fin]
+                if sabs_fin.size:
+                    K = len(quantiles)
+                    probs = np.linspace(0.0, 1.0, K + 1)
+                    edges = np.nanquantile(sabs_fin, probs)
+                else:
+                    edges = None
+            else:
+                edges = None
+
+            for q in quantiles:
+                qlbl = _qlabel(q)
+
+                if type_quantile == 'cumulative':
+                    mask_q = _topk_mask_desc(abs_s, m_fin, q)
+                else:
+                    if edges is None or not np.isfinite(edges).all():
+                        mask_q = np.zeros_like(m_fin, dtype=bool)
+                    else:
+                        j = quantiles.index(q) + 1
+                        lo, hi = edges[j-1], edges[j]
+                        mask_q = m_fin & (abs_s >= lo) & (abs_s <= hi)
+
+                if not mask_q.any():
+                    continue
+
+                # slice once
+                s_q   = s_all[mask_q]                          # (m,)
+                sgn_q = sgn[mask_q]                            # (m,)
+                Y_q   = Y[mask_q, :]                           # (m, nt)
+                B_q   = B[mask_q, :]                           # (m, nb)
+
+                Y_fin = np.isfinite(Y_q)                       # (m, nt)
+                B_fin = np.isfinite(B_q)                       # (m, nb)
+                Yz    = np.where(Y_fin, Y_q, 0.0)              # (m, nt)
+                Bz    = np.where(B_fin, B_q, 0.0)              # (m, nb)
+
+                # ----- PPD matrix (daily) -----
+                pnl_mat = ((Yz * sgn_q[:, None]).T @ Bz)       # (nt, nb)
+                not_mat = (Y_fin.astype(float).T @ Bz)         # (nt, nb)
+                ppd_mat = np.divide(pnl_mat, not_mat, out=np.full_like(pnl_mat, np.nan), where=(not_mat > 0))
+
+                # ----- efficiencyP matrix (daily) -----
+                denom_abs = (np.abs(Yz).T @ Bz)                # (nt, nb)
+                effP_mat  = np.divide(np.abs(pnl_mat), denom_abs,
+                                      out=np.full_like(pnl_mat, np.nan),
+                                      where=(denom_abs > 0))
+
+                # ----- hit ratio counts -----
+                y_sign   = np.sign(Y_q)                        # (m, nt)
+                nonzero  = (y_sign != 0.0) & Y_fin
+                denom_hr = (nonzero.astype(float).T @ B_fin.astype(float))   # (nt, nb)
+                eq_sign  = ((np.sign(s_q)[:, None] == y_sign) & nonzero)
+                numer_hr = (eq_sign.astype(float).T @ B_fin.astype(float))   # (nt, nb)
+
+                # ----- long ratio (per bet) -----
+                long_den_vec = np.sum(B_fin, axis=0).astype(int)                        # (nb,)
+                long_num_vec = np.sum((sgn_q > 0)[:, None] & B_fin, axis=0).astype(int) # (nb,)
+                for bi, b_name in enumerate(bet_names):
+                    if long_den_vec[bi] > 0:
+                        long_den[(s_name, qlbl, b_name)] += int(long_den_vec[bi])
+                        long_num[(s_name, qlbl, b_name)] += int(long_num_vec[bi])
+
+                # ----- update all per (target, bet) -----
+                for ti, t_name in enumerate(tgt_names):
+                    # daily PPD Welford
+                    row_ppd = ppd_mat[ti, :]
+                    row_eff = effP_mat[ti, :]
+                    for bi, b_name in enumerate(bet_names):
+                        v = row_ppd[bi]
+                        if np.isfinite(v):
+                            ppd_stats[(s_name, qlbl, t_name, b_name)] = _welford_update(ppd_stats[(s_name, qlbl, t_name, b_name)], float(v))
+                        ev = row_eff[bi]
+                        if np.isfinite(ev):
+                            effp_stats[(s_name, qlbl, t_name, b_name)] = _welford_update(effp_stats[(s_name, qlbl, t_name, b_name)], float(ev))
+
+                        # hit ratio counts
+                        d = int(denom_hr[ti, bi])
+                        if d > 0:
+                            key = (s_name, qlbl, t_name, b_name)
+                            hit_den[key] += d
+                            hit_num[key] += int(numer_hr[ti, bi])
+
+                        # pooled regression sums (per-row) + optional sample
+                        b_ok = B_fin[:, bi]
+                        y_ok = Y_fin[:, ti]
+                        m = b_ok & y_ok
+                        if m.any():
+                            xs = s_q[m]
+                            ys = Y_q[m, ti]
+                            nrows = xs.size
+                            sx = float(xs.sum()); sy = float(ys.sum())
+                            sxx = float((xs*xs).sum()); syy = float((ys*ys).sum())
+                            sxy = float((xs*ys).sum())
+                            st = reg[(s_name, qlbl, t_name, b_name)]
+                            st['n']  += nrows
+                            st['sx'] += sx
+                            st['sy'] += sy
+                            st['sxx']+= sxx
+                            st['syy']+= syy
+                            st['sxy']+= sxy
+
+                            if add_spearman or add_dcor:
+                                cap = min(1024, spearman_sample_cap_per_key)
+                                if xs.size > cap:
+                                    idx = rng.choice(xs.size, size=cap, replace=False)
+                                    xs = xs[idx]; ys = ys[idx]
+                                sampler.add((s_name, qlbl, t_name, b_name), xs, ys)
+
+    # --------- Finalize into nested output ---------
+    out_nested = create_5d_stats()
+
+    # Sharpe from daily PPD (Welford)
+    for key, st in ppd_stats.items():
+        mu, sd = _welford_finalize(*st)
+        sharpe = (mu / sd * sqrt_252) if (np.isfinite(mu) and np.isfinite(sd) and sd > 0) else np.nan
+        s, ql, t, b = key
+        out_nested['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
+
+    # efficiencyP mean (daily)
+    for key, st in effp_stats.items():
+        n, mean, _ = st
+        val = float(mean) if (n > 0 and np.isfinite(mean)) else np.nan
+        s, ql, t, b = key
+        out_nested['efficiencyP'][s][ql][t][b] = val
+
+    # r2 and t-stat from pooled sufficient stats
+    eps = 1e-15
+    for key, st in reg.items():
+        n = st['n']
         if n >= 3:
-            if x.size != n: x = x[:n]
-            if y.size != n: y = y[:n]
-            try:
-                slope, intercept, r_val, p_val, stderr = linregress(x, y)
-                r2 = float(r_val**2) if np.isfinite(r_val) else np.nan
-                t_stat = float(slope / stderr) if (stderr is not None and stderr > 0) else np.nan
-            except Exception:
-                r2 = np.nan
-                t_stat = np.nan
-
-            if add_spearman:
-                try:
-                    sp = float(spearmanr(x, y, nan_policy='omit').correlation)
-                except Exception:
-                    sp = np.nan
+            sx, sy, sxx, syy, sxy = st['sx'], st['sy'], st['sxx'], st['syy'], st['sxy']
+            cov_xy = sxy - (sx * sy) / n
+            var_x  = sxx - (sx * sx) / n
+            var_y  = syy - (sy * sy) / n
+            if var_x > eps and var_y > eps:
+                r = cov_xy / np.sqrt(var_x * var_y)
+                r = float(np.clip(r, -1.0, 1.0))
+                r2 = r * r
+                denom = max(eps, 1.0 - r2)
+                t_stat = float(r * np.sqrt((n - 2) / denom))
             else:
-                sp = np.nan
-
-            if add_dcor:
-                try:
-                    dc = float(_distance_correlation(x, y))
-                except Exception:
-                    dc = np.nan
-            else:
-                dc = np.nan
+                r2 = np.nan; t_stat = np.nan
         else:
-            r2 = np.nan; t_stat = np.nan; sp = np.nan; dc = np.nan
+            r2 = np.nan; t_stat = np.nan
+        s, ql, t, b = key
+        out_nested['r2'][s][ql][t][b] = r2 if np.isfinite(r2) else np.nan
+        out_nested['t_stat'][s][ql][t][b] = t_stat if np.isfinite(t_stat) else np.nan
 
-        s, ql, t, b = key_full
-        out['r2'][s][ql][t][b] = r2 if np.isfinite(r2) else np.nan
-        out['t_stat'][s][ql][t][b] = t_stat if np.isfinite(t_stat) else np.nan
-        if add_spearman:
-            out['spearman'][s][ql][t][b] = sp if np.isfinite(sp) else np.nan
-        if add_dcor:
-            out['dcor'][s][ql][t][b] = dc if np.isfinite(dc) else np.nan
+    # Optional: Spearman & DCOR on bounded samples
+    if add_spearman or add_dcor:
+        for key in reg.keys():  # compute only where we had data
+            xs, ys = sampler.get(key)
+            s, ql, t, b = key
+            if add_spearman:
+                if xs.size >= 3 and ys.size >= 3:
+                    try:
+                        sp = float(spearmanr(xs, ys, nan_policy='omit').correlation)
+                    except Exception:
+                        sp = np.nan
+                else:
+                    sp = np.nan
+                out_nested['spearman'][s][ql][t][b] = sp if np.isfinite(sp) else np.nan
+            if add_dcor:
+                if xs.size >= 3 and ys.size >= 3:
+                    try:
+                        dc = float(_distance_correlation(xs, ys))
+                    except Exception:
+                        dc = np.nan
+                else:
+                    dc = np.nan
+                out_nested['dcor'][s][ql][t][b] = dc if np.isfinite(dc) else np.nan
 
     # hit ratio
-    for key_full, hn in hit_num.items():
-        hd = hit_den[key_full]
-        s, ql, t, b = key_full
-        out['hit_ratio'][s][ql][t][b] = (hn / hd) if hd > 0 else np.nan
+    for key, hn in hit_num.items():
+        hd = hit_den.get(key, 0)
+        s, ql, t, b = key
+        out_nested['hit_ratio'][s][ql][t][b] = (hn / hd) if hd > 0 else np.nan
 
-    # long ratio (stored per (signal, q, bet); broadcast to all targets)
+    # long ratio (per bet) -> broadcast to all targets we saw in keys
+    seen_targets_per_sqb = defaultdict(set)
+    for (s, ql, t, b) in ppd_stats.keys():
+        seen_targets_per_sqb[(s, ql, b)].add(t)
+
     for (s, ql, b), ln in long_num.items():
-        ld = long_den[(s, ql, b)]
+        ld = long_den.get((s, ql, b), 0)
         val = (ln / ld) if ld > 0 else np.nan
-        for t in target_cols:
-            out['long_ratio'][s][ql][t][b] = val
+        for t in seen_targets_per_sqb.get((s, ql, b), []):
+            out_nested['long_ratio'][s][ql][t][b] = val
 
-    return out
+    return out_nested
 
 
 __all__ = [

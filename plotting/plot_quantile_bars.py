@@ -53,10 +53,10 @@ ROLL_H2_LINES = 60
 ROLL_H3_LINES = 1
 
 # Bottom pages windows:
-ROLL_PNL_NRINSTR  = 1   # right axis: nrInstr → rolling AVERAGE now
-ROLL_PPD_NOTIONAL = 1   # right axis: Notional → rolling AVERAGE; left PPD normalized by rolling AVG Notional
+ROLL_PNL_NRINSTR  = 30   # right axis: nrInstr → rolling AVERAGE now
+ROLL_PPD_NOTIONAL = 30   # right axis: Notional → rolling AVERAGE; left PPD normalized by rolling AVG Notional
 ROLL_PPT_TRADES   = 30   # right axis: Trades → rolling AVERAGE; left PPT normalized by rolling AVG Trades
-NORMALIZE_LEFT_WITH_ROLL = True
+NORMALIZE_LEFT_WITH_ROLL = False
 
 # =========================
 # -------- CONFIG ---------
@@ -66,7 +66,8 @@ BAR_X_VARS    = ['target']
 
 metrics_to_plot = [
     'pnl','ppd','sharpe','hit_ratio','long_ratio',
-    'nrInstr','sizeNotional','r2','t_stat','n_trades','ppt','spearman'
+    'nrInstr','sizeNotional','r2','t_stat','n_trades','ppt'
+    #,'spearman'
     #,'dcor'
 ]
 

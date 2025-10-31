@@ -1,4 +1,3 @@
-# pipeline/outliers_stats.py
 import os
 from typing import List, Tuple
 
@@ -8,20 +7,21 @@ import pandas as pd
 
 def compute_outliers(
     stats_df: pd.DataFrame,
-    stats_list: List[str],                      # required (no defaults)
+    stats_list: List[str],
     z_thresh: float = 3.0,
-    top_k: int = 5,
+    top_k: int = 5,  # kept for backward compatibility; UNUSED
     group_keys: Tuple[str, ...] = ('target', 'signal', 'bet_size_col', 'qrank', 'stat_type'),
 ) -> pd.DataFrame:
     """
-    Flag outliers within each (target, signal, bet_size_col, qrank, stat_type) group over time.
+    Flag outliers *only* by |z| within each (target, signal, bet_size_col, qrank, stat_type) group over time.
     Expects columns: ['date','value','stat_type','signal','target','bet_size_col','qrank'].
 
-    Rules:
-      - Statistical: |z| >= z_thresh, computed within group.
-      - Extremes: top_k largest |value| within group.
+    Rule:
+      - Statistical only: |z| >= z_thresh (computed within group across dates).
 
-    Returns only rows flagged as outliers with diagnostics.
+    Notes:
+      - 'top_k' is ignored (kept to avoid breaking callers).
+      - Output is sorted by |z| descending, then date descending.
     """
     if not stats_list:
         raise ValueError("compute_outliers: 'stats_list' must be a non-empty list of stat_type names.")
@@ -31,33 +31,29 @@ def compute_outliers(
     use = use[np.isfinite(use['value'])]
     if use.empty:
         cols = list(set(['date', 'value'] + list(group_keys))) + [
-            'mean', 'std', 'z', 'abs_val', 'rank_abs', 'is_outlier', 'rule'
+            'mean', 'std', 'z', 'abs_z', 'is_outlier', 'rule'
         ]
         return pd.DataFrame(columns=cols)
 
-    # Ensure datetime for sorting/plotting later
+    # Ensure datetime
     use['date'] = pd.to_datetime(use['date'], errors='coerce')
 
-    # Group-wise stats
+    # Group-wise mean/std/z
     gkeys = list(group_keys)
     use['mean'] = use.groupby(gkeys)['value'].transform('mean')
     use['std']  = use.groupby(gkeys)['value'].transform('std')
     use['z']    = (use['value'] - use['mean']) / use['std'].replace(0, np.nan)
+    use['abs_z'] = use['z'].abs()
 
-    # Magnitudes + ranks
-    use['abs_val']  = use['value'].abs()
-    use['rank_abs'] = use.groupby(gkeys)['abs_val'].rank(ascending=False, method='first')
-
-    # Flags
-    by_z   = use['z'].abs() >= z_thresh
-    by_top = use['rank_abs'] <= top_k
-    use['is_outlier'] = by_z | by_top
-    use.loc[by_z & ~by_top, 'rule']  = f'|z|>={z_thresh}'
-    use.loc[by_top & ~by_z, 'rule']  = f'top_{top_k}_abs'
-    use.loc[by_top & by_z,  'rule']  = f'|z|>={z_thresh}+top_{top_k}'
+    # Flag by z only
+    use['is_outlier'] = use['abs_z'] >= float(z_thresh)
+    use.loc[use['is_outlier'], 'rule'] = f'|z|>={z_thresh}'
 
     out = use[use['is_outlier']].copy()
-    out = out.sort_values(['abs_val', 'date'], ascending=[False, False])
+
+    # Sort strictly by |z| (desc), then by date (desc)
+    out = out.sort_values(['abs_z', 'date'], ascending=[False, False])
+
     return out
 
 
