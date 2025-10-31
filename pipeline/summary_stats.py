@@ -1,5 +1,5 @@
 # =============================
-# summary_stats.py (vectorized, fast + parallel)
+# summary_stats.py (vectorized, fast + parallel)  — now with efficiencyP
 # =============================
 from __future__ import annotations
 
@@ -80,9 +80,11 @@ def _topk_mask_desc(abs_vals: np.ndarray, finite_mask: np.ndarray, q: float) -> 
 
 
 def _merge_daily_accumulators(
-    dest_daily_ppd, dest_pairs, dest_hit_num, dest_hit_den, dest_long_num, dest_long_den, src
+    dest_daily_ppd, dest_pairs, dest_hit_num, dest_hit_den, dest_long_num, dest_long_den,
+    dest_daily_effp,  # <---- NEW
+    src
 ):
-    (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den) = src
+    (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp) = src
     for k, v in daily_ppd.items():
         if v:
             dest_daily_ppd[k].extend(v)
@@ -102,6 +104,10 @@ def _merge_daily_accumulators(
     for k, c in long_den.items():
         if c:
             dest_long_den[k] += c
+    # NEW: efficiencyP day list
+    for k, v in daily_effp.items():
+        if v:
+            dest_daily_effp[k].extend(v)
 
 
 # -------- Vectorized single-day accumulator --------
@@ -118,7 +124,7 @@ def _summarize_one_day(
     """
     Compute per-day accumulators (not the final summary).
     Returns:
-      (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den)
+      (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp)
     """
     import pandas as pd
 
@@ -137,6 +143,7 @@ def _summarize_one_day(
             defaultdict(int),
             defaultdict(int),
             defaultdict(int),
+            defaultdict(list),  # daily_effp
         )
 
     S = np.column_stack([_float_clean(d[c].to_numpy()) for c in sig_names])              # (n, ns)
@@ -147,12 +154,13 @@ def _summarize_one_day(
     _, nt = Y.shape
     _, nb = B.shape
 
-    daily_ppd   = defaultdict(list)                 # key=(signal, qlabel, target, bet) -> [ppd_day,...]
+    daily_ppd    = defaultdict(list)                 # (signal, qlabel, target, bet) -> [ppd_day,...]
     pooled_pairs = defaultdict(lambda: {'s': [], 'y': []})
-    hit_num     = defaultdict(int)
-    hit_den     = defaultdict(int)
-    long_num    = defaultdict(int)                  # key=(signal, qlabel, bet)
-    long_den    = defaultdict(int)
+    hit_num      = defaultdict(int)
+    hit_den      = defaultdict(int)
+    long_num     = defaultdict(int)                  # (signal, qlabel, bet)
+    long_den     = defaultdict(int)
+    daily_effp   = defaultdict(list)                 # <--- NEW (signal, qlabel, target, bet) -> [effP_day,...]
 
     for si, s_name in enumerate(sig_names):
         s_all = S[:, si]
@@ -197,8 +205,6 @@ def _summarize_one_day(
             Bz    = np.where(B_fin, B_q, 0.0)              # (m, nb)
 
             # --------- Vectorized PPD per (target, bet) ---------
-            # pnl[t, b] = sum_r (sgn_q[r] * Y_q[r,t] * B_q[r,b]) over rows with finite Y and B
-            # notional[t, b] = sum_r (1_{Y finite} * B_q[r,b])
             pnl_mat = ( (Yz * sgn_q[:, None]).T @ Bz )     # (nt, nb)
             not_mat = ( Y_fin.astype(float).T @ Bz )       # (nt, nb)
             ppd_mat = np.divide(pnl_mat, not_mat, out=np.full_like(pnl_mat, np.nan), where=(not_mat > 0))
@@ -211,10 +217,23 @@ def _summarize_one_day(
                     if np.isfinite(v):
                         daily_ppd[(s_name, qlbl, t_name, b_name)].append(float(v))
 
+            # --------- Vectorized efficiencyP per (target, bet) ---------
+            # effP_day = |sum_r sgn * y * b| / sum_r |y| * b, using only finite y and b
+            denom_abs = (np.abs(Yz).T @ Bz)                # (nt, nb)
+            effP_mat  = np.divide(np.abs(pnl_mat), denom_abs,
+                                  out=np.full_like(pnl_mat, np.nan),
+                                  where=(denom_abs > 0))
+
+            for ti, t_name in enumerate(tgt_names):
+                vals = effP_mat[ti, :]
+                for bi, b_name in enumerate(bet_names):
+                    v = vals[bi]
+                    if np.isfinite(v):
+                        daily_effp[(s_name, qlbl, t_name, b_name)].append(float(v))
+
             # --------- Vectorized hit-ratio per (target, bet) ---------
             y_sign = np.sign(Y_q)                          # (m, nt)
             nonzero = (y_sign != 0.0) & Y_fin              # valid denom rows (finite and non-zero)
-            # Counts across rows using B_fin as the “pair mask”:
             denom_mat = (nonzero.astype(float).T @ B_fin.astype(float))   # (nt, nb)
             eq_sign = ((np.sign(s_q)[:, None] == y_sign) & nonzero)       # (m, nt)
             numer_mat = (eq_sign.astype(float).T @ B_fin.astype(float))   # (nt, nb)
@@ -237,7 +256,6 @@ def _summarize_one_day(
                     long_num[(s_name, qlbl, b_name)] += int(long_num_vec[bi])
 
             # --------- Pooled pairs for r2/t, spearman, dcor (compact append) ---------
-            # Keep the append tight: only small loops over (target, bet) to build pairs
             for bi in range(nb):
                 b_ok = B_fin[:, bi]
                 if not b_ok.any():
@@ -253,7 +271,7 @@ def _summarize_one_day(
                     pooled_pairs[key]['s'].append(xs)
                     pooled_pairs[key]['y'].append(ys)
 
-    return (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den)
+    return (daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp)
 
 
 # ===================== SUMMARY over multiple days (parallel) ====================
@@ -314,6 +332,7 @@ def compute_summary_stats_over_days(
     hit_den      = defaultdict(int)
     long_num     = defaultdict(int)    # (signal, qlabel, bet)
     long_den     = defaultdict(int)
+    daily_effp   = defaultdict(list)   # <--- NEW
 
     # Run per-day workers (parallel if requested and joblib available)
     if _HAS_JOBLIB and (n_jobs is not None) and (int(n_jobs) != 0):
@@ -331,7 +350,7 @@ def compute_summary_stats_over_days(
             for _, day_df in grouped
         )
         for part in results:
-            _merge_daily_accumulators(daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, part)
+            _merge_daily_accumulators(daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp, part)
     else:
         for _, day_df in grouped:
             part = _summarize_one_day(
@@ -344,7 +363,7 @@ def compute_summary_stats_over_days(
                 add_spearman,
                 add_dcor,
             )
-            _merge_daily_accumulators(daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, part)
+            _merge_daily_accumulators(daily_ppd, pooled_pairs, hit_num, hit_den, long_num, long_den, daily_effp, part)
 
     # ---------- Finalize one value per combo ----------
     sqrt_252 = np.sqrt(252.0)
@@ -362,9 +381,16 @@ def compute_summary_stats_over_days(
         s, ql, t, b = key_full
         out['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
 
+    # NEW: efficiencyP (average over days)
+    for key_full, series in daily_effp.items():
+        arr = np.asarray(series, dtype='float64')
+        arr = arr[np.isfinite(arr)]
+        val = float(arr.mean()) if arr.size > 0 else np.nan
+        s, ql, t, b = key_full
+        out['efficiencyP'][s][ql][t][b] = val if np.isfinite(val) else np.nan
+
     # r2, t_stat, spearman, dcor (pooled over all days)
     for key_full, bits in pooled_pairs.items():
-        # robust concatenation + alignment
         x = np.concatenate([np.asarray(a, dtype='float64').ravel() for a in bits['s']]) if bits['s'] else np.array([], dtype='float64')
         y = np.concatenate([np.asarray(a, dtype='float64').ravel() for a in bits['y']]) if bits['y'] else np.array([], dtype='float64')
         n = min(x.size, y.size)

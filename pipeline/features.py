@@ -21,28 +21,15 @@ def generate_signals_and_targets(
         - optional MDV21-based caps: betsize_cap150k, betsize_cap200k, betsize_cap250k
           computed as min(cap, 0.005 * rolling_median_21d(dollar_vol)), per ticker.
 
-    Key change vs. old version: we build a single panel sorted by ['ticker','date']
-    and use groupby().shift to compute lookback/forward returns. This eliminates
-    start-of-year dips that came from resetting the lookback index.
-
-    Parameters
-    ----------
-    daily_data_by_date : list[(fname, df)]
-        df must include columns: 'ticker', 'prevAdjClose'
-        optional: 'SPpvCLCL' (market log return per date), 'volume'
-        fname must begin with YYYYMMDD (used as the date stamp).
-    horizons : list[int]
-        Lookback/forward horizons (in trading days) for signals/targets.
-    include_bet_caps : bool
-        Whether to compute MDV21-based bet caps.
-
-    Returns
-    -------
-    list of (fname, enriched_df) in the same order as input.
+    Key points:
+      * Single continuous panel across years (no calendar resets).
+      * Drop duplicate (ticker, date); keep the last.
+      * Guard against backward date jumps within each ticker.
+      * Mask first/last h rows per ticker so boundary artifacts (incl. year turn)
+        don’t enter signals/targets used by downstream quantile selection.
     """
 
-    # --------- 1) Build a continuous panel (no per-year reset) ----------
-    # Normalize input → attach a 'date' column parsed from fname[:8]
+    # ---------- 1) Build a continuous panel (no per-year reset) ----------
     records = []
     for fname, df in daily_data_by_date:
         if df is None or df.empty:
@@ -58,19 +45,16 @@ def generate_signals_and_targets(
 
     panel = pd.concat(records, ignore_index=True)
 
-    # Basic hygiene
-    # Keep essential columns; preserve all others to merge back later.
+    # Hygiene & types
     must_have = ["ticker", "date", "prevAdjClose"]
     for col in must_have:
         if col not in panel.columns:
             raise ValueError(f"features.generate_signals_and_targets: required column '{col}' missing.")
 
-    # Force types
     panel["ticker"] = panel["ticker"].astype(str)
     panel["date"] = pd.to_datetime(panel["date"], errors="coerce")
     panel["prevAdjClose"] = pd.to_numeric(panel["prevAdjClose"], errors="coerce")
 
-    # Optional columns
     has_sp = "SPpvCLCL" in panel.columns
     if has_sp:
         panel["SPpvCLCL"] = pd.to_numeric(panel["SPpvCLCL"], errors="coerce")
@@ -78,19 +62,32 @@ def generate_signals_and_targets(
     if has_vol:
         panel["volume"] = pd.to_numeric(panel["volume"], errors="coerce")
 
-    panel = panel.sort_values(["ticker", "date"], kind="mergesort")
+    # Sort, drop rows with bad dates, and de-duplicate (ticker, date)
+    panel = panel.dropna(subset=["date"]).sort_values(["ticker", "date"], kind="mergesort")
+    panel = panel.drop_duplicates(subset=["ticker", "date"], keep="last")
 
-    # --------- 2) Signals (RR/MR) using past prices and market sums ----------
-    # Market sums by date (scalar per day)
+    # Guard against true backward date jumps (allow equal dates)
+    neg_jump = (
+        panel.groupby("ticker", sort=False)["date"]
+        .apply(lambda s: (s.diff().dt.days < 0).any())
+    )
+    if bool(neg_jump.any()):
+        bad_tickers = neg_jump[neg_jump].index.tolist()[:5]
+        raise AssertionError(
+            f"Found backward date jumps within tickers (e.g., {bad_tickers}). "
+            "Upstream loader may be mixing calendars."
+        )
+
+    # ---------- 2) Market series (if provided) ----------
+    # Work at the date level, then map back to panel rows
     if has_sp:
-        # Sum of last h days INCLUDING today (t-h+1..t) for signals MR
         mkt_rolling = (
-            panel.drop_duplicates("date")[["date", "SPpvCLCL"]]
+            panel[["date", "SPpvCLCL"]]
+            .dropna(subset=["date"])
+            .drop_duplicates("date")
             .set_index("date")
             .sort_index()["SPpvCLCL"]
         )
-        # For signals MR: inclusive back-rolling window of length h
-        # For targets MR: sum of next h days EXCLUDING today => shift(-1).rolling(h)
     else:
         mkt_rolling = None
 
@@ -104,13 +101,21 @@ def generate_signals_and_targets(
             out[ok] = np.log(num[ok].values / den[ok].values)
         return out
 
-    # Compute signals/targets per horizon with groupby().shift
     by_ticker = panel.groupby("ticker", sort=False, group_keys=False)
+    # Positions within each ticker to mask first/last h rows (prevents boundary artifacts)
+    pos_in_group = by_ticker.cumcount()
+    n_in_group   = by_ticker["date"].transform("size")
+
+    # ---------- 3) Signals/Targets (RR & MR) ----------
     for h in horizons:
+        valid_back = pos_in_group >= h
+        valid_fwd  = (n_in_group - pos_in_group - 1) >= h
+
         # SIGNALS: past h-day log return
         price_t   = panel["prevAdjClose"]
         price_t_h = by_ticker["prevAdjClose"].shift(h)
-        panel[f"pret_{h}_RR"] = _log_ratio(price_t, price_t_h)
+        sig_rr = _log_ratio(price_t, price_t_h).where(valid_back)
+        panel[f"pret_{h}_RR"] = sig_rr
 
         if has_sp:
             # Sum SPpvCLCL from t-h+1..t (inclusive)
@@ -119,13 +124,15 @@ def generate_signals_and_targets(
                 .reindex(panel["date"].values)
                 .to_numpy()
             )
-            panel[f"pret_{h}_MR"] = panel[f"pret_{h}_RR"] - sp_back_sum
+            sig_mr = (sig_rr - sp_back_sum).where(valid_back)
+            panel[f"pret_{h}_MR"] = sig_mr
         else:
-            panel[f"pret_{h}_MR"] = panel[f"pret_{h}_RR"]
+            panel[f"pret_{h}_MR"] = sig_rr
 
         # TARGETS: forward h-day log return
         price_t_ph = by_ticker["prevAdjClose"].shift(-h)
-        panel[f"fret_{h}_RR"] = _log_ratio(price_t_ph, price_t)
+        tgt_rr = _log_ratio(price_t_ph, price_t).where(valid_fwd)
+        panel[f"fret_{h}_RR"] = tgt_rr
 
         if has_sp:
             # Sum SPpvCLCL from t+1..t+h (exclude today)
@@ -134,15 +141,15 @@ def generate_signals_and_targets(
                 .reindex(panel["date"].values)
                 .to_numpy()
             )
-            panel[f"fret_{h}_MR"] = panel[f"fret_{h}_RR"] - sp_fwd_sum
+            tgt_mr = (tgt_rr - sp_fwd_sum).where(valid_fwd)
+            panel[f"fret_{h}_MR"] = tgt_mr
         else:
-            panel[f"fret_{h}_MR"] = panel[f"fret_{h}_RR"]
+            panel[f"fret_{h}_MR"] = tgt_rr
 
-    # --------- 3) Bet sizes ----------
+    # ---------- 4) Bet sizes ----------
     panel["betsize_equal"] = 1.0
 
     if include_bet_caps and has_vol and ("prevAdjClose" in panel.columns):
-        # Dollar volume and 21-day rolling median per ticker
         panel["dollar_vol"] = panel["volume"] * panel["prevAdjClose"]
         mdv21 = (
             by_ticker["dollar_vol"]
@@ -154,51 +161,41 @@ def generate_signals_and_targets(
 
         def _cap(colname, cap_amt):
             panel[colname] = np.minimum(cap_amt, 0.005 * panel["mdv21"])
-            # If mdv21 is NaN, fall back to 1.0 so the column exists and is usable
+            # If mdv21 is NaN (early warmup), fall back to 1.0 so column is usable
             panel[colname] = panel[colname].where(panel["mdv21"].notna(), 1.0)
 
         _cap("betsize_cap150k", 150000.0)
         _cap("betsize_cap200k", 200000.0)
         _cap("betsize_cap250k", 250000.0)
     else:
-        # Provide the columns with 1.0 so downstream code is not surprised
         panel["betsize_cap150k"] = 1.0
         panel["betsize_cap200k"] = 1.0
         panel["betsize_cap250k"] = 1.0
 
-    # --------- 4) (Optional) downcast floats to save memory ----------
+    # ---------- 5) Downcast floats to save memory ----------
     float_cols = panel.select_dtypes(include=["float64", "float32"]).columns
     if len(float_cols):
         panel[float_cols] = panel[float_cols].astype("float32")
 
-    # --------- 5) Split back into original per-day DataFrames ----------
-    # We maintain the original order and row set of each input df, and left-merge the new columns.
+    # ---------- 6) Split back to per-day frames ----------
     result = []
-    # Collect the set of new columns we created
     new_cols = [c for c in panel.columns if c.startswith("pret_") or c.startswith("fret_") or c.startswith("betsize_")]
-    new_cols = sorted(set(new_cols))  # stable order
-
-    # Quick index by date for fast slicing
+    new_cols = sorted(set(new_cols))
     panel_idx = panel.set_index("date")
 
     for fname, df_orig in daily_data_by_date:
         d = pd.to_datetime(str(fname)[:8], format="%Y%m%d", errors="coerce")
-        # Subset panel for that date with only (ticker + new columns)
         try:
             sub = panel_idx.loc[d].reset_index()
         except KeyError:
-            # No data for this date (e.g., holiday); just attach defaults
             sub = pd.DataFrame(columns=["date", "ticker"] + new_cols)
 
         keep = ["ticker"] + new_cols
         sub = sub[keep] if not sub.empty else pd.DataFrame(columns=keep)
 
-        # Merge onto original df to preserve all other columns and row order
+        # Merge onto original df to preserve other columns and row order
         enriched = df_orig.merge(sub, on="ticker", how="left")
-
-        # Always echo the 'date' as a string (YYYYMMDD) for downstream usage
-        enriched["date"] = str(fname)[:8]
-
+        enriched["date"] = str(fname)[:8]  # always store YYYYMMDD string
         result.append((fname, enriched))
 
     return result

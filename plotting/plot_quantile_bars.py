@@ -48,14 +48,14 @@ H3_BETS    = "AUTO"
 # =========================
 # ---- PER-GRAPH ROLLING WINDOWS ----
 # =========================
-ROLL_H1_LINES = 1
-ROLL_H2_LINES = 1
+ROLL_H1_LINES = 60
+ROLL_H2_LINES = 60
 ROLL_H3_LINES = 1
 
 # Bottom pages windows:
 ROLL_PNL_NRINSTR  = 1   # right axis: nrInstr → rolling AVERAGE now
 ROLL_PPD_NOTIONAL = 1   # right axis: Notional → rolling AVERAGE; left PPD normalized by rolling AVG Notional
-ROLL_PPT_TRADES   = 1   # right axis: Trades → rolling AVERAGE; left PPT normalized by rolling AVG Trades
+ROLL_PPT_TRADES   = 30   # right axis: Trades → rolling AVERAGE; left PPT normalized by rolling AVG Trades
 NORMALIZE_LEFT_WITH_ROLL = True
 
 # =========================
