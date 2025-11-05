@@ -1,81 +1,136 @@
-# runner.py — fast daily loop + lean summary (no year-open overrides)
+# pipeline/runner.py — consume daily feature PKLs -> produce stats/summary/outliers (all PKL)
 import os
-import pandas as pd
-import numpy as np
-from tempfile import NamedTemporaryFile
+import re
+import pickle
 import shutil
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 
-from pipeline.loader import load_daily_files
-from pipeline.features import generate_signals_and_targets
+import pandas as pd
+
 from pipeline.daily_stats import compute_daily_stats
 from pipeline.summary_stats import compute_summary_stats_over_days
-from pipeline.outliers_stats import compute_outliers, save_outliers  # PKL
+from pipeline.outliers_stats import compute_outliers, save_outliers
 
-# ======== CONFIG ========
-RAW_DATA_DIR = 'data/RAW_DATA'
+# ===================== CONFIG =====================
+FEATURES_INPUT_DIR  = "output/DAILY_FEATURES_PKL"   # where features_{YYYYMMDD}.pkl live
+FEATURES_GLOB       = "features_*.pkl"
 
-OUTPUT_ROOT       = 'output'
-DAILY_STATS_DIR   = os.path.join(OUTPUT_ROOT, 'DAILY_STATS')
-SUMMARY_STATS_DIR = os.path.join(OUTPUT_ROOT, 'SUMMARY_STATS')
-OUTLIERS_DIR      = os.path.join(OUTPUT_ROOT, 'OUTLIERS')
+OUTPUT_ROOT         = "output"
+DAILY_STATS_DIR     = os.path.join(OUTPUT_ROOT, "DAILY_STATS")
+SUMMARY_STATS_DIR   = os.path.join(OUTPUT_ROOT, "SUMMARY_STATS")
+OUTLIERS_DIR        = os.path.join(OUTPUT_ROOT, "OUTLIERS")
+
 os.makedirs(DAILY_STATS_DIR, exist_ok=True)
 os.makedirs(SUMMARY_STATS_DIR, exist_ok=True)
 os.makedirs(OUTLIERS_DIR, exist_ok=True)
 
-# Outliers: z-score based (top-K rule removed in compute_outliers per your change)
-OUTLIER_METRICS  = ['pnl', 'ppd', 'sizeNotional', 'nrInstr', 'n_trades', 'ppt']
-OUTLIER_Z_THRESH = 3.0
+# Stats knobs
+QUANTILES           = [1.0, 0.75, 0.5, 0.25]
+TYPE_QUANTILE       = "cumulative"
 
-# ======== UTIL ========
-def _atomic_pickle_dump(df: pd.DataFrame, path: str) -> None:
+# Outliers knobs (MUST be non-empty for compute_outliers)
+OUTLIER_METRICS     = ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades", "ppt"]
+OUTLIER_Z_THRESH    = 3.0
+
+# ===================== UTILS =====================
+def _atomic_pickle_dump(obj, path: str) -> None:
+    """Atomic write of a pickle file (uses highest protocol)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with NamedTemporaryFile(dir=os.path.dirname(path), delete=False) as tmp:
-        df.to_pickle(tmp.name)
+        pickle.dump(obj, tmp, protocol=pickle.HIGHEST_PROTOCOL)
         tmp_name = tmp.name
-    shutil.move(tmp_name, path)
+    os.replace(tmp_name, path)
 
-# ============================== PIPELINE ==============================
+def _extract_date_str(name: str) -> str | None:
+    """Extract YYYYMMDD from a filename like 'features_20240103.pkl' or any name containing 8 digits."""
+    m = re.search(r"(\d{8})", name)
+    return m.group(1) if m else None
+
+def _read_pickle_compat(path: Path):
+    """
+    Load a pickle across NumPy 1.x/2.x by remapping module paths:
+    'numpy._core.*' -> 'numpy.core.*'
+    """
+    class NPCompatUnpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module.startswith("numpy._core"):
+                module = module.replace("numpy._core", "numpy.core")
+            return super().find_class(module, name)
+    with path.open("rb") as f:
+        return NPCompatUnpickler(f).load()
+
+# ===================== PIPELINE =====================
 def run_pipeline():
-    # 1) Load & feature
-    daily_data = load_daily_files(RAW_DATA_DIR)
-    enriched_data = generate_signals_and_targets(daily_data)
+    # 1) Discover and load feature PKLs (one per day)
+    features_dir = Path(FEATURES_INPUT_DIR)
+    files = sorted(features_dir.glob(FEATURES_GLOB), key=lambda p: p.name)
+    if not files:
+        print(f"[stop] No feature PKLs matching {features_dir / FEATURES_GLOB}")
+        return {
+            "daily_dir": DAILY_STATS_DIR,
+            "summary_path": None,
+            "outliers_path": None,
+            "index_csv": None,
+            "index_pkl": None,
+        }
 
-    # chronological order
     items = []
-    for fname, df in enriched_data:
-        day_str = fname[:8]
-        day_dt = pd.to_datetime(day_str, format='%Y%m%d', errors='coerce')
-        if pd.isna(day_dt):
-            if 'date' in df.columns:
-                day_dt = pd.to_datetime(df['date'].iloc[0])
-            else:
-                continue
-        items.append((day_dt, day_str, fname, df))
-    items.sort(key=lambda x: x[0])
-
-    daily_stats_frames = []     # for outliers
-    per_day_index_rows = []
-
-    # Quantile config
-    quantiles = [1.0, 0.75, 0.5, 0.25]
-    type_quantile = 'cumulative'
-
-    # Collect minimal per-day frames for summary (only needed columns)
-    raw_days_for_summary = []
-    needed_sig = set()
-    needed_tgt = set()
-    needed_bet = set()
-
-    # 2) Per-day loop
-    for day_dt, day_str, fname, df in items:
-        signal_cols = [c for c in df.columns if c.startswith('pret_')]
-        target_cols = [c for c in df.columns if c.startswith('fret_')]
-        bet_size_cols_all = ['betsize_equal', 'betsize_cap200k', 'betsize_cap250k']
-        bet_size_cols = [b for b in bet_size_cols_all if b in df.columns]
-
-        if not signal_cols or not target_cols or not bet_size_cols:
-            print(f"Skipping {fname}: missing signals/targets/bets")
+    for p in files:
+        day_str = _extract_date_str(p.name)
+        if not day_str:
+            print(f"[skip] cannot parse date from {p.name}")
             continue
+
+        try:
+            df = _read_pickle_compat(p)
+        except Exception as e:
+            print(f"[skip] failed to read {p}: {e}")
+            continue
+
+        # Must have ticker and at least one pret_/fret_/betsize_
+        if "ticker" not in df.columns:
+            print(f"[skip] {p.name}: missing 'ticker'")
+            continue
+        signal_cols = [c for c in df.columns if c.startswith("pret_")]
+        target_cols = [c for c in df.columns if c.startswith("fret_")]
+        bet_cols    = [c for c in df.columns if c.startswith("betsize_")]
+        if not signal_cols or not target_cols or not bet_cols:
+            print(f"[skip] {p.name}: missing features (pret_*, fret_*, betsize_*)")
+            continue
+
+        keep = ["ticker"] + sorted(set(signal_cols + target_cols + bet_cols))
+        df_use = df[keep].copy()
+
+        day_dt = pd.to_datetime(day_str, format="%Y%m%d", errors="coerce")
+        if pd.isna(day_dt):
+            print(f"[skip] bad date {day_str} from {p.name}")
+            continue
+
+        items.append((day_dt, day_str, str(p), df_use))
+
+    # sort chronologically
+    items.sort(key=lambda x: x[0])
+    if not items:
+        print("[stop] No usable feature files after filtering.")
+        return {
+            "daily_dir": DAILY_STATS_DIR,
+            "summary_path": None,
+            "outliers_path": None,
+            "index_csv": None,
+            "index_pkl": None,
+        }
+
+    # 2) Per-day stats (PKL), and build inputs for summary/outliers
+    daily_stats_frames = []
+    per_day_index_rows = []
+    raw_days_for_summary = []
+    needed_sig, needed_tgt, needed_bet = set(), set(), set()
+
+    for day_dt, day_str, src_path, df in items:
+        signal_cols    = [c for c in df.columns if c.startswith("pret_")]
+        target_cols    = [c for c in df.columns if c.startswith("fret_")]
+        bet_size_cols  = [c for c in df.columns if c.startswith("betsize_")]
 
         needed_sig.update(signal_cols)
         needed_tgt.update(target_cols)
@@ -86,14 +141,14 @@ def run_pipeline():
             df,
             signal_cols=signal_cols,
             target_cols=target_cols,
-            quantiles=quantiles,
+            quantiles=QUANTILES,
             bet_size_cols=bet_size_cols,
-            type_quantile=type_quantile,
-            empty_day_policy='carry',
+            type_quantile=TYPE_QUANTILE,
+            empty_day_policy="carry",
             report_empty_trades_as_nan=True,
         )
 
-        # SAVE daily stats
+        # Flatten nested dict -> rows
         rows = []
         for stat_type, sig_dict in stats.items():
             for s, qd in sig_dict.items():
@@ -101,27 +156,28 @@ def run_pipeline():
                     for t, bd in td.items():
                         for b, v in bd.items():
                             rows.append((day_str, s, t, q, stat_type, b, v))
+
         if not rows:
-            print(f"Skipping {fname}: no stats produced")
+            print(f"[skip] {day_str}: no stats produced")
             continue
 
         day_df_stats = pd.DataFrame(
             rows,
-            columns=['date','signal','target','qrank','stat_type','bet_size_col','value']
+            columns=["date", "signal", "target", "qrank", "stat_type", "bet_size_col", "value"],
         )
-        out_path = os.path.join(DAILY_STATS_DIR, f'stats_{day_str}.pkl')
+        out_path = os.path.join(DAILY_STATS_DIR, f"stats_{day_str}.pkl")
         _atomic_pickle_dump(day_df_stats, out_path)
-        per_day_index_rows.append({'date': day_str, 'path': out_path, 'n_rows': len(day_df_stats)})
+        per_day_index_rows.append({"date": day_str, "path": out_path, "n_rows": len(day_df_stats)})
         daily_stats_frames.append(day_df_stats)
-        print(f"📦 Saved daily stats for {day_str} -> {out_path} ({len(day_df_stats)} rows)")
+        print(f"📦 Saved daily stats PKL for {day_str} -> {out_path} ({len(day_df_stats)} rows)")
 
-        # Keep a LEAN frame for summary (only needed columns + date)
-        keep_cols = ['date'] + signal_cols + target_cols + bet_size_cols
+        # lean frame for summary
+        keep_cols = ["date"] + signal_cols + target_cols + bet_size_cols
         raw_days_for_summary.append(
             df[signal_cols + target_cols + bet_size_cols].assign(date=day_dt)[keep_cols]
         )
 
-    # 3) FINALIZE SUMMARY using optimized summary_stats.py
+    # 3) Summary stats over all days (PKL)
     summary_path = None
     if raw_days_for_summary:
         big_df = pd.concat(raw_days_for_summary, ignore_index=True, copy=False)
@@ -131,29 +187,27 @@ def run_pipeline():
         bet_list = sorted([c for c in needed_bet if c in big_df.columns])
 
         if sig_list and tgt_list and bet_list:
-            # Fast: disable expensive correlations unless needed
             summary = compute_summary_stats_over_days(
                 big_df,
                 date_col="date",
                 signal_cols=sig_list,
                 target_cols=tgt_list,
                 bet_size_cols=bet_list,
-                quantiles=quantiles,
-                type_quantile=type_quantile,
+                quantiles=QUANTILES,
+                type_quantile=TYPE_QUANTILE,
                 add_spearman=False,
                 add_dcor=False,
-                # If your summary_stats supports these knobs, keep them; else remove:
                 spearman_sample_cap_per_key=10000,
                 random_state=123,
             )
 
             # flatten summary -> rows; tag with date range
-            all_days = pd.to_datetime(big_df['date'], errors='coerce')
-            first_date = pd.to_datetime(all_days.min())
-            last_date  = pd.to_datetime(all_days.max())
-            date_tag   = (
-                f"{first_date:%Y%m%d}_{last_date:%Y%m%d}"
-                if pd.notna(first_date) and pd.notna(last_date) else "summary"
+            all_days  = pd.to_datetime(big_df["date"], errors="coerce")
+            first_day = pd.to_datetime(all_days.min())
+            last_day  = pd.to_datetime(all_days.max())
+            date_tag  = (
+                f"{first_day:%Y%m%d}_{last_day:%Y%m%d}"
+                if pd.notna(first_day) and pd.notna(last_day) else "summary"
             )
 
             s_rows = []
@@ -163,65 +217,71 @@ def run_pipeline():
                         for t, bd in td.items():
                             for b, v in bd.items():
                                 s_rows.append((
-                                    f"{last_date:%Y%m%d}" if pd.notna(last_date) else None,
+                                    f"{last_day:%Y%m%d}" if pd.notna(last_day) else None,
                                     s, t, q, stat_type, b, v
                                 ))
 
             if s_rows:
                 summary_df = pd.DataFrame(
                     s_rows,
-                    columns=['date','signal','target','qrank','stat_type','bet_size_col','value']
+                    columns=["date", "signal", "target", "qrank", "stat_type", "bet_size_col", "value"],
                 )
-                summary_path = os.path.join(SUMMARY_STATS_DIR, f'summary_stats_{date_tag}.pkl')
+                summary_path = os.path.join(SUMMARY_STATS_DIR, f"summary_stats_{date_tag}.pkl")
                 _atomic_pickle_dump(summary_df, summary_path)
-                print(f"✅ Saved summary stats -> {summary_path} ({len(summary_df)} rows)")
+                print(f"✅ Saved summary stats PKL -> {summary_path} ({len(summary_df)} rows)")
             else:
-                print("Summary produced no rows; not saving.")
+                print("[info] Summary produced no rows; not saving.")
         else:
-            print("No valid columns for summary stats; skipping summary save.")
+            print("[info] No valid columns for summary stats; skipping summary save.")
     else:
-        print("No daily data collected; skipping summary computation.")
+        print("[info] No daily data collected; skipping summary computation.")
 
-    # 4) OUTLIERS from all daily stat frames (z-score only in compute_outliers)
+    # 4) Outliers across all daily-stat frames (PKL)
     outliers_path = None
     if daily_stats_frames:
         stats_all = pd.concat(daily_stats_frames, ignore_index=True, copy=False)
-        dates = pd.to_datetime(stats_all['date'], errors='coerce')
-        first_date = pd.to_datetime(dates.min())
-        last_date  = pd.to_datetime(dates.max())
-        date_tag   = (
-            f"{first_date:%Y%m%d}_{last_date:%Y%m%d}"
-            if pd.notna(first_date) and pd.notna(last_date) else "all"
+        dates = pd.to_datetime(stats_all["date"], errors="coerce")
+        first_day = pd.to_datetime(dates.min())
+        last_day  = pd.to_datetime(dates.max())
+        date_tag  = (
+            f"{first_day:%Y%m%d}_{last_day:%Y%m%d}"
+            if pd.notna(first_day) and pd.notna(last_day) else "all"
         )
 
         odf = compute_outliers(
             stats_all,
-            stats_list=OUTLIER_METRICS,
+            stats_list=OUTLIER_METRICS,      # <-- FIX: non-empty stat list
             z_thresh=OUTLIER_Z_THRESH,
         )
-        outliers_path = os.path.join(OUTLIERS_DIR, f'outliers_{date_tag}.pkl')
+        outliers_path = os.path.join(OUTLIERS_DIR, f"outliers_{date_tag}.pkl")
         save_outliers(odf, outliers_path)
-        print(f"⚠️  Saved outliers -> {outliers_path} ({len(odf)} rows)")
+        print(f"⚠️  Saved outliers PKL -> {outliers_path} ({len(odf)} rows)")
     else:
-        print("No daily stats frames accumulated; skipping outlier computation.")
+        print("[info] No daily stats frames accumulated; skipping outlier computation.")
 
-    # 5) Index of daily files
-    index_path = None
+    # 5) Write index for daily stats (CSV + PKL)
+    index_csv = None
+    index_pkl = None
     if per_day_index_rows:
-        index_df = pd.DataFrame(per_day_index_rows).sort_values('date')
-        index_path = os.path.join(DAILY_STATS_DIR, '_index.csv')
-        with NamedTemporaryFile(dir=os.path.dirname(index_path), delete=False, mode='w', newline='') as tmp:
+        index_df = pd.DataFrame(per_day_index_rows).sort_values("date")
+        index_csv = os.path.join(DAILY_STATS_DIR, "_index.csv")
+        with NamedTemporaryFile(dir=os.path.dirname(index_csv), delete=False, mode="w", newline="") as tmp:
             index_df.to_csv(tmp.name, index=False)
             tmp_name = tmp.name
-        shutil.move(tmp_name, index_path)
-        print(f"🧭 Wrote daily index -> {index_path}")
+        shutil.move(tmp_name, index_csv)
+
+        index_pkl = os.path.join(DAILY_STATS_DIR, "_index.pkl")
+        _atomic_pickle_dump(index_df, index_pkl)
+        print(f"🧭 Wrote daily index -> {index_csv} and {index_pkl}")
 
     return {
-        'daily_dir': DAILY_STATS_DIR,
-        'summary_path': summary_path,
-        'outliers_path': outliers_path,
-        'index_path': index_path,
+        "daily_dir": DAILY_STATS_DIR,
+        "summary_path": summary_path,
+        "outliers_path": outliers_path,
+        "index_csv": index_csv,
+        "index_pkl": index_pkl,
     }
 
+# ===================== ENTRY =====================
 if __name__ == "__main__":
     run_pipeline()

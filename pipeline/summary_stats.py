@@ -157,6 +157,7 @@ def compute_summary_stats_over_days(
       • Welford for daily PPD Sharpe and efficiencyP.
       • r²/t-stat via pooled sufficient statistics (sx, sy, sxx, syy, sxy).
       • Spearman/DCOR optionally on a capped reservoir per key.
+      • Accumulate totals for pnl / notional / instruments / trades, then derive ppd & ppt.
     """
     import pandas as pd
 
@@ -210,6 +211,12 @@ def compute_summary_stats_over_days(
     # Spearman/DCOR small reservoir
     sampler = _Reservoir(spearman_sample_cap_per_key if add_spearman or add_dcor else 0,
                          seed=random_state)
+
+    # Daily totals accumulators (streamed sums over days)
+    sum_pnl       = defaultdict(float)  # key=(s,q,t,b)
+    sum_notional  = defaultdict(float)  # key=(s,q,t,b)
+    sum_nrInstr   = defaultdict(float)  # key=(s,q,t,b)  (count summed over days)
+    sum_ntrades   = defaultdict(float)  # key=(s,q,t,b)  (same definition here)
 
     # --------- Stream each day ---------
     for _, day in grouped:
@@ -279,10 +286,14 @@ def compute_summary_stats_over_days(
                 Yz    = np.where(Y_fin, Y_q, 0.0)              # (m, nt)
                 Bz    = np.where(B_fin, B_q, 0.0)              # (m, nb)
 
-                # ----- PPD matrix (daily) -----
+                # ----- PnL / Notional (daily matrices) -----
                 pnl_mat = ((Yz * sgn_q[:, None]).T @ Bz)       # (nt, nb)
                 not_mat = (Y_fin.astype(float).T @ Bz)         # (nt, nb)
-                ppd_mat = np.divide(pnl_mat, not_mat, out=np.full_like(pnl_mat, np.nan), where=(not_mat > 0))
+
+                # ----- PPD matrix (daily) -----
+                ppd_mat = np.divide(pnl_mat, not_mat,
+                                    out=np.full_like(pnl_mat, np.nan),
+                                    where=(not_mat > 0))
 
                 # ----- efficiencyP matrix (daily) -----
                 denom_abs = (np.abs(Yz).T @ Bz)                # (nt, nb)
@@ -307,28 +318,44 @@ def compute_summary_stats_over_days(
 
                 # ----- update all per (target, bet) -----
                 for ti, t_name in enumerate(tgt_names):
-                    # daily PPD Welford
                     row_ppd = ppd_mat[ti, :]
                     row_eff = effP_mat[ti, :]
+
                     for bi, b_name in enumerate(bet_names):
+                        key = (s_name, qlbl, t_name, b_name)
+
+                        # Welford (daily PPD / efficiencyP)
                         v = row_ppd[bi]
                         if np.isfinite(v):
-                            ppd_stats[(s_name, qlbl, t_name, b_name)] = _welford_update(ppd_stats[(s_name, qlbl, t_name, b_name)], float(v))
+                            ppd_stats[key] = _welford_update(ppd_stats[key], float(v))
                         ev = row_eff[bi]
                         if np.isfinite(ev):
-                            effp_stats[(s_name, qlbl, t_name, b_name)] = _welford_update(effp_stats[(s_name, qlbl, t_name, b_name)], float(ev))
+                            effp_stats[key] = _welford_update(effp_stats[key], float(ev))
 
                         # hit ratio counts
                         d = int(denom_hr[ti, bi])
                         if d > 0:
-                            key = (s_name, qlbl, t_name, b_name)
                             hit_den[key] += d
                             hit_num[key] += int(numer_hr[ti, bi])
 
-                        # pooled regression sums (per-row) + optional sample
+                        # NEW: accumulate activity totals (daily -> running sums)
+                        p = pnl_mat[ti, bi]
+                        ntn = not_mat[ti, bi]
+                        if np.isfinite(p):
+                            sum_pnl[key] += float(p)
+                        if np.isfinite(ntn):
+                            sum_notional[key] += float(ntn)
+
+                        # nrInstr / n_trades: count of rows contributing to this (t,b) today
                         b_ok = B_fin[:, bi]
                         y_ok = Y_fin[:, ti]
                         m = b_ok & y_ok
+                        if m.any():
+                            cnt = float(np.sum(m))
+                            sum_nrInstr[key] += cnt
+                            sum_ntrades[key] += cnt  # same definition here
+
+                        # pooled regression sums (per-row) + optional sample
                         if m.any():
                             xs = s_q[m]
                             ys = Y_q[m, ti]
@@ -336,7 +363,7 @@ def compute_summary_stats_over_days(
                             sx = float(xs.sum()); sy = float(ys.sum())
                             sxx = float((xs*xs).sum()); syy = float((ys*ys).sum())
                             sxy = float((xs*ys).sum())
-                            st = reg[(s_name, qlbl, t_name, b_name)]
+                            st = reg[key]
                             st['n']  += nrows
                             st['sx'] += sx
                             st['sy'] += sy
@@ -349,7 +376,7 @@ def compute_summary_stats_over_days(
                                 if xs.size > cap:
                                     idx = rng.choice(xs.size, size=cap, replace=False)
                                     xs = xs[idx]; ys = ys[idx]
-                                sampler.add((s_name, qlbl, t_name, b_name), xs, ys)
+                                sampler.add(key, xs, ys)
 
     # --------- Finalize into nested output ---------
     out_nested = create_5d_stats()
@@ -431,6 +458,25 @@ def compute_summary_stats_over_days(
         val = (ln / ld) if ld > 0 else np.nan
         for t in seen_targets_per_sqb.get((s, ql, b), []):
             out_nested['long_ratio'][s][ql][t][b] = val
+
+    # ===== Activity metrics to SUMMARY (totals + ratios) =====
+    all_keys = set(sum_pnl) | set(sum_notional) | set(sum_nrInstr) | set(sum_ntrades)
+    for key in all_keys:
+        pnl_tot  = sum_pnl.get(key, 0.0)
+        not_tot  = sum_notional.get(key, 0.0)
+        nrin_tot = sum_nrInstr.get(key, 0.0)
+        ntrd_tot = sum_ntrades.get(key, 0.0)
+
+        ppd_val = (pnl_tot / not_tot) if (np.isfinite(pnl_tot) and np.isfinite(not_tot) and not_tot > 0) else np.nan
+        ppt_val = (pnl_tot / ntrd_tot) if (np.isfinite(pnl_tot) and np.isfinite(ntrd_tot) and ntrd_tot > 0) else np.nan
+
+        s, ql, t, b = key
+        out_nested['pnl'][s][ql][t][b]          = float(pnl_tot) if np.isfinite(pnl_tot) else np.nan
+        out_nested['sizeNotional'][s][ql][t][b] = float(not_tot) if np.isfinite(not_tot) else np.nan
+        out_nested['nrInstr'][s][ql][t][b]      = float(nrin_tot) if np.isfinite(nrin_tot) else np.nan
+        out_nested['n_trades'][s][ql][t][b]     = float(ntrd_tot) if np.isfinite(ntrd_tot) else np.nan
+        out_nested['ppd'][s][ql][t][b]          = float(ppd_val) if np.isfinite(ppd_val) else np.nan
+        out_nested['ppt'][s][ql][t][b]          = float(ppt_val) if np.isfinite(ppt_val) else np.nan
 
     return out_nested
 

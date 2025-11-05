@@ -9,6 +9,17 @@ start = time.perf_counter()
 
 DEFAULT_COLS = ['date','signal','target','qrank','stat_type','bet_size_col','value']
 
+# --- NEW: NumPy 1.x/2.x compatible pickle loader ---
+def read_pickle_compat(path: str):
+    """Unpickle objects across NumPy 1.x/2.x by remapping numpy._core -> numpy.core."""
+    class NPCompatUnpickler(pkl.Unpickler):
+        def find_class(self, module, name):
+            if module.startswith("numpy._core"):
+                module = module.replace("numpy._core", "numpy.core")
+            return super().find_class(module, name)
+    with open(path, "rb") as f:
+        return NPCompatUnpickler(f).load()
+
 if __name__ == '__main__':
     result = run_pipeline()
 
@@ -19,7 +30,8 @@ if __name__ == '__main__':
 
         # Gather all daily frames
         daily_paths = sorted(glob.glob(os.path.join(daily_dir, 'stats_*.pkl'))) if daily_dir else []
-        daily_frames = [pd.read_pickle(p) for p in daily_paths]
+        # CHANGED: use compat loader instead of pd.read_pickle
+        daily_frames = [read_pickle_compat(p) for p in daily_paths]
         stats_daily = (
             pd.concat(daily_frames, ignore_index=True)
             if daily_frames else pd.DataFrame(columns=DEFAULT_COLS)
@@ -27,7 +39,8 @@ if __name__ == '__main__':
 
         # Read summary (optional)
         if summary_path and os.path.exists(summary_path):
-            stats_summary = pd.read_pickle(summary_path)
+            # CHANGED: use compat loader instead of pd.read_pickle
+            stats_summary = read_pickle_compat(summary_path)
         else:
             stats_summary = pd.DataFrame(columns=DEFAULT_COLS)
 
