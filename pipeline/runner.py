@@ -21,6 +21,10 @@ DAILY_STATS_DIR     = os.path.join(OUTPUT_ROOT, "DAILY_STATS")
 SUMMARY_STATS_DIR   = os.path.join(OUTPUT_ROOT, "SUMMARY_STATS")
 OUTLIERS_DIR        = os.path.join(OUTPUT_ROOT, "OUTLIERS")
 
+# Market proxy settings
+SPY_TICKER          = "SPY"          # the ticker string inside 'ticker' column
+SPY_COL_NAME        = "spy_ret"      # column we'll synthesize per day with SPY return
+
 os.makedirs(DAILY_STATS_DIR, exist_ok=True)
 os.makedirs(SUMMARY_STATS_DIR, exist_ok=True)
 os.makedirs(OUTLIERS_DIR, exist_ok=True)
@@ -30,7 +34,8 @@ QUANTILES           = [1.0, 0.75, 0.5, 0.25]
 TYPE_QUANTILE       = "cumulative"
 
 # Outliers knobs (MUST be non-empty for compute_outliers)
-OUTLIER_METRICS     = ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades", "ppt"]
+# NOTE: PPT removed everywhere.
+OUTLIER_METRICS     = ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades"]
 OUTLIER_Z_THRESH    = 3.0
 
 # ===================== UTILS =====================
@@ -50,7 +55,7 @@ def _extract_date_str(name: str) -> str | None:
 def _read_pickle_compat(path: Path):
     """
     Load a pickle across NumPy 1.x/2.x by remapping module paths:
-    'numpy._core.*' -> 'numpy.core.*'
+    'numpy._core.*' -> 'numpy.core'
     """
     class NPCompatUnpickler(pickle.Unpickler):
         def find_class(self, module, name):
@@ -102,6 +107,29 @@ def run_pipeline():
         keep = ["ticker"] + sorted(set(signal_cols + target_cols + bet_cols))
         df_use = df[keep].copy()
 
+        # Derive a single daily SPY return and broadcast to a column (SPY_COL_NAME)
+        spy_val = None
+        try:
+            if (df_use['ticker'] == SPY_TICKER).any():
+                # Prefer 'fret_1D' if present, else first available 'fret_*'
+                if 'fret_1D' in target_cols:
+                    tcol = 'fret_1D'
+                else:
+                    t_candidates = [c for c in target_cols if c.startswith('fret_')]
+                    tcol = t_candidates[0] if t_candidates else None
+                if tcol:
+                    spy_row = df_use.loc[df_use['ticker'] == SPY_TICKER, tcol]
+                    if not spy_row.empty:
+                        spy_val = float(pd.to_numeric(spy_row, errors='coerce').dropna().mean())
+        except Exception:
+            spy_val = None
+
+        if spy_val is not None:
+            df_use[SPY_COL_NAME] = float(spy_val)
+        else:
+            # keep column absent if we couldn't compute SPY for the day
+            pass
+
         day_dt = pd.to_datetime(day_str, format="%Y%m%d", errors="coerce")
         if pd.isna(day_dt):
             print(f"[skip] bad date {day_str} from {p.name}")
@@ -126,15 +154,18 @@ def run_pipeline():
     per_day_index_rows = []
     raw_days_for_summary = []
     needed_sig, needed_tgt, needed_bet = set(), set(), set()
+    spy_present_anywhere = False
 
     for day_dt, day_str, src_path, df in items:
         signal_cols    = [c for c in df.columns if c.startswith("pret_")]
         target_cols    = [c for c in df.columns if c.startswith("fret_")]
         bet_size_cols  = [c for c in df.columns if c.startswith("betsize_")]
+        has_spy_col    = (SPY_COL_NAME in df.columns)
 
         needed_sig.update(signal_cols)
         needed_tgt.update(target_cols)
         needed_bet.update(bet_size_cols)
+        spy_present_anywhere = spy_present_anywhere or has_spy_col
 
         # DAILY STATS (stateful carry lives inside compute_daily_stats)
         stats = compute_daily_stats(
@@ -171,10 +202,11 @@ def run_pipeline():
         daily_stats_frames.append(day_df_stats)
         print(f"📦 Saved daily stats PKL for {day_str} -> {out_path} ({len(day_df_stats)} rows)")
 
-        # lean frame for summary
-        keep_cols = ["date"] + signal_cols + target_cols + bet_size_cols
+        # lean frame for summary (add 'date' and keep SPY_COL_NAME if present)
+        keep_cols = ["date"] + signal_cols + target_cols + bet_size_cols + ([SPY_COL_NAME] if has_spy_col else [])
         raw_days_for_summary.append(
-            df[signal_cols + target_cols + bet_size_cols].assign(date=day_dt)[keep_cols]
+            df[signal_cols + target_cols + bet_size_cols + ([SPY_COL_NAME] if has_spy_col else [])]
+              .assign(date=day_dt)[keep_cols]
         )
 
     # 3) Summary stats over all days (PKL)
@@ -195,10 +227,11 @@ def run_pipeline():
                 bet_size_cols=bet_list,
                 quantiles=QUANTILES,
                 type_quantile=TYPE_QUANTILE,
-                add_spearman=False,
+                add_spearman=False,   # bounded per-row Spearman (signal vs target)
                 add_dcor=False,
                 spearman_sample_cap_per_key=10000,
                 random_state=123,
+                spy_col=SPY_COL_NAME if spy_present_anywhere else None,  # Spearman corr(PnL, SPY) per (s,q,t,b)
             )
 
             # flatten summary -> rows; tag with date range
@@ -250,7 +283,7 @@ def run_pipeline():
 
         odf = compute_outliers(
             stats_all,
-            stats_list=OUTLIER_METRICS,      # <-- FIX: non-empty stat list
+            stats_list=OUTLIER_METRICS,      # NOTE: PPT removed from this list.
             z_thresh=OUTLIER_Z_THRESH,
         )
         outliers_path = os.path.join(OUTLIERS_DIR, f"outliers_{date_tag}.pkl")

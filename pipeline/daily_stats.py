@@ -1,5 +1,5 @@
 # =============================
-# daily_stats.py — year-aware n_trades (carry + year-open override)
+# daily_stats.py — year-aware n_trades (carry + year-open override), no PPT
 # =============================
 from __future__ import annotations
 
@@ -189,7 +189,7 @@ def compute_daily_stats(
                 nr_instr_today = int(np.sum(mask_q)) if mask_q.any() else 0
 
             # ----------------------------
-            # Per-bet work (trades, sizeNotional part of PPD/PPT)
+            # Per-bet work (trades, sizeNotional part of PPD)
             # ----------------------------
             for bet in bet_size_cols:
                 b = bet_abs.get(bet)
@@ -296,7 +296,7 @@ def compute_daily_stats(
                         notional = 0.0
                         ppd = np.nan
 
-                    # write all metrics
+                    # write all metrics (no PPT here)
                     stats['pnl'][signal][qlabel][target][bet]          = pnl
                     stats['ppd'][signal][qlabel][target][bet]          = ppd
                     stats['sizeNotional'][signal][qlabel][target][bet] = notional
@@ -304,7 +304,6 @@ def compute_daily_stats(
 
                     ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
                     stats['n_trades'][signal][qlabel][target][bet]     = ntr
-                    stats['ppt'][signal][qlabel][target][bet]          = (pnl / ntr) if (np.isfinite(ntr) and ntr > 1e-12) else np.nan
 
         # ----------------------------
         # Optional raw distributions (thin sampling)
@@ -357,7 +356,7 @@ def _snapshot_prev_book_counts(prev_state: MutableMapping) -> Dict[tuple, int]:
 
 def _apply_year_opening_override(stats: Dict, prev_counts: Dict[tuple, int], override_if: str = "zero_or_nan"):
     """
-    Mutates `stats['n_trades']` (and recomputes `ppt`) in place:
+    Mutates `stats['n_trades']` in place:
     On the first trading day of a year, for each (signal, qlabel, bet),
     if n_trades meets the condition, set to prev_counts[(signal, qlabel, bet)].
     """
@@ -373,9 +372,16 @@ def _apply_year_opening_override(stats: Dict, prev_counts: Dict[tuple, int], ove
         return False
 
     ntr_tree = stats.get('n_trades', {})
-    pnl_tree = stats.get('pnl', {})
-    ppt_tree = stats.get('ppt', {})
 
+    for _, qdict in ntr_tree.items():
+        for _, tdict in qdict.items():
+            for _, bdict in tdict.items():
+                for bet, ntr_val in list(bdict.items()):
+                    # try to infer (signal, qlabel, bet) from the traversal path is messy here,
+                    # so we iterate the full stats dict below for safety.
+                    pass
+
+    # Safe pass: iterate full path
     for signal, qdict in ntr_tree.items():
         for qlabel, tdict in qdict.items():
             for target, bdict in tdict.items():
@@ -383,24 +389,7 @@ def _apply_year_opening_override(stats: Dict, prev_counts: Dict[tuple, int], ove
                     k = (signal, qlabel, bet)
                     if k in prev_counts and _should_override(ntr_val):
                         new_ntr = float(prev_counts[k])
-                        # Write n_trades
-                        bdict[bet] = new_ntr
-                        # Recompute ppt consistently if pnl exists
-                        try:
-                            pnl_val = (((pnl_tree.get(signal, {})
-                                                   .get(qlabel, {})
-                                                   .get(target, {}))
-                                                   .get(bet, 0.0)))
-                        except Exception:
-                            pnl_val = 0.0
-                        if (new_ntr is not None) and np.isfinite(new_ntr) and new_ntr > 1e-12:
-                            (((ppt_tree.setdefault(signal, {})
-                                         .setdefault(qlabel, {})
-                                         .setdefault(target, {})))[bet]) = float(pnl_val) / new_ntr
-                        else:
-                            (((ppt_tree.setdefault(signal, {})
-                                         .setdefault(qlabel, {})
-                                         .setdefault(target, {})))[bet]) = np.nan
+                        bdict[bet] = new_ntr  # write n_trades
 
 # ========================= SERIES RUNNERS (with override) =====================
 

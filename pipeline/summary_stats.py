@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import numpy as np
 from collections import defaultdict
-from typing import Sequence, List, Dict, Tuple
+from typing import Sequence, List, Dict, Tuple, Optional
 from scipy.stats import spearmanr
 
 # Optional distance correlation
@@ -76,7 +76,7 @@ def _welford_finalize(n, mean, M2):
     var = M2 / n  # population variance (ddof=0)
     return mean, float(np.sqrt(var))
 
-# Small, bounded sampler for Spearman/DCOR to avoid O(N) memory
+# Small, bounded sampler for Spearman/DCOR to avoid O(N) memory (on per-row xs/ys)
 class _Reservoir:
     def __init__(self, cap: int = 0, seed: int | None = 123):
         self.cap = int(cap) if cap and cap > 0 else 0
@@ -139,13 +139,15 @@ def compute_summary_stats_over_days(
     quantiles: Sequence[float] = (1.0, 0.75, 0.5, 0.25),
     bet_size_cols: Sequence[str] = ('betsize_equal',),
     type_quantile: str = 'cumulative',   # 'cumulative' (>=thr) or 'quantEach' (exact bucket)
-    add_spearman: bool = False,
+    add_spearman: bool = False,          # (signal vs target) per-row reservoir Spearman
     add_dcor: bool = False,
     n_jobs: int | None = None,           # kept for signature compatibility (unused)
     backend: str = "loky",               # kept for signature compatibility (unused)
     # ---- bounded sampling for Spearman/DCOR ----
     spearman_sample_cap_per_key: int = 10000,
     random_state: int | None = 123,
+    # ---- market correlation (daily PnL vs market) ----
+    spy_col: Optional[str] = None,       # name of column carrying daily market return in df
 ):
     """
     Returns ONE summary value per (signal, qrank, target, bet).
@@ -157,7 +159,8 @@ def compute_summary_stats_over_days(
       • Welford for daily PPD Sharpe and efficiencyP.
       • r²/t-stat via pooled sufficient statistics (sx, sy, sxx, syy, sxy).
       • Spearman/DCOR optionally on a capped reservoir per key.
-      • Accumulate totals for pnl / notional / instruments / trades, then derive ppd & ppt.
+      • Accumulate totals for pnl / notional / instruments / trades, then derive ppd.
+      • NEW: Spearman corr between daily summed PNL (per key) and market (spy_col) across days -> 'spy_corr'.
     """
     import pandas as pd
 
@@ -171,11 +174,14 @@ def compute_summary_stats_over_days(
     if date_col not in df.columns:
         raise KeyError(f"[summary_stats] date_col '{date_col}' not found in DataFrame.")
 
-    want = [date_col] + signal_cols + target_cols + bet_size_cols
+    want = [date_col] + signal_cols + target_cols + bet_size_cols + ([spy_col] if spy_col else [])
     present = [c for c in want if c in df.columns]
     missing = [c for c in want if c not in df.columns]
     if missing:
         print(f"[WARN][summary_stats] Ignoring missing columns: {missing}")
+    if spy_col and (spy_col not in present):
+        print(f"[WARN][summary_stats] spy_col='{spy_col}' not found. 'spy_corr' will be NaN.")
+        spy_col = None
 
     df = df[present].copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
@@ -208,7 +214,7 @@ def compute_summary_stats_over_days(
     long_num = defaultdict(int)        # key=(s,q,b)
     long_den = defaultdict(int)
 
-    # Spearman/DCOR small reservoir
+    # Spearman/DCOR small reservoir (signal vs target per-row)
     sampler = _Reservoir(spearman_sample_cap_per_key if add_spearman or add_dcor else 0,
                          seed=random_state)
 
@@ -218,10 +224,21 @@ def compute_summary_stats_over_days(
     sum_nrInstr   = defaultdict(float)  # key=(s,q,t,b)  (count summed over days)
     sum_ntrades   = defaultdict(float)  # key=(s,q,t,b)  (same definition here)
 
+    # NEW: per-key daily PnL series vs market (spy_col)
+    spy_pairs = defaultdict(lambda: ([], []))  # key -> (pnl_series, spy_series)
+
     # --------- Stream each day ---------
-    for _, day in grouped:
+    for dt, day in grouped:
         if day.empty:
             continue
+
+        # per-day market value
+        if spy_col:
+            # allow any shape; just take finite mean for the day
+            spy_val_day = pd.to_numeric(day[spy_col], errors='coerce')
+            spy_val_day = float(spy_val_day[np.isfinite(spy_val_day)].mean()) if spy_val_day.notna().any() else np.nan
+        else:
+            spy_val_day = np.nan
 
         # Build matrices
         sig_names = [c for c in signal_cols if c in day.columns]
@@ -319,7 +336,6 @@ def compute_summary_stats_over_days(
                 # ----- update all per (target, bet) -----
                 for ti, t_name in enumerate(tgt_names):
                     row_ppd = ppd_mat[ti, :]
-                    row_eff = effP_mat[ti, :]
 
                     for bi, b_name in enumerate(bet_names):
                         key = (s_name, qlbl, t_name, b_name)
@@ -328,7 +344,7 @@ def compute_summary_stats_over_days(
                         v = row_ppd[bi]
                         if np.isfinite(v):
                             ppd_stats[key] = _welford_update(ppd_stats[key], float(v))
-                        ev = row_eff[bi]
+                        ev = effP_mat[ti, bi]
                         if np.isfinite(ev):
                             effp_stats[key] = _welford_update(effp_stats[key], float(ev))
 
@@ -353,10 +369,9 @@ def compute_summary_stats_over_days(
                         if m.any():
                             cnt = float(np.sum(m))
                             sum_nrInstr[key] += cnt
-                            sum_ntrades[key] += cnt  # same definition here
+                            sum_ntrades[key] += cnt  # (definition here: contributing rows)
 
-                        # pooled regression sums (per-row) + optional sample
-                        if m.any():
+                            # pooled regression sums (per-row) + optional sample
                             xs = s_q[m]
                             ys = Y_q[m, ti]
                             nrows = xs.size
@@ -377,6 +392,12 @@ def compute_summary_stats_over_days(
                                     idx = rng.choice(xs.size, size=cap, replace=False)
                                     xs = xs[idx]; ys = ys[idx]
                                 sampler.add(key, xs, ys)
+
+                        # NEW: collect per-day pnl for market Spearman
+                        if np.isfinite(p) and np.isfinite(spy_val_day):
+                            pnl_ser, spy_ser = spy_pairs[key]
+                            pnl_ser.append(float(p))
+                            spy_ser.append(float(spy_val_day))
 
     # --------- Finalize into nested output ---------
     out_nested = create_5d_stats()
@@ -418,7 +439,7 @@ def compute_summary_stats_over_days(
         out_nested['r2'][s][ql][t][b] = r2 if np.isfinite(r2) else np.nan
         out_nested['t_stat'][s][ql][t][b] = t_stat if np.isfinite(t_stat) else np.nan
 
-    # Optional: Spearman & DCOR on bounded samples
+    # Optional: Spearman & DCOR on bounded samples (per-row xs vs ys)
     if add_spearman or add_dcor:
         for key in reg.keys():  # compute only where we had data
             xs, ys = sampler.get(key)
@@ -468,7 +489,7 @@ def compute_summary_stats_over_days(
         ntrd_tot = sum_ntrades.get(key, 0.0)
 
         ppd_val = (pnl_tot / not_tot) if (np.isfinite(pnl_tot) and np.isfinite(not_tot) and not_tot > 0) else np.nan
-        ppt_val = (pnl_tot / ntrd_tot) if (np.isfinite(pnl_tot) and np.isfinite(ntrd_tot) and ntrd_tot > 0) else np.nan
+        # NOTE: PPT removed project-wide
 
         s, ql, t, b = key
         out_nested['pnl'][s][ql][t][b]          = float(pnl_tot) if np.isfinite(pnl_tot) else np.nan
@@ -476,7 +497,22 @@ def compute_summary_stats_over_days(
         out_nested['nrInstr'][s][ql][t][b]      = float(nrin_tot) if np.isfinite(nrin_tot) else np.nan
         out_nested['n_trades'][s][ql][t][b]     = float(ntrd_tot) if np.isfinite(ntrd_tot) else np.nan
         out_nested['ppd'][s][ql][t][b]          = float(ppd_val) if np.isfinite(ppd_val) else np.nan
-        out_nested['ppt'][s][ql][t][b]          = float(ppt_val) if np.isfinite(ppt_val) else np.nan
+
+    # ===== NEW: Spearman corr between per-day pnl and market (spy_col) =====
+    if spy_col:
+        for key, (pnl_series, spy_series) in spy_pairs.items():
+            s, ql, t, b = key
+            x = np.asarray(pnl_series, dtype=float)
+            y = np.asarray(spy_series, dtype=float)
+            if x.size >= 3 and y.size >= 3:
+                try:
+                    r = spearmanr(x, y, nan_policy='omit').correlation
+                    r = float(r) if np.isfinite(r) else np.nan
+                except Exception:
+                    r = np.nan
+            else:
+                r = np.nan
+            out_nested['spy_corr'][s][ql][t][b] = r
 
     return out_nested
 
