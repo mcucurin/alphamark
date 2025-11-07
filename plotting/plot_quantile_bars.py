@@ -108,13 +108,12 @@ mpl.rcParams.update({
 
 META_TEXT = None  # printed top-right on each page
 
-# --- Page spacing knobs ---
-BAR_TITLE_Y   = 0.985   # suptitle vertical position (bar pages)
-BAR_XLABEL_Y  = 0.962   # "X-axis: ..." label vertical position (bar pages)
-BAR_AX_TOP    = 0.955   # top bound for tight_layout rect on bar pages
-HEATMAP_AX_TOP   = 0.90 # top bound to keep heatmap titles away from META_TEXT
-TEMPORAL_AX_TOP  = 0.90 # top bound for the heatmap temporal line charts (prevents title cutoff)
-
+# --- Page spacing knobs / layout guardrails ---
+BAR_TITLE_Y     = 0.985  # suptitle vertical position (bar pages)
+BAR_XLABEL_Y    = 0.962  # "X-axis: ..." label vertical position (bar pages)
+BAR_AX_TOP      = 0.955  # top bound for tight_layout rect on bar pages
+HEATMAP_AX_TOP  = 0.90   # top bound to keep heatmap titles away from META_TEXT
+TEMPORAL_AX_TOP = 0.90   # top bound for heatmap temporal line charts (prevents title cutoff)
 
 # -------------------------------------------------
 # Utilities
@@ -124,12 +123,10 @@ def savefig_white(pdf, fig):
     fig.patch.set_facecolor("white")
     fig.patch.set_alpha(1.0)
     if META_TEXT:
-        # Put window info at very top so it won't collide with axes titles
         fig.text(
             0.99, 0.99, META_TEXT,
             ha="right", va="top", fontsize=10, color="0.35", weight='normal',
         )
-    # Ensure every axis stays white too
     for ax in fig.get_axes():
         ax.set_facecolor("white")
     pdf.savefig(fig, facecolor="white", edgecolor="white")
@@ -229,11 +226,8 @@ def _ensure_quantile_colors(labels, base_map):
             out[lab] = cmap(i % cmap.N); i += 1
     return out
 
-# For bar pages (SUMMARY) use BARS_SOURCE; for heatmaps use DAILY.
-if BARS_SOURCE is not None:
-    qranks_all    = _sorted_qranks(BARS_SOURCE['qrank'])
-else:
-    qranks_all    = _sorted_qranks(STATS_DAILY['qrank'])
+# Bar pages use SUMMARY if present; otherwise derive from DAILY for QR labels
+qranks_all = _sorted_qranks((BARS_SOURCE if BARS_SOURCE is not None else STATS_DAILY)['qrank'])
 
 if isinstance(QR, (list, tuple)):
     requested = [str(q) for q in QR][:4]
@@ -276,29 +270,119 @@ def std_err():
     with np.errstate(invalid='ignore', divide='ignore'):
         yield
 
-def _set_title(ax, title, fontsize=14, pad=10, loc='left', single_line=False, wrap=False):
-    """
-    Title helper.
-    - If single_line=True: force into one line by removing any newlines and collapsing spaces.
-    - wrap controls matplotlib's wrapping behavior (kept False for single-line titles).
-    """
-    if single_line:
-        t = ' '.join(str(title).replace('\n', ' ').split())
-        ax.set_title(t, fontsize=fontsize, weight='bold', pad=pad, loc=loc, wrap=False)
-    else:
-        ax.set_title(title, fontsize=fontsize, weight='bold', pad=pad, loc=loc, wrap=wrap)
+# ----- title helpers (NO TRUNCATION; optional wrapping) -----
+def _compose_filters_str(qfilter=None, targets=None, bets=None, short_keys=False):
+    parts = []
+    if qfilter: parts.append(f"{'qr' if short_keys else 'qranks'}={','.join(map(str, qfilter if isinstance(qfilter,(list,tuple,set)) else [qfilter]))}")
+    if targets: parts.append(f"{'tgt' if short_keys else 'target'}={','.join(map(str, targets if isinstance(targets,(list,tuple,set)) else [targets]))}")
+    if bets:    parts.append(f"bet={','.join(map(str, bets if isinstance(bets,(list,tuple,set)) else [bets]))}")
+    return " | ".join(parts)
 
-def _plot_matrix_heatmap(fig, ax, M, labels, title, vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"):
+def _measure_text_width(fig, text, fontsize):
+    # Create a transient text to measure width in pixels
+    t = fig.text(0, 0, text, fontsize=fontsize)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    w = t.get_window_extent(renderer=renderer).width
+    t.remove()
+    return w
+
+def _wrap_text_greedy(fig, ax, text, fontsize, max_lines=2, max_frac=0.98):
+    """
+    Greedily wrap `text` into <= max_lines so that each line width <= max_frac * axis width.
+    Returns list of lines.
+    """
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    ax_bb = ax.get_window_extent(renderer=renderer)
+    max_w = max_frac * ax_bb.width
+
+    words = str(text).split()
+    lines = []
+    cur = ""
+    for w in words:
+        trial = (cur + " " + w).strip()
+        if _measure_text_width(fig, trial, fontsize) <= max_w:
+            cur = trial
+        else:
+            if cur: lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+
+    # If we exceeded max_lines, we'll shrink font elsewhere; here just return lines
+    return lines
+
+def _set_title_fit(fig, ax, text, base_size=14, min_size=8, pad=10, loc='center', allow_wrap=False, max_lines=2):
+    """
+    Fit title without truncation. Strategy:
+    1) Try single line, shrinking font down to min_size.
+    2) If still too wide and allow_wrap=True, wrap into <= max_lines with greedy wrapping,
+       and (if necessary) shrink font so each line fits within the axes box.
+    Never inserts '…' and keeps the title centered, avoiding left/right bleed.
+    """
+    text = " ".join(str(text).split())
+    # Step 1: single-line attempt
+    size = int(base_size)
+    while size >= min_size:
+        t = ax.set_title(text, fontsize=size, weight='bold', pad=pad, loc=loc)
+        t.set_ha('center'); t.set_x(0.5)
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax_bb = ax.get_window_extent(renderer=renderer)
+        t_bb  = t.get_window_extent(renderer=renderer)
+        if (t_bb.width <= 0.98 * ax_bb.width) and (t_bb.x0 >= ax_bb.x0) and (t_bb.x1 <= ax_bb.x1):
+            return t  # fits on one line
+        size -= 1
+
+    # Step 2: wrapping if allowed
+    if allow_wrap:
+        for size in range(min_size, min_size-1, -1):  # lock at min_size for measurement stability
+            lines = _wrap_text_greedy(fig, ax, text, size, max_lines=max_lines, max_frac=0.98)
+            # If too many lines, try bumping max_lines to 3 as a last resort
+            if len(lines) > max_lines:
+                lines = _wrap_text_greedy(fig, ax, text, size, max_lines=3, max_frac=0.98)
+            # Ensure each line fits; if not, we accept smaller implicit scaling via Matplotlib layout
+            t = ax.set_title("\n".join(lines), fontsize=size, weight='bold', pad=pad, loc=loc)
+            t.set_ha('center'); t.set_x(0.5)
+            fig.canvas.draw()
+            return t
+
+    # Fallback: set at min_size single-line (may slightly overflow in extreme cases, but no truncation)
+    t = ax.set_title(text, fontsize=min_size, weight='bold', pad=pad, loc=loc)
+    t.set_ha('center'); t.set_x(0.5)
+    fig.canvas.draw()
+    return t
+
+# ----- centered heatmap layout -----
+def _centered_heatmap_axes(k):
+    """
+    Center the heatmap with symmetric margins and a dedicated colorbar axis.
+    Returns (fig, ax, cax).
+    """
+    figsize = _heatmap_figure_size(k)
+    fig = plt.figure(figsize=figsize)
+    gs = GridSpec(
+        nrows=1, ncols=2, figure=fig,
+        left=0.10, right=0.90, bottom=0.10, top=HEATMAP_AX_TOP,  # symmetric to avoid left bleed
+        width_ratios=[20, 1], wspace=0.15
+    )
+    ax  = fig.add_subplot(gs[0, 0])
+    cax = fig.add_subplot(gs[0, 1])
+    return fig, ax, cax
+
+def _plot_matrix_heatmap(fig, ax, cax, M, labels, title, vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"):
     if M is None or labels is None or len(labels) == 0:
-        ax.axis('off'); _set_title(ax, title, fontsize=13, pad=8, loc='left', single_line=True)
-        ax.text(0.5,0.5,"No data",ha='center',va='center'); return
+        ax.axis('off'); _set_title_fit(fig, ax, title, base_size=13, pad=8, loc='center', allow_wrap=True, max_lines=3)
+        if cax is not None: cax.axis('off')
+        ax.text(0.5,0.5,"No data",ha='center',va='center')
+        return
     k = len(labels)
     fs_labels = 9 if k <= 18 else (7 if k <= 30 else 6)
     fs_cells  = 8 if k <= 18 else (6 if k <= 30 else 5)
 
     im = ax.imshow(M, vmin=vmin, vmax=vmax, cmap='coolwarm', aspect='equal')
-    # --- HEATMAP TITLES: force a SINGLE LINE (no wrapping) ---
-    _set_title(ax, title, fontsize=13, pad=10, loc='left', single_line=True, wrap=False)
+    _set_title_fit(fig, ax, title, base_size=13, pad=10, loc='center', allow_wrap=True, max_lines=2)
     ax.set_xticks(range(k)); ax.set_xticklabels(labels, rotation=45, ha='right', fontsize=fs_labels)
     ax.set_yticks(range(k)); ax.set_yticklabels(labels, fontsize=fs_labels)
     ax.set_xlim(-0.5, k-0.5); ax.set_ylim(k-0.5, -0.5)
@@ -316,7 +400,7 @@ def _plot_matrix_heatmap(fig, ax, M, labels, title, vmin=-1, vmax=1, annotate_lo
                             ha='center', va='center',
                             fontsize=fs_cells,
                             color=('white' if abs(val) >= 0.5 else 'black'))
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.4/10)
+    cbar = fig.colorbar(im, cax=cax)
     cbar.ax.tick_params(labelsize=9)
 
 def _minp(window, floor=3):
@@ -393,14 +477,12 @@ def _exclude_all_rows(df: pd.DataFrame) -> pd.DataFrame:
     )
     return df[m].copy()
 
-# -------- Spearman helpers (no warnings; Pearson on ranks) --------
+# -------- Spearman helpers (no constant-input warnings) --------
 def _spearman_corr_df(X: pd.DataFrame, min_periods: int = 2) -> pd.DataFrame:
-    """Spearman via Pearson on ranks; avoids ConstantInputWarning for constant inputs."""
     R = X.rank(axis=0, method='average', na_option='keep')
     return R.corr(method='pearson', min_periods=min_periods)
 
 def _spearman_corr_pair(x: pd.Series, y: pd.Series, min_periods: int = 2) -> float:
-    """Spearman(x,y) via Pearson on ranks; returns NaN if any side is constant or not enough points."""
     m = x.notna() & y.notna()
     if m.sum() < min_periods:
         return np.nan
@@ -412,11 +494,6 @@ def _spearman_corr_pair(x: pd.Series, y: pd.Series, min_periods: int = 2) -> flo
 
 # -------- Barplot helpers for 0.5 reference tick alignment --------
 def _ensure_half_tick_and_line(ax):
-    """
-    Draw the red 0.5 reference line and ensure '0.5' appears as a *tick label*
-    aligned with other y-axis labels (instead of floating text). Safe if 0.5 is
-    outside the visible range.
-    """
     ymin, ymax = ax.get_ylim()
     if ymin <= 0.5 <= ymax:
         ax.axhline(y=0.5, color='red', linestyle=':', linewidth=1.5, alpha=0.7, zorder=0)
@@ -427,7 +504,6 @@ def _ensure_half_tick_and_line(ax):
 # -------------------------------------------------
 # Build datasets
 # -------------------------------------------------
-# For heatmaps/temporal pages we always use DAILY
 stats_daily_plot = _exclude_all_rows(STATS_DAILY)
 
 # For bar plots (SUMMARY only)
@@ -441,7 +517,6 @@ else:
     stats_summary_plot = pd.DataFrame()
     plot_signals = plot_targets = plot_bets = []
     PLOT_LEVELS  = {'signal': [], 'target': [], 'bet_size_col': []}
-
 
 # -------------------------------------------------
 # Heatmap builders (SPEARMAN)
@@ -480,7 +555,6 @@ def _avg_mats_ignore_nan(mats):
 
 def compute_heatmap_daily_avg(stats_df, alphas, stat_type, min_pairs=2,
                               qfilter=None, targets=None, bets=None):
-    """Daily cross-section correlation averaged over days — Spearman."""
     alphas = list(alphas)
     if len(alphas) < 2: return None, alphas, 0
     mats = []
@@ -497,7 +571,6 @@ def compute_heatmap_daily_avg(stats_df, alphas, stat_type, min_pairs=2,
 
 def compute_timeseries_heatmap(stats_df, alphas, stat_type, min_days=5, agg='sum',
                                qfilter=None, targets=None, bets=None):
-    """Time-series correlation across days (daily sums) — Spearman."""
     df = stats_df[stats_df['stat_type'] == stat_type].copy()
     if qfilter: df = df[df['qrank'].isin(qfilter)]
     if targets: df = df[df['target'].isin(targets)]
@@ -514,13 +587,11 @@ def compute_timeseries_heatmap(stats_df, alphas, stat_type, min_days=5, agg='sum
     C = _spearman_corr_df(daily, min_periods=min_days)
     return C.values, C.columns.tolist(), int(daily.shape[0])
 
-
 # -------------------------------------------------
 # Temporal correlation lines (SPEARMAN)
 # -------------------------------------------------
 def compute_daily_pair_corr_series(stats_df, alphas, stat_type, min_pairs=2,
                                    qfilter=None, targets=None, bets=None):
-    """Per-day cross-section Spearman corr between alpha pairs."""
     alphas = [a for a in alphas]
     pairs = list(combinations(alphas, 2))
     dates = sorted(stats_df['date'].dropna().unique())
@@ -542,10 +613,6 @@ def compute_daily_pair_corr_series(stats_df, alphas, stat_type, min_pairs=2,
     return out
 
 def _rolling_spearman_pair(a: pd.Series, b: pd.Series, window=None, min_periods=2):
-    """
-    Rolling/expanding Spearman correlation between two aligned series.
-    If window is None or <=1 -> expanding Spearman (via ranks).
-    """
     s1 = a.copy()
     s2 = b.copy()
     idx = s1.index.union(s2.index)
@@ -588,7 +655,6 @@ def _rolling_spearman_pair(a: pd.Series, b: pd.Series, window=None, min_periods=
 
 def compute_pairwise_rolling_time_corr(stats_df, alphas, stat_type, window=1, min_periods=None,
                                        qfilter=None, targets=None, bets=None, agg='mean'):
-    """Rolling/expanding Spearman time correlation between alpha pairs."""
     df = stats_df[stats_df['stat_type'] == stat_type].copy()
     if qfilter: df = df[df['qrank'].isin(qfilter)]
     if targets: df = df[df['target'].isin(targets)]
@@ -625,9 +691,15 @@ def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix
         stats_df, alphas, stat_type, min_pairs=2,
         qfilter=qfilter, targets=targets, bets=bets
     )
+    filt_str = _compose_filters_str(qfilter=qfilter, targets=targets, bets=bets, short_keys=True)
+    if (smooth_window is None) or int(smooth_window) <= 1:
+        title_text = f"{title_prefix} — daily (no smoothing){(' — ' + filt_str) if filt_str else ''}"
+    else:
+        title_text = f"{title_prefix} — smoothed {int(smooth_window)}D mean{(' — ' + filt_str) if filt_str else ''}"
+
     if not corr_map:
-        fig, ax = plt.subplots(figsize=(17, height))
-        _set_title(ax, f"{title_prefix} — Daily Cross-Section Corr (no data)", fontsize=14, pad=8, loc='left', wrap=True)
+        fig, ax = plt.subplots(figsize=(14, height))
+        _set_title_fit(fig, ax, title_text + " — no data", base_size=14, pad=8, loc='center', allow_wrap=False)
         fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
         savefig_white(pdf, fig); return
 
@@ -637,28 +709,13 @@ def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix
 
     dates_all = sorted(stats_df['date'].dropna().unique())
     if len(dates_all) == 0 or not chosen:
-        fig, ax = plt.subplots(figsize=(17, height))
-        _set_title(ax, f"{title_prefix} — Daily Cross-Section Corr (insufficient)", fontsize=14, pad=8, loc='left', wrap=True)
+        fig, ax = plt.subplots(figsize=(14, height))
+        _set_title_fit(fig, ax, title_text + " — insufficient", base_size=14, pad=8, loc='center', allow_wrap=False)
         fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
         savefig_white(pdf, fig); return
 
-    fig, ax = plt.subplots(figsize=(17.5, height))
-    fil_str = []
-    if qfilter: fil_str.append(f"qranks={', '.join(qfilter)}")
-    if targets: fil_str.append(f"target={', '.join(targets)}")
-    if bets:    fil_str.append(f"bet={', '.join(bets)}")
-    suffix = " | ".join(fil_str)
-
-    if (smooth_window is None) or int(smooth_window) <= 1:
-        title_main = f"{title_prefix} — daily (no smoothing)"
-        apply_smoothing = False
-    else:
-        title_main = f"{title_prefix} — (smoothed {int(smooth_window)}D mean)"
-        apply_smoothing = True
-
-    # Wrap suffix onto the next line so long filters don't run off the page (temporal plots can be multi-line)
-    title_text = f"{title_main}\n{suffix}" if suffix else title_main
-    _set_title(ax, title_text, fontsize=14, pad=10, loc='left', wrap=True)
+    fig, ax = plt.subplots(figsize=(14, height))
+    _set_title_fit(fig, ax, title_text, base_size=14, pad=10, loc='center', allow_wrap=False)
 
     cmap = mpl.colormaps.get_cmap('tab20')
     x_min, x_max = pd.to_datetime(dates_all[0]), pd.to_datetime(dates_all[-1])
@@ -666,21 +723,19 @@ def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix
 
     for i, key in enumerate(chosen):
         s = corr_map[key].copy().sort_index()
-        if apply_smoothing:
+        if (smooth_window is not None) and int(smooth_window) > 1:
             win = int(smooth_window)
             mp = _minp(win, floor=3)
-            sm = s.rolling(win, min_periods=mp).mean()
-        else:
-            sm = s
+            s = s.rolling(win, min_periods=mp).mean()
         color = cmap(i % cmap.N)
-        ax.plot(sm.index, sm.values, lw=1.8, alpha=0.95, color=color)
-        v = sm.values
+        ax.plot(s.index, s.values, lw=1.8, alpha=0.95, color=color)
+        v = s.values
         if np.isfinite(v).any():
             all_vals.append(v[np.isfinite(v)])
-        finite_idx = np.where(np.isfinite(sm.values))[0]
+        finite_idx = np.where(np.isfinite(s.values))[0]
         if finite_idx.size:
             j = finite_idx[-1]
-            ax.text(sm.index[j], sm.values[j], f"  {key}", color=color, fontsize=9, va='center')
+            ax.text(s.index[j], s.values[j], f"  {key}", color=color, fontsize=9, va='center')
 
     if all_vals:
         vals = np.concatenate(all_vals)
@@ -707,10 +762,15 @@ def plot_pairwise_timecorr_lines(pdf, stats_df, alphas, stat_type, title_prefix,
         stats_df, alphas, stat_type, window=window, qfilter=qfilter,
         targets=targets, bets=bets, agg=agg
     )
+    filt_str = _compose_filters_str(qfilter=qfilter, targets=targets, bets=bets, short_keys=True)
+    if (window is None) or int(window) <= 1:
+        title_text = f"{title_prefix} — Expanding Spearman{(' — ' + filt_str) if filt_str else ''}"
+    else:
+        title_text = f"{title_prefix} — Rolling Spearman {int(window)}D{(' — ' + filt_str) if filt_str else ''}"
+
     if not corr_map:
-        fig, ax = plt.subplots(figsize=(17, height))
-        lbl = "Expanding Spearman" if (window is None or int(window) <= 1) else f"Rolling Spearman ({int(window)}D)"
-        _set_title(ax, f"{title_prefix} — {lbl} (no data)", fontsize=14, pad=8, loc='left', wrap=True)
+        fig, ax = plt.subplots(figsize=(14, height))
+        _set_title_fit(fig, ax, title_text + " — no data", base_size=14, pad=8, loc='center', allow_wrap=False)
         fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
         savefig_white(pdf, fig); return
 
@@ -720,26 +780,13 @@ def plot_pairwise_timecorr_lines(pdf, stats_df, alphas, stat_type, title_prefix,
 
     dates_all = sorted(stats_df['date'].dropna().unique())
     if len(dates_all) == 0 or not chosen:
-        fig, ax = plt.subplots(figsize=(17, height))
-        lbl = "Expanding Spearman" if (window is None or int(window) <= 1) else f"Rolling Spearman ({int(window)}D)"
-        _set_title(ax, f"{title_prefix} — {lbl} (insufficient)", fontsize=14, pad=8, loc='left', wrap=True)
+        fig, ax = plt.subplots(figsize=(14, height))
+        _set_title_fit(fig, ax, title_text + " — insufficient", base_size=14, pad=8, loc='center', allow_wrap=False)
         fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
         savefig_white(pdf, fig); return
 
-    fig, ax = plt.subplots(figsize=(17.5, height))
-    fil_str = []
-    if qfilter: fil_str.append(f"qranks={', '.join(qfilter)}")
-    if targets: fil_str.append(f"target={', '.join(targets)}")
-    if bets:    fil_str.append(f"bet={', '.join(bets)}")
-    suffix = " | ".join(fil_str)
-
-    if (window is None) or int(window) <= 1:
-        title_main = f"{title_prefix} — Expanding Spearman"
-    else:
-        title_main = f"{title_prefix} — Rolling Spearman ({int(window)}D)"
-    # Temporal plots can keep multiline suffix to avoid overflow
-    title_text = f"{title_main}\n{suffix}" if suffix else title_main
-    _set_title(ax, title_text, fontsize=14, pad=10, loc='left', wrap=True)
+    fig, ax = plt.subplots(figsize=(14, height))
+    _set_title_fit(fig, ax, title_text, base_size=14, pad=10, loc='center', allow_wrap=False)
 
     cmap = mpl.colormaps.get_cmap('tab20')
     x_min, x_max = pd.to_datetime(dates_all[0]), pd.to_datetime(dates_all[-1])
@@ -776,7 +823,6 @@ def plot_pairwise_timecorr_lines(pdf, stats_df, alphas, stat_type, title_prefix,
     fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
     savefig_white(pdf, fig)
 
-
 # -------------------------------------------------
 # Alpha autodetection (for heatmaps/lines)
 # -------------------------------------------------
@@ -801,7 +847,6 @@ DO_TEMPORAL = (len(ALPHAS) <= 6)
 if not DO_TEMPORAL:
     print(f"[INFO] {len(ALPHAS)} alphas detected (>6). Skipping temporal line plots for heatmaps.")
 
-
 # -------------------------------------------------
 # Outlier tables
 # -------------------------------------------------
@@ -815,7 +860,7 @@ def _metric_table_rows(odf, metric, top_k, have_z, have_rule):
     if sub.empty: return None, None
     sub = sub.sort_values('value')
     lows  = sub.head(top_k).copy()
-    highs = sub.tail(top_k).iloc[::-1].copy()
+    highs = sub.tail(top_k).iloc[::-1].copy()  # fixed typo
     labels_tbl = ["Type","Date","Signal","Bet","Target","Q","Value"] + (["z"] if have_z else []) + (["Rule"] if have_rule else [])
     def row(r, kind):
         base = [
@@ -903,7 +948,6 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
                                 col_labels=col_labels, rows=rows, fontsize=9)
         savefig_white(pdf, fig)
 
-
 # =========================
 # ------- BUILD PDF -------
 # =========================
@@ -913,11 +957,6 @@ def _series(df, stat):
     return s
 
 def _title_token(base: str, window: int, cumulative: bool = False) -> str:
-    """
-    Build a token for titles/labels:
-    - if window > 1: "Rolling-mean {base} ({k}D)" with "cumulative" prefix if cumulative=True.
-    - if window <=1: "{Base}" with "Cumulative " prefix if cumulative=True.
-    """
     if cumulative:
         base = f"cumulative {base}"
         Base = f"Cumulative {base.split(' ',1)[1].capitalize()}"
@@ -966,11 +1005,10 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             axs = np.atleast_1d(axs)
             main_title = "Bar Plots | " + " | ".join(title_bits)
 
-            # --- tightened top spacing on the bar page ---
             fig.suptitle(main_title, fontsize=18, weight='bold', y=BAR_TITLE_Y)
             xlabel_descr = " | ".join(BAR_X_VARS) if BAR_X_VARS else "ALL"
             fig.text(0.5, BAR_XLABEL_Y, f"X-axis: {xlabel_descr}",
-                ha="center", va="top", fontsize=13, color="0.35", weight='bold')
+                     ha="center", va="top", fontsize=13, color="0.35", weight='bold')
 
             for i, metric in enumerate(metrics_to_plot):
                 ax = axs[i]
@@ -978,22 +1016,20 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 if data.empty:
                     ax.set_title(f"{metric}: no data in summary PKL"); ax.axis('off'); continue
 
-                # Unit conversions for display (applied to the raw summary values)
                 unit_suffix = ""
                 if metric.lower() == 'ppd':
-                    data['value'] = data['value'] * 10000  # basis points
+                    data['value'] = data['value'] * 10000  # bps
                     unit_suffix = " (bpts)"
                 elif metric == 'sizeNotional':
-                    data['value'] = data['value'] / 1e6    # millions
+                    data['value'] = data['value'] / 1e6    # $M
                     unit_suffix = " ($M)"
 
-                # -------- NO AVERAGES: take the summary value as-is --------
                 if 'date' in data.columns:
-                    data = data.sort_values('date')  # oldest→newest so drop_duplicates keep='last' picks latest
+                    data = data.sort_values('date')
 
                 if data['qrank'].notna().any():
                     keys = ['x_key', 'qrank']
-                    data_dedup = data.drop_duplicates(subset=keys, keep='last')  # keep latest if multiples
+                    data_dedup = data.drop_duplicates(subset=keys, keep='last')
                     try:
                         pivot = data_dedup.pivot(index='x_key', columns='qrank', values='value')
                     except ValueError:
@@ -1022,7 +1058,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                             .values)
                     ax.bar(np.arange(len(x_levels)), vals, width=bar_width, color='gray')
 
-                # Reference line & aligned '0.5' tick for ratios
                 if metric in ('long_ratio','hit_ratio'):
                     _ensure_half_tick_and_line(ax)
 
@@ -1031,7 +1066,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 ax.set_xticklabels([str(v) for v in x_levels], rotation=45, ha='right', fontsize=11)
                 ax.grid(axis='y', linestyle='--', alpha=0.35)
 
-            # keep space at top for META_TEXT so titles don't collide
             plt.tight_layout(rect=[0.02, 0.04, 0.98, BAR_AX_TOP])
             savefig_white(pdf, fig)
 
@@ -1041,19 +1075,21 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             stats_daily_plot, ALPHAS, stat_type=H1_BASE_STAT, min_pairs=2, qfilter=qranks
         )
         k1 = len(labels1) if labels1 else 0
-        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k1))  # no constrained_layout
-        base_desc = "Alpha Cross-Section Corr (Spearman)" if H1_BASE_STAT in ('alpha_sum', 'alpha_strength') else f"Cross-Section Corr (Spearman, {H1_BASE_STAT})"
+        fig, ax, cax = _centered_heatmap_axes(k1)
+        base_desc = ("Alpha Cross-Section Corr (Spearman)"
+                     if H1_BASE_STAT in ('alpha_sum', 'alpha_strength')
+                     else f"Cross-Section Corr (Spearman, {H1_BASE_STAT})")
         if H1 is None or n_days1 == 0:
-            ax.axis('off'); _set_title(ax, f"Heatmap 1 — {base_desc}", fontsize=13, pad=8, loc='left', single_line=True)
+            ax.axis('off')
+            _set_title_fit(fig, ax, f"Heatmap 1 — {base_desc}", base_size=13, pad=8, loc='center', allow_wrap=True, max_lines=2)
             ax.text(0.5,0.5,"No sufficient daily cross-sections.\nTip: include ≥2 quantiles in QR.", ha='center', va='center')
+            if cax is not None: cax.axis('off')
         else:
             _plot_matrix_heatmap(
-                fig, ax, H1, labels1,
-                # single-line enforced inside _plot_matrix_heatmap
+                fig, ax, cax, H1, labels1,
                 f"Heatmap 1 — {base_desc}",
                 vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
             )
-        # Keep extra headroom so META_TEXT never overlaps with the heatmap title
         fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
         savefig_white(pdf, fig)
 
@@ -1088,17 +1124,18 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             qfilter=[q], targets=t2, bets=b2
         )
         k2 = len(labels2) if labels2 else 0
-        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k2))
+        fig, ax, cax = _centered_heatmap_axes(k2)
         tdesc2 = f"target={', '.join(t2)}"
         bdesc2 = f"bet={', '.join(b2)}"
         if H2 is None or n_days2 == 0:
-            ax.axis('off'); _set_title(ax, f"Heatmap 2 — PnL Cross-Section Corr (Spearman, daily avg) [{q}] [{tdesc2} | {bdesc2}]",
-                                       fontsize=13, pad=8, loc='left', single_line=True)
+            ax.axis('off')
+            _set_title_fit(fig, ax, f"Heatmap 2 — PnL Cross-Section Corr (Spearman, daily avg) [{q}] [{tdesc2} | {bdesc2}]",
+                           base_size=13, pad=8, loc='center', allow_wrap=True, max_lines=2)
             ax.text(0.5,0.5,"No sufficient daily cross-sections for 'pnl' with fixed filters.", ha='center', va='center')
+            if cax is not None: cax.axis('off')
         else:
             _plot_matrix_heatmap(
-                fig, ax, H2, labels2,
-                # single-line enforced inside _plot_matrix_heatmap
+                fig, ax, cax, H2, labels2,
                 f"Heatmap 2 — Cross-section corr of daily PnLs (Spearman) [{q}] [{tdesc2} | {bdesc2}]",
                 vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
             )
@@ -1119,17 +1156,18 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
             qfilter=[q], targets=H3_TARGETS_RES, bets=H3_BETS_RES
         )
         k3 = len(labels3) if labels3 else 0
-        fig, ax = plt.subplots(1,1, figsize=_heatmap_figure_size(k3))
+        fig, ax, cax = _centered_heatmap_axes(k3)
         tdesc3 = f"target={', '.join(H3_TARGETS_RES)}"
         bdesc3 = f"bet={', '.join(H3_BETS_RES)}"
         if C3 is None or n_days3 < 5:
-            ax.axis('off'); _set_title(ax, f"Heatmap 3 — PnL Time-Series Corr (Spearman) [{q}] [{tdesc3} | {bdesc3}]",
-                                       fontsize=13, pad=8, loc='left', single_line=True)
+            ax.axis('off')
+            _set_title_fit(fig, ax, f"Heatmap 3 — PnL Time-Series Corr (Spearman) [{q}] [{tdesc3} | {bdesc3}]",
+                           base_size=13, pad=8, loc='center', allow_wrap=True, max_lines=2)
             ax.text(0.5,0.5,"Not enough days (need ≥5) for time-series correlations.", ha='center', va='center')
+            if cax is not None: cax.axis('off')
         else:
             _plot_matrix_heatmap(
-                fig, ax, C3, labels3,
-                # single-line enforced inside _plot_matrix_heatmap
+                fig, ax, cax, C3, labels3,
                 f"Heatmap 3 — corr of daily summed P&L across days (Spearman) [{q}] [{tdesc3} | {bdesc3}]",
                 vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
             )
@@ -1157,7 +1195,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                 if sub_all.empty:
                     continue
 
-                # ---- PnL (cum; maybe rolling mean) vs nrInstr (daily; maybe rolling mean)
+                # ---- PnL (cum) vs nrInstr (daily)
                 left_title  = _title_token("P&L", ROLL_NORMALIZE_PNL, cumulative=True)
                 right_title = _title_token("nrInstr", ROLL_NRINSTR, cumulative=False)
 
@@ -1202,7 +1240,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                              bbox_to_anchor=(1, 0.98))
                 plt.tight_layout(rect=[0, 0.03, 1, 0.90]); savefig_white(pdf, fig)
 
-                # ---- PPD (cum; maybe rolling mean) vs Size Notional (daily; maybe rolling mean)
+                # ---- PPD (cum) vs Size Notional (daily)
                 left_title_base  = _title_token("PPD", ROLL_PPD, cumulative=True)
                 right_title_base = _title_token("Size Notional", ROLL_SIZE_NOTIONAL, cumulative=False)
                 left_title  = f"{left_title_base} (bpts)"
@@ -1225,7 +1263,6 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                     pnl    = _series(sq, 'pnl')
                     notnl  = _series(sq, 'sizeNotional')
 
-                    # Compute cumulative PPD correctly: cumulative PnL / cumulative Notional
                     if not pnl.empty and not notnl.empty:
                         merged = pd.DataFrame({'pnl': pnl, 'notional': notnl}).fillna(0.0)
                         cum_pnl = merged['pnl'].cumsum()
@@ -1262,7 +1299,7 @@ with PdfPages("output/Quantile_Combined_Report.pdf") as pdf:
                              bbox_to_anchor=(1, 0.98))
                 plt.tight_layout(rect=[0, 0.03, 1, 0.90]); savefig_white(pdf, fig)
 
-                # ---- Number of Trades (daily; maybe rolling mean)
+                # ---- Number of Trades (daily)
                 title_trades = _title_token("Trades", ROLL_TRADES, cumulative=False)
                 fig, ax = plt.subplots(figsize=(14, 5.5))
                 fig.suptitle(f"{target} | {signal} | {bet_strategy}\n{title_trades}",
