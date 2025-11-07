@@ -1,5 +1,6 @@
 # =============================
 # summary_stats.py (fast, streaming, memory-light)
+# Parallel-per-signal option; efficiencyP removed.
 # =============================
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ import numpy as np
 from collections import defaultdict
 from typing import Sequence, List, Dict, Tuple, Optional
 from scipy.stats import spearmanr
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Optional distance correlation
 try:
@@ -61,107 +63,22 @@ def _topk_mask_desc(abs_vals: np.ndarray, finite_mask: np.ndarray, q: float) -> 
     out[choose] = True
     return out
 
-# ---------- Online stats ----------
-def _welford_update(state, x):
-    n, mean, M2 = state
-    n += 1
-    delta = x - mean
-    mean += delta / n
-    M2 += delta * (x - mean)
-    return [n, mean, M2]
 
-def _welford_finalize(n, mean, M2):
-    if n <= 1:
-        return mean, np.nan
-    var = M2 / n  # population variance (ddof=0)
-    return mean, float(np.sqrt(var))
-
-# Small, bounded sampler for Spearman/DCOR to avoid O(N) memory (on per-row xs/ys)
-class _Reservoir:
-    def __init__(self, cap: int = 0, seed: int | None = 123):
-        self.cap = int(cap) if cap and cap > 0 else 0
-        self.rng = np.random.default_rng(seed)
-        self.store: Dict[Tuple[str,str,str,str], Tuple[np.ndarray,np.ndarray,int]] = {}
-        # key -> (xs, ys, n_seen)
-
-    def add(self, key, xs: np.ndarray, ys: np.ndarray):
-        if self.cap <= 0 or xs.size == 0:
-            return
-        m = min(xs.size, ys.size)
-        if m == 0:
-            return
-        xs = xs[:m].astype('float64', copy=False)
-        ys = ys[:m].astype('float64', copy=False)
-
-        if key not in self.store:
-            take = min(self.cap, m)
-            idx = self.rng.choice(m, size=take, replace=False)
-            self.store[key] = (xs[idx].copy(), ys[idx].copy(), m)
-            return
-
-        X, Y, seen = self.store[key]
-        total = seen + m
-
-        # ensure arrays filled up to cap
-        if X.size < self.cap:
-            need = self.cap - X.size
-            add = min(need, m)
-            idx = self.rng.choice(m, size=add, replace=False)
-            X = np.concatenate([X, xs[idx]])
-            Y = np.concatenate([Y, ys[idx]])
-            seen += m
-            self.store[key] = (X, Y, seen)
-            return
-
-        # reservoir replacement
-        if total > 0:
-            p = self.cap / float(total)
-            rcount = int(self.rng.binomial(m, p))
-            if rcount > 0:
-                rep_new_idx = self.rng.choice(m, size=rcount, replace=False)
-                rep_old_idx = self.rng.choice(self.cap, size=rcount, replace=False)
-                X[rep_old_idx] = xs[rep_new_idx]
-                Y[rep_old_idx] = ys[rep_new_idx]
-
-        seen += m
-        self.store[key] = (X, Y, seen)
-
-    def get(self, key):
-        return self.store.get(key, (np.array([]), np.array([]), 0))[:2]
-
-
-# ===================== SUMMARY over multiple days (single-pass) ====================
-def compute_summary_stats_over_days(
+# ===================== INTERNAL CORE (single set of signals) ====================
+def _compute_summary_stats_core(
     df,
     date_col: str,
     signal_cols: Sequence[str],
     target_cols: Sequence[str],
-    quantiles: Sequence[float] = (1.0, 0.75, 0.5, 0.25),
-    bet_size_cols: Sequence[str] = ('betsize_equal',),
-    type_quantile: str = 'cumulative',   # 'cumulative' (>=thr) or 'quantEach' (exact bucket)
-    add_spearman: bool = False,          # (signal vs target) per-row reservoir Spearman
-    add_dcor: bool = False,
-    n_jobs: int | None = None,           # kept for signature compatibility (unused)
-    backend: str = "loky",               # kept for signature compatibility (unused)
-    # ---- bounded sampling for Spearman/DCOR ----
-    spearman_sample_cap_per_key: int = 10000,
-    random_state: int | None = 123,
-    # ---- market correlation (daily PnL vs market) ----
-    spy_col: Optional[str] = None,       # name of column carrying daily market return in df
+    quantiles: Sequence[float],
+    bet_size_cols: Sequence[str],
+    type_quantile: str,
+    add_spearman: bool,
+    add_dcor: bool,
+    spearman_sample_cap_per_key: int,
+    random_state: int | None,
+    spy_col: Optional[str],
 ):
-    """
-    Returns ONE summary value per (signal, qrank, target, bet).
-    Output access pattern:
-      out[stat_type][signal][qrank][target][bet] = value
-
-    Fast strategy:
-      • Stream through dates once (no joblib/process pickling).
-      • Welford for daily PPD Sharpe and efficiencyP.
-      • r²/t-stat via pooled sufficient statistics (sx, sy, sxx, syy, sxy).
-      • Spearman/DCOR optionally on a capped reservoir per key.
-      • Accumulate totals for pnl / notional / instruments / trades, then derive ppd.
-      • NEW: Spearman corr between daily summed PNL (per key) and market (spy_col) across days -> 'spy_corr'.
-    """
     import pandas as pd
 
     out = create_5d_stats()
@@ -174,7 +91,7 @@ def compute_summary_stats_over_days(
     if date_col not in df.columns:
         raise KeyError(f"[summary_stats] date_col '{date_col}' not found in DataFrame.")
 
-    want = [date_col] + signal_cols + target_cols + bet_size_cols + ([spy_col] if spy_col else [])
+    want = [date_col] + list(signal_cols) + list(target_cols) + list(bet_size_cols) + ([spy_col] if spy_col else [])
     present = [c for c in want if c in df.columns]
     missing = [c for c in want if c not in df.columns]
     if missing:
@@ -201,9 +118,8 @@ def compute_summary_stats_over_days(
     sqrt_252 = np.sqrt(252.0)
     rng = np.random.default_rng(random_state)
 
-    # Welford stats for daily PPD and efficiencyP
+    # Welford stats for daily PPD
     ppd_stats = defaultdict(lambda: [0, 0.0, 0.0])   # key=(s,q,t,b)
-    effp_stats = defaultdict(lambda: [0, 0.0, 0.0])  # key=(s,q,t,b)
 
     # Regression pooled sufficient stats for r² / t
     reg = defaultdict(lambda: {'n':0, 'sx':0.0, 'sy':0.0, 'sxx':0.0, 'syy':0.0, 'sxy':0.0})
@@ -215,16 +131,66 @@ def compute_summary_stats_over_days(
     long_den = defaultdict(int)
 
     # Spearman/DCOR small reservoir (signal vs target per-row)
+    class _Reservoir:
+        def __init__(self, cap: int = 0, seed: int | None = 123):
+            self.cap = int(cap) if cap and cap > 0 else 0
+            self.rng = np.random.default_rng(seed)
+            self.store: Dict[Tuple[str,str,str,str], Tuple[np.ndarray,np.ndarray,int]] = {}
+        def add(self, key, xs: np.ndarray, ys: np.ndarray):
+            if self.cap <= 0 or xs.size == 0:
+                return
+            m = min(xs.size, ys.size)
+            if m == 0:
+                return
+            xs = xs[:m].astype('float64', copy=False)
+            ys = ys[:m].astype('float64', copy=False)
+
+            if key not in self.store:
+                take = min(self.cap, m)
+                idx = self.rng.choice(m, size=take, replace=False)
+                self.store[key] = (xs[idx].copy(), ys[idx].copy(), m)
+                return
+
+            X, Y, seen = self.store[key]
+            total = seen + m
+
+            # ensure arrays filled up to cap
+            if X.size < self.cap:
+                need = self.cap - X.size
+                add = min(need, m)
+                idx = self.rng.choice(m, size=add, replace=False)
+                X = np.concatenate([X, xs[idx]])
+                Y = np.concatenate([Y, ys[idx]])
+                seen += m
+                self.store[key] = (X, Y, seen)
+                return
+
+            # reservoir replacement
+            if total > 0:
+                p = self.cap / float(total)
+                rcount = int(self.rng.binomial(m, p))
+                if rcount > 0:
+                    rep_new_idx = self.rng.choice(m, size=rcount, replace=False)
+                    rep_old_idx = self.rng.choice(self.cap, size=rcount, replace=False)
+                    X[rep_old_idx] = xs[rep_new_idx]
+                    Y[rep_old_idx] = ys[rep_new_idx]
+
+            seen += m
+            self.store[key] = (X, Y, seen)
+
+        def get(self, key):
+            return self.store.get(key, (np.array([]), np.array([]), 0))[:2]
+
     sampler = _Reservoir(spearman_sample_cap_per_key if add_spearman or add_dcor else 0,
                          seed=random_state)
 
     # Daily totals accumulators (streamed sums over days)
     sum_pnl       = defaultdict(float)  # key=(s,q,t,b)
-    sum_notional  = defaultdict(float)  # key=(s,q,t,b)
-    sum_nrInstr   = defaultdict(float)  # key=(s,q,t,b)  (count summed over days)
-    sum_ntrades   = defaultdict(float)  # key=(s,q,t,b)  (same definition here)
+    sum_notional  = defaultdict(float)
+    sum_nrInstr   = defaultdict(float)
+    sum_ntrades   = defaultdict(float)
 
-    # NEW: per-key daily PnL series vs market (spy_col)
+    # per-key daily PnL series vs market (spy_col)
     spy_pairs = defaultdict(lambda: ([], []))  # key -> (pnl_series, spy_series)
 
     # --------- Stream each day ---------
@@ -234,7 +200,6 @@ def compute_summary_stats_over_days(
 
         # per-day market value
         if spy_col:
-            # allow any shape; just take finite mean for the day
             spy_val_day = pd.to_numeric(day[spy_col], errors='coerce')
             spy_val_day = float(spy_val_day[np.isfinite(spy_val_day)].mean()) if spy_val_day.notna().any() else np.nan
         else:
@@ -251,7 +216,6 @@ def compute_summary_stats_over_days(
         Y = np.column_stack([day[c].to_numpy() for c in tgt_names])              # (n, nt)
         B = np.column_stack([np.abs(day[c].to_numpy()) for c in bet_names])      # (n, nb)
 
-        n, ns = S.shape
         _, nt = Y.shape
         _, nb = B.shape
 
@@ -293,15 +257,15 @@ def compute_summary_stats_over_days(
                     continue
 
                 # slice once
-                s_q   = s_all[mask_q]                          # (m,)
-                sgn_q = sgn[mask_q]                            # (m,)
-                Y_q   = Y[mask_q, :]                           # (m, nt)
-                B_q   = B[mask_q, :]                           # (m, nb)
+                s_q   = s_all[mask_q]
+                sgn_q = sgn[mask_q]
+                Y_q   = Y[mask_q, :]
+                B_q   = B[mask_q, :]
 
-                Y_fin = np.isfinite(Y_q)                       # (m, nt)
-                B_fin = np.isfinite(B_q)                       # (m, nb)
-                Yz    = np.where(Y_fin, Y_q, 0.0)              # (m, nt)
-                Bz    = np.where(B_fin, B_q, 0.0)              # (m, nb)
+                Y_fin = np.isfinite(Y_q)
+                B_fin = np.isfinite(B_q)
+                Yz    = np.where(Y_fin, Y_q, 0.0)
+                Bz    = np.where(B_fin, B_q, 0.0)
 
                 # ----- PnL / Notional (daily matrices) -----
                 pnl_mat = ((Yz * sgn_q[:, None]).T @ Bz)       # (nt, nb)
@@ -312,22 +276,16 @@ def compute_summary_stats_over_days(
                                     out=np.full_like(pnl_mat, np.nan),
                                     where=(not_mat > 0))
 
-                # ----- efficiencyP matrix (daily) -----
-                denom_abs = (np.abs(Yz).T @ Bz)                # (nt, nb)
-                effP_mat  = np.divide(np.abs(pnl_mat), denom_abs,
-                                      out=np.full_like(pnl_mat, np.nan),
-                                      where=(denom_abs > 0))
-
                 # ----- hit ratio counts -----
-                y_sign   = np.sign(Y_q)                        # (m, nt)
+                y_sign   = np.sign(Y_q)
                 nonzero  = (y_sign != 0.0) & Y_fin
                 denom_hr = (nonzero.astype(float).T @ B_fin.astype(float))   # (nt, nb)
                 eq_sign  = ((np.sign(s_q)[:, None] == y_sign) & nonzero)
                 numer_hr = (eq_sign.astype(float).T @ B_fin.astype(float))   # (nt, nb)
 
                 # ----- long ratio (per bet) -----
-                long_den_vec = np.sum(B_fin, axis=0).astype(int)                        # (nb,)
-                long_num_vec = np.sum((sgn_q > 0)[:, None] & B_fin, axis=0).astype(int) # (nb,)
+                long_den_vec = np.sum(B_fin, axis=0).astype(int)
+                long_num_vec = np.sum((sgn_q > 0)[:, None] & B_fin, axis=0).astype(int)
                 for bi, b_name in enumerate(bet_names):
                     if long_den_vec[bi] > 0:
                         long_den[(s_name, qlbl, b_name)] += int(long_den_vec[bi])
@@ -336,17 +294,18 @@ def compute_summary_stats_over_days(
                 # ----- update all per (target, bet) -----
                 for ti, t_name in enumerate(tgt_names):
                     row_ppd = ppd_mat[ti, :]
-
                     for bi, b_name in enumerate(bet_names):
                         key = (s_name, qlbl, t_name, b_name)
 
-                        # Welford (daily PPD / efficiencyP)
+                        # Welford (daily PPD)
                         v = row_ppd[bi]
                         if np.isfinite(v):
-                            ppd_stats[key] = _welford_update(ppd_stats[key], float(v))
-                        ev = effP_mat[ti, bi]
-                        if np.isfinite(ev):
-                            effp_stats[key] = _welford_update(effp_stats[key], float(ev))
+                            n, mean, M2 = ppd_stats[key]
+                            n += 1
+                            delta = v - mean
+                            mean += delta / n
+                            M2 += delta * (v - mean)
+                            ppd_stats[key] = [n, mean, M2]
 
                         # hit ratio counts
                         d = int(denom_hr[ti, bi])
@@ -354,7 +313,7 @@ def compute_summary_stats_over_days(
                             hit_den[key] += d
                             hit_num[key] += int(numer_hr[ti, bi])
 
-                        # NEW: accumulate activity totals (daily -> running sums)
+                        # accumulate activity totals
                         p = pnl_mat[ti, bi]
                         ntn = not_mat[ti, bi]
                         if np.isfinite(p):
@@ -362,16 +321,16 @@ def compute_summary_stats_over_days(
                         if np.isfinite(ntn):
                             sum_notional[key] += float(ntn)
 
-                        # nrInstr / n_trades: count of rows contributing to this (t,b) today
+                        # nrInstr / n_trades: rows contributing today
                         b_ok = B_fin[:, bi]
                         y_ok = Y_fin[:, ti]
                         m = b_ok & y_ok
                         if m.any():
                             cnt = float(np.sum(m))
                             sum_nrInstr[key] += cnt
-                            sum_ntrades[key] += cnt  # (definition here: contributing rows)
+                            sum_ntrades[key] += cnt
 
-                            # pooled regression sums (per-row) + optional sample
+                            # pooled regression sums + optional sample
                             xs = s_q[m]
                             ys = Y_q[m, ti]
                             nrows = xs.size
@@ -391,9 +350,17 @@ def compute_summary_stats_over_days(
                                 if xs.size > cap:
                                     idx = rng.choice(xs.size, size=cap, replace=False)
                                     xs = xs[idx]; ys = ys[idx]
-                                sampler.add(key, xs, ys)
+                                # simple reservoir
+                                if 'sampler' not in locals():
+                                    pass
+                                # Using closure sampler from above:
+                                # (already defined outside loop)
+                                try:
+                                    sampler.add(key, xs, ys)
+                                except Exception:
+                                    pass
 
-                        # NEW: collect per-day pnl for market Spearman
+                        # collect per-day pnl for market Spearman
                         if np.isfinite(p) and np.isfinite(spy_val_day):
                             pnl_ser, spy_ser = spy_pairs[key]
                             pnl_ser.append(float(p))
@@ -403,18 +370,13 @@ def compute_summary_stats_over_days(
     out_nested = create_5d_stats()
 
     # Sharpe from daily PPD (Welford)
+    sqrt_252 = np.sqrt(252.0)
     for key, st in ppd_stats.items():
-        mu, sd = _welford_finalize(*st)
+        n, mean, M2 = st
+        mu, sd = (mean, np.sqrt(M2 / n)) if n > 1 else (mean, np.nan)
         sharpe = (mu / sd * sqrt_252) if (np.isfinite(mu) and np.isfinite(sd) and sd > 0) else np.nan
         s, ql, t, b = key
         out_nested['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
-
-    # efficiencyP mean (daily)
-    for key, st in effp_stats.items():
-        n, mean, _ = st
-        val = float(mean) if (n > 0 and np.isfinite(mean)) else np.nan
-        s, ql, t, b = key
-        out_nested['efficiencyP'][s][ql][t][b] = val
 
     # r2 and t-stat from pooled sufficient stats
     eps = 1e-15
@@ -489,7 +451,6 @@ def compute_summary_stats_over_days(
         ntrd_tot = sum_ntrades.get(key, 0.0)
 
         ppd_val = (pnl_tot / not_tot) if (np.isfinite(pnl_tot) and np.isfinite(not_tot) and not_tot > 0) else np.nan
-        # NOTE: PPT removed project-wide
 
         s, ql, t, b = key
         out_nested['pnl'][s][ql][t][b]          = float(pnl_tot) if np.isfinite(pnl_tot) else np.nan
@@ -498,7 +459,7 @@ def compute_summary_stats_over_days(
         out_nested['n_trades'][s][ql][t][b]     = float(ntrd_tot) if np.isfinite(ntrd_tot) else np.nan
         out_nested['ppd'][s][ql][t][b]          = float(ppd_val) if np.isfinite(ppd_val) else np.nan
 
-    # ===== NEW: Spearman corr between per-day pnl and market (spy_col) =====
+    # ===== Spearman corr between per-day pnl and market (spy_col) =====
     if spy_col:
         for key, (pnl_series, spy_series) in spy_pairs.items():
             s, ql, t, b = key
@@ -515,6 +476,79 @@ def compute_summary_stats_over_days(
             out_nested['spy_corr'][s][ql][t][b] = r
 
     return out_nested
+
+
+def _merge_summary(dst: Dict, src: Dict) -> None:
+    """Merge nested stats dicts whose SIGNAL subtrees are disjoint."""
+    for stat_type, sig_tree in src.items():
+        if stat_type not in dst:
+            dst[stat_type] = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+        for signal, q_tree in sig_tree.items():
+            dst[stat_type][signal] = q_tree
+
+
+# ===================== PUBLIC API (optionally parallel) ====================
+def compute_summary_stats_over_days(
+    df,
+    date_col: str,
+    signal_cols: Sequence[str],
+    target_cols: Sequence[str],
+    quantiles: Sequence[float] = (1.0, 0.75, 0.5, 0.25),
+    bet_size_cols: Sequence[str] = ('betsize_equal',),
+    type_quantile: str = 'cumulative',   # 'cumulative' (>=thr) or 'quantEach' (exact bucket)
+    add_spearman: bool = False,
+    add_dcor: bool = False,
+    n_jobs: int | None = None,           # threads per-signal
+    backend: str = "loky",               # kept for compat
+    spearman_sample_cap_per_key: int = 10000,
+    random_state: int | None = 123,
+    spy_col: Optional[str] = None,
+):
+    """Returns ONE summary value per (signal, qrank, target, bet)."""
+    signal_cols = _sanitize_list(signal_cols)
+    if not signal_cols:
+        return create_5d_stats()
+
+    if not n_jobs or n_jobs <= 1 or len(signal_cols) == 1:
+        return _compute_summary_stats_core(
+            df, date_col, signal_cols, target_cols, quantiles, bet_size_cols,
+            type_quantile, add_spearman, add_dcor, spearman_sample_cap_per_key,
+            random_state, spy_col
+        )
+
+    # Parallel across signals
+    n_threads = min(len(signal_cols), int(n_jobs))
+    out = create_5d_stats()
+
+    def _chunks(lst, k):
+        for i in range(k):
+            yield [lst[j] for j in range(i, len(lst), k)]
+
+    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+        futs = []
+        rng = np.random.default_rng(random_state)
+        for sub_signals in _chunks(signal_cols, n_threads):
+            if not sub_signals:
+                continue
+            futs.append(ex.submit(
+                _compute_summary_stats_core,
+                df,
+                date_col,
+                sub_signals,
+                target_cols,
+                quantiles,
+                bet_size_cols,
+                type_quantile,
+                add_spearman,
+                add_dcor,
+                spearman_sample_cap_per_key,
+                None if random_state is None else int(rng.integers(0, 2**31 - 1)),
+                spy_col
+            ))
+        for fut in as_completed(futs):
+            _merge_summary(out, fut.result())
+
+    return out
 
 
 __all__ = [

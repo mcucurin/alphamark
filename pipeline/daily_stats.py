@@ -1,13 +1,16 @@
 # =============================
 # daily_stats.py — year-aware n_trades (carry + year-open override), no PPT
+# Parallel-per-signal (threads) with truthful state merging.
 # =============================
 from __future__ import annotations
 
+import math
 import os
 import pickle
 import numpy as np
-from typing import Dict, MutableMapping, Sequence
+from typing import Dict, MutableMapping, Sequence, Tuple, List
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -----------------------------------------------------------------------------
 # Nested metrics store:
@@ -67,6 +70,216 @@ def _topk_mask_desc(abs_vals: np.ndarray, valid_mask: np.ndarray, q: float) -> n
     out[choose] = True
     return out
 
+def _merge_signal_branch(dst: Dict, src: Dict, signal: str) -> None:
+    """Per-signal subtrees are disjoint, so we can assign directly."""
+    for stat_type, sig_dict in src.items():
+        if stat_type not in dst:
+            dst[stat_type] = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+        dst[stat_type][signal] = src[stat_type][signal]
+
+def _compute_daily_stats_for_one_signal(
+    signal: str,
+    df_np: Dict[str, np.ndarray],
+    id_arr: np.ndarray | None,
+    target_cols: Sequence[str],
+    quantiles: Sequence[float],
+    bet_size_cols: Sequence[str],
+    type_quantile: str,
+    enable_distributions: bool,
+    max_dist_samples_per_series: int,
+    rng_state: int | None,
+    empty_day_policy: str,
+    report_empty_trades_as_nan: bool,
+    prev_state_slice: MutableMapping,
+) -> Tuple[Dict, Dict]:
+    """Worker: compute metrics for ONE signal (thread)."""
+    rng = np.random.default_rng(rng_state)
+    stats = create_5d_stats()
+
+    s = df_np.get(signal)
+    if s is None or s.size == 0:
+        return stats, prev_state_slice
+
+    m_fin = np.isfinite(s)
+    m_nz  = (s != 0.0)
+    m_ok  = m_fin & m_nz
+    if not m_fin.any():
+        return stats, prev_state_slice
+
+    sgn = np.sign(s)
+    abs_s = np.abs(s)
+
+    # Precompute absolute bet arrays
+    bet_abs: Dict[str, np.ndarray] = {}
+    for b in bet_size_cols:
+        x = df_np.get(b)
+        bet_abs[b] = np.abs(x) if x is not None else np.full(s.size, np.nan, dtype='float64')
+
+    # Optional bucket edges
+    if type_quantile == 'quantEach':
+        K = len(quantiles)
+        probs = np.linspace(0.0, 1.0, K + 1, dtype='float64')
+        edges = np.nanquantile(abs_s[m_ok], probs) if m_ok.any() else np.array([np.nan, np.nan])
+    else:
+        edges = None
+
+    alpha_written = set()
+
+    for q in quantiles:
+        qlabel = _label_for_quantile(q)
+
+        # Selection mask
+        if type_quantile == 'cumulative':
+            mask_q = _topk_mask_desc(abs_s, m_ok, q)
+        else:
+            if edges is None or not np.isfinite(edges).all():
+                mask_q = np.zeros_like(m_ok, dtype=bool)
+            else:
+                j = quantiles.index(q) + 1  # 1..K
+                lo, hi = edges[j-1], (edges[j-1] if j == len(quantiles) else edges[j])
+                mask_q = m_ok & (abs_s >= lo) if j == len(quantiles) else (m_ok & (abs_s >= lo) & (abs_s <= hi))
+
+        # alpha_sum (emit once per (signal,q))
+        alpha_sum_today = float(np.nansum(s[mask_q])) if mask_q.any() else 0.0
+        if qlabel not in alpha_written:
+            stats['alpha_sum'][signal][qlabel]['__ALL__']['__ALL__'] = alpha_sum_today
+            alpha_written.add(qlabel)
+
+        # nrInstr (bet-independent)
+        if id_arr is not None:
+            if mask_q.any():
+                ids = id_arr[mask_q]
+                ids = ids[ids == ids]  # drop NaN-ish
+                nr_instr_today = int(np.unique(ids).size)
+            else:
+                nr_instr_today = 0
+        else:
+            nr_instr_today = int(mask_q.sum()) if mask_q.any() else 0
+
+        for bet in bet_size_cols:
+            b = bet_abs.get(bet)
+            if b is None:
+                continue
+            b_fin = np.isfinite(b)
+            mask_qb = mask_q & b_fin
+
+            key_sb = (signal, qlabel, bet)
+            prev = prev_state_slice.get(key_sb, {})
+            prev_map = prev.get('pos_map', {}) if isinstance(prev.get('pos_map', {}), dict) else {}
+
+            # n_trades (truthful empties)
+            if id_arr is not None:
+                if mask_qb.any():
+                    pos_today = (sgn[mask_qb] * b[mask_qb]).astype('float64', copy=False)
+                    ids_today = id_arr[mask_qb]
+                    pos_map_today: Dict = {}
+                    for inst, pos in zip(ids_today, pos_today):
+                        pos_map_today[inst] = float(pos)
+
+                    if not prev_map:
+                        day_trades = len(pos_map_today)  # openers
+                    else:
+                        day_trades = 0
+                        for inst, pos in pos_map_today.items():
+                            prev_pos = float(prev_map.get(inst, 0.0))
+                            if pos != prev_pos:
+                                day_trades += 1
+                        day_trades += len(set(prev_map.keys()) - set(pos_map_today.keys()))
+                    n_trades_today = float(day_trades)
+                    prev_state_slice[key_sb] = {
+                        'Bt': float(np.nansum(b[mask_qb])),
+                        'mean_bet': float(np.nanmean(b[mask_qb])),
+                        'pos_map': pos_map_today,
+                    }
+                else:
+                    if empty_day_policy == "close":
+                        n_trades_today = float(len(prev_map))
+                        prev_state_slice[key_sb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
+                    elif empty_day_policy == "carry":
+                        n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
+                    else:  # skip
+                        n_trades_today = np.nan
+            else:
+                # proxy mode (no IDs)
+                if mask_qb.any():
+                    Bt_today = float(np.nansum(b[mask_qb]))
+                    mean_bet = float(np.nanmean(b[mask_qb]))
+                    prev_Bt = float(prev.get('Bt', np.nan)) if prev and 'Bt' in prev else np.nan
+                    prev_mb = float(prev.get('mean_bet', np.nan)) if prev and 'mean_bet' in prev else np.nan
+
+                    if np.isfinite(prev_Bt):
+                        dBt = abs(Bt_today - prev_Bt)
+                        denom = mean_bet if mean_bet > 0 else (prev_mb if np.isfinite(prev_mb) and prev_mb > 0 else np.nan)
+                        n_trades_today = (dBt / denom) if (np.isfinite(denom) and denom > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
+                    else:
+                        n_trades_today = (Bt_today / mean_bet) if (mean_bet and mean_bet > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
+
+                    prev_state_slice[key_sb] = {'Bt': Bt_today, 'mean_bet': mean_bet, 'pos_map': {}}
+                else:
+                    if empty_day_policy == "close":
+                        prev_Bt = float(prev.get('Bt', 0.0) or 0.0)
+                        prev_mb = float(prev.get('mean_bet', 0.0) or 0.0)
+                        n_trades_today = (prev_Bt / prev_mb) if prev_mb > 0 else 0.0
+                        prev_state_slice[key_sb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
+                    elif empty_day_policy == "carry":
+                        n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
+                    else:
+                        n_trades_today = np.nan
+
+            # per-target metrics
+            for target in target_cols:
+                y = df_np.get(target)
+                if y is None:
+                    continue
+                y_fin = np.isfinite(y)
+                m = mask_qb & y_fin
+                if m.any():
+                    pnl_vec = sgn[m] * y[m] * b[m]
+                    pnl = float(np.nansum(pnl_vec))
+                    notional = float(np.nansum(b[m]))
+                    ppd = (pnl / notional) if notional > 0 else np.nan
+                else:
+                    pnl = 0.0
+                    notional = 0.0
+                    ppd = np.nan
+
+                stats['pnl'][signal][qlabel][target][bet]          = pnl
+                stats['ppd'][signal][qlabel][target][bet]          = ppd
+                stats['sizeNotional'][signal][qlabel][target][bet] = notional
+                stats['nrInstr'][signal][qlabel][target][bet]      = nr_instr_today
+                ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
+                stats['n_trades'][signal][qlabel][target][bet]     = ntr
+
+    # Optional raw distributions (thin sampling) per signal
+    if enable_distributions:
+        # targets
+        for target in target_cols:
+            y = df_np.get(target)
+            if y is None:
+                continue
+            y = y[np.isfinite(y)]
+            if y.size == 0:
+                continue
+            if y.size > max_dist_samples_per_series:
+                idx = rng.choice(y.size, size=max_dist_samples_per_series, replace=False)
+                y = y[idx]
+            stats['fret_value'][f'__S__{signal}']['__ALL__'][target]['__ALL__'] = float(np.nanmean(y))
+        # bet columns
+        for bet in bet_size_cols:
+            b = df_np.get(bet)
+            if b is None:
+                continue
+            x = np.abs(b[np.isfinite(b)])
+            if x.size == 0:
+                continue
+            if x.size > max_dist_samples_per_series:
+                idx = rng.choice(x.size, size=max_dist_samples_per_series, replace=False)
+                x = x[idx]
+            stats['betsize_value'][f'__B__{bet}']['__ALL__']['__ALL__'][bet] = float(np.nanmean(x))
+
+    return stats, prev_state_slice
+
+
 def compute_daily_stats(
     df,
     signal_cols: Sequence[str],
@@ -82,27 +295,18 @@ def compute_daily_stats(
     # ---- Empty-slice handling (default 'carry' so state persists across empties)
     empty_day_policy: str = "carry",     # 'close' | 'carry' | 'skip'
     # ---- Reporting tweak on empties under "carry"
-    report_empty_trades_as_nan: bool = True,  # True: NaN on empty days (prevents fake 0 dips)
+    report_empty_trades_as_nan: bool = True,
+    # ---- Parallelism
+    n_jobs: int = 1,                     # >1 => threads per-signal
 ):
-    """
-    Per-day cross-section stats (single date snapshot).
-
-    Truthfulness choices here:
-      * Quantiles are exact top-K by |signal|, excluding zeros.
-      * If a (signal, q, bet) slice is empty:
-          - 'close': treat as closing all prior positions (n_trades = #prior names),
-                     state is reset to empty; emit rows with notional=0, pnl=0, ratios=NaN.
-          - 'carry': keep prior state; emit rows with notional=0, pnl=0; by default
-                     n_trades=NaN (report_empty_trades_as_nan=True) to avoid fake dips.
-          - 'skip' : do not update state; emit minimal rows with n_trades=NaN.
-    """
+    """Per-day cross-section stats (single date), optionally parallelized per signal."""
     import pandas as pd
-
-    rng = np.random.default_rng(random_state)
-    stats = create_5d_stats()
 
     if prev_state is None:
         prev_state = _GLOBAL_PREV_STATE
+
+    rng = np.random.default_rng(random_state)
+    stats = create_5d_stats()
 
     # ----------------------------
     # Column preparation (FAST)
@@ -126,221 +330,72 @@ def compute_daily_stats(
     if n == 0:
         return stats
 
-    # Precompute absolute bet arrays
-    bet_abs: Dict[str, np.ndarray] = {}
-    for b in bet_size_cols:
-        if b in df_np:
-            bet_abs[b] = np.abs(df_np[b])
-        else:
-            bet_abs[b] = np.full(n, np.nan, dtype='float64')
+    # Prepare per-signal prev_state slices
+    def _slice_state_for_signal(sig: str) -> Dict:
+        out = {}
+        for k, v in prev_state.items():
+            if isinstance(k, tuple) and len(k) == 3 and k[0] == sig:
+                out[k] = v
+        return out
 
-    # ----------------------------
-    # Main loops (signals -> q -> bets -> targets)
-    # ----------------------------
-    for signal in signal_cols:
-        if signal not in df_np:
-            continue
+    signals = [s for s in signal_cols if s in df_np]
+    n_threads = min(max(1, int(n_jobs or 1)), len(signals) or 1)
 
-        s = df_np[signal]                       # float64
-        m_fin = np.isfinite(s)
-        m_nz  = (s != 0.0)
-        m_ok  = m_fin & m_nz                    # finite AND non-zero only
-        if not m_fin.any():
-            continue
-
-        sgn = np.sign(s)
-        abs_s = np.abs(s)
-
-        # Prepare optional bucket edges (rarely used)
-        if type_quantile == 'quantEach':
-            K = len(quantiles)
-            probs = np.linspace(0.0, 1.0, K + 1, dtype='float64')
-            edges = np.nanquantile(abs_s[m_ok], probs) if m_ok.any() else np.array([np.nan, np.nan])
-        else:
-            edges = None
-
-        alpha_written = set()
-
-        for q in quantiles:
-            qlabel = _label_for_quantile(q)
-
-            # ---- Selection mask (exact-size or bucket) ----
-            if type_quantile == 'cumulative':
-                mask_q = _topk_mask_desc(abs_s, m_ok, q)
-            else:
-                if edges is None or not np.isfinite(edges).all():
-                    mask_q = np.zeros_like(m_ok, dtype=bool)
-                else:
-                    j = quantiles.index(q) + 1  # 1..K
-                    lo, hi = edges[j-1], j == len(quantiles) and edges[j-1] or edges[j]
-                    # Inclusive on hi to keep coverage; still limited by non-zero filter above
-                    mask_q = m_ok & (abs_s >= lo) & (abs_s <= hi)
-
-            # -------- alpha_sum (always emit; 0 if empty) --------
-            alpha_sum_today = float(np.nansum(s[mask_q])) if mask_q.any() else 0.0
-            if qlabel not in alpha_written:
-                stats['alpha_sum'][signal][qlabel]['__ALL__']['__ALL__'] = alpha_sum_today
-                alpha_written.add(qlabel)
-
-            # -------- nrInstr (bet-independent; 0 if empty) --------
-            if id_arr is not None:
-                nr_instr_today = int(pd.Series(id_arr[mask_q]).dropna().nunique()) if mask_q.any() else 0
-            else:
-                nr_instr_today = int(np.sum(mask_q)) if mask_q.any() else 0
-
-            # ----------------------------
-            # Per-bet work (trades, sizeNotional part of PPD)
-            # ----------------------------
-            for bet in bet_size_cols:
-                b = bet_abs.get(bet)
-                if b is None:
-                    continue
-
-                b_fin = np.isfinite(b)
-                mask_qb = mask_q & b_fin
-
-                key_sb = (signal, qlabel, bet)
-                prev = prev_state.get(key_sb, {})
-                prev_map = prev.get('pos_map', {}) if isinstance(prev.get('pos_map', {}), dict) else {}
-
-                # ---- TRADES & STATE (truthful empty-day handling) ----
-                if id_arr is not None:
-                    if mask_qb.any():
-                        # exact trades with IDs
-                        pos_today = (sgn[mask_qb] * b[mask_qb]).astype('float64', copy=False)
-                        ids_today = id_arr[mask_qb]
-                        pos_map_today: Dict = {}
-                        for inst, pos in zip(ids_today, pos_today):
-                            pos_map_today[inst] = float(pos)
-
-                        if not prev_map:
-                            day_trades = len(pos_map_today)  # opening trades on first observed day
-                        else:
-                            day_trades = 0
-                            # changes & opens
-                            for inst, pos in pos_map_today.items():
-                                prev_pos = float(prev_map.get(inst, 0.0))
-                                if pos != prev_pos:
-                                    day_trades += 1
-                            # closes
-                            day_trades += len(set(prev_map.keys()) - set(pos_map_today.keys()))
-
-                        n_trades_today = float(day_trades)
-
-                        prev_state[key_sb] = {
-                            'Bt': float(np.nansum(b[mask_qb])),
-                            'mean_bet': float(np.nanmean(b[mask_qb])),
-                            'pos_map': pos_map_today,
-                        }
-                    else:
-                        # EMPTY slice today
-                        if empty_day_policy == "close":
-                            # close everything that was open
-                            n_trades_today = float(len(prev_map))
-                            prev_state[key_sb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
-                        elif empty_day_policy == "carry":
-                            # carry the book; don't fake a zero in outputs
-                            n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
-                            # keep prev_state as-is
-                        else:  # 'skip'
-                            n_trades_today = np.nan
-                            # do not modify prev_state
-                else:
-                    # proxy mode (no IDs) using |ΔBt| / mean_bet
-                    if mask_qb.any():
-                        Bt_today = float(np.nansum(b[mask_qb]))
-                        mean_bet = float(np.nanmean(b[mask_qb]))
-                        prev_Bt = float(prev.get('Bt', np.nan)) if prev and 'Bt' in prev else np.nan
-                        prev_mb = float(prev.get('mean_bet', np.nan)) if prev and 'mean_bet' in prev else np.nan
-
-                        if np.isfinite(prev_Bt):
-                            dBt = abs(Bt_today - prev_Bt)
-                            denom = mean_bet if mean_bet > 0 else (prev_mb if np.isfinite(prev_mb) and prev_mb > 0 else np.nan)
-                            n_trades_today = (dBt / denom) if (np.isfinite(denom) and denom > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
-                        else:
-                            # first observed day → approx number of names
-                            n_trades_today = (Bt_today / mean_bet) if (mean_bet and mean_bet > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
-
-                        prev_state[key_sb] = {'Bt': Bt_today, 'mean_bet': mean_bet, 'pos_map': {}}
-                    else:
-                        if empty_day_policy == "close":
-                            prev_Bt = float(prev.get('Bt', 0.0)) if prev else 0.0
-                            prev_mb = float(prev.get('mean_bet', 0.0)) if prev else 0.0
-                            n_trades_today = (prev_Bt / prev_mb) if prev_mb > 0 else 0.0
-                            prev_state[key_sb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
-                        elif empty_day_policy == "carry":
-                            n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
-                            # keep prev_state
-                        else:
-                            n_trades_today = np.nan
-                            # do not modify prev_state
-
-                # ----------------------------
-                # Per-target metrics (emit even if empty)
-                # ----------------------------
-                for target in target_cols:
-                    y = df_np.get(target)
-                    if y is None:
-                        continue
-
-                    y_fin = np.isfinite(y)
-                    m = mask_qb & y_fin
-
-                    if m.any():
-                        pnl_vec = sgn[m] * y[m] * b[m]
-                        pnl = float(np.nansum(pnl_vec))
-                        notional = float(np.nansum(b[m]))
-                        ppd = (pnl / notional) if notional > 0 else np.nan
-                    else:
-                        pnl = 0.0
-                        notional = 0.0
-                        ppd = np.nan
-
-                    # write all metrics (no PPT here)
-                    stats['pnl'][signal][qlabel][target][bet]          = pnl
-                    stats['ppd'][signal][qlabel][target][bet]          = ppd
-                    stats['sizeNotional'][signal][qlabel][target][bet] = notional
-                    stats['nrInstr'][signal][qlabel][target][bet]      = nr_instr_today
-
-                    ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
-                    stats['n_trades'][signal][qlabel][target][bet]     = ntr
-
-        # ----------------------------
-        # Optional raw distributions (thin sampling)
-        # ----------------------------
-        if enable_distributions:
-            for target in target_cols:
-                y = df_np.get(target)
-                if y is None:
-                    continue
-                y = y[np.isfinite(y)]
-                if y.size == 0:
-                    continue
-                if y.size > max_dist_samples_per_series:
-                    idx = rng.choice(y.size, size=max_dist_samples_per_series, replace=False)
-                    y = y[idx]
-                stats['fret_value'][f'__S__{signal}']['__ALL__'][target]['__ALL__'] = float(np.nanmean(y))
-            for bet in bet_size_cols:
-                b = bet_abs.get(bet)
-                if b is None:
-                    continue
-                x = b[np.isfinite(b)]
-                if x.size == 0:
-                    continue
-                if x.size > max_dist_samples_per_series:
-                    idx = rng.choice(x.size, size=max_dist_samples_per_series, replace=False)
-                    x = x[idx]
-                stats['betsize_value'][f'__B__{bet}']['__ALL__']['__ALL__'][bet] = float(np.nanmean(x))
+    if n_threads == 1:
+        for signal in signals:
+            stats_sig, st_sig = _compute_daily_stats_for_one_signal(
+                signal=signal,
+                df_np=df_np,
+                id_arr=id_arr,
+                target_cols=target_cols,
+                quantiles=quantiles,
+                bet_size_cols=bet_size_cols,
+                type_quantile=type_quantile,
+                enable_distributions=enable_distributions,
+                max_dist_samples_per_series=max_dist_samples_per_series,
+                rng_state=None if random_state is None else int(rng.integers(0, 2**31 - 1)),
+                empty_day_policy=empty_day_policy,
+                report_empty_trades_as_nan=report_empty_trades_as_nan,
+                prev_state_slice=_slice_state_for_signal(signal),
+            )
+            _merge_signal_branch(stats, stats_sig, signal)
+            prev_state.update(st_sig)
+    else:
+        with ThreadPoolExecutor(max_workers=n_threads) as ex:
+            futs = []
+            for signal in signals:
+                futs.append(ex.submit(
+                    _compute_daily_stats_for_one_signal,
+                    signal,
+                    df_np,
+                    id_arr,
+                    target_cols,
+                    quantiles,
+                    bet_size_cols,
+                    type_quantile,
+                    enable_distributions,
+                    max_dist_samples_per_series,
+                    None if random_state is None else int(rng.integers(0, 2**31 - 1)),
+                    empty_day_policy,
+                    report_empty_trades_as_nan,
+                    _slice_state_for_signal(signal),
+                ))
+            for fut in as_completed(futs):
+                stats_sig, st_sig = fut.result()
+                # find signal name inside branch (fallbacks safe)
+                try:
+                    sig_name = next(iter(next(iter(stats_sig.values())).keys()))
+                except Exception:
+                    sig_name = signals[0] if signals else "__SIG__"
+                _merge_signal_branch(stats, stats_sig, sig_name)
+                prev_state.update(st_sig)
 
     return stats
 
 # ========================= YEAR-AWARE OVERRIDE HELPERS ========================
 
 def _snapshot_prev_book_counts(prev_state: MutableMapping) -> Dict[tuple, int]:
-    """
-    Build a map (signal, qlabel, bet) -> count of open names in the carried book.
-    Works with ID mode (pos_map) and proxy mode (Bt/mean_bet).
-    """
+    """(signal, qlabel, bet) -> count of open names in carried book."""
     out = {}
     for key_sb, obj in prev_state.items():
         if not isinstance(key_sb, tuple) or len(key_sb) != 3:
@@ -356,12 +411,9 @@ def _snapshot_prev_book_counts(prev_state: MutableMapping) -> Dict[tuple, int]:
 
 def _apply_year_opening_override(stats: Dict, prev_counts: Dict[tuple, int], override_if: str = "zero_or_nan"):
     """
-    Mutates `stats['n_trades']` in place:
     On the first trading day of a year, for each (signal, qlabel, bet),
     if n_trades meets the condition, set to prev_counts[(signal, qlabel, bet)].
     """
-    import math
-
     def _should_override(x):
         if override_if == "always":
             return True
@@ -372,24 +424,13 @@ def _apply_year_opening_override(stats: Dict, prev_counts: Dict[tuple, int], ove
         return False
 
     ntr_tree = stats.get('n_trades', {})
-
-    for _, qdict in ntr_tree.items():
-        for _, tdict in qdict.items():
-            for _, bdict in tdict.items():
-                for bet, ntr_val in list(bdict.items()):
-                    # try to infer (signal, qlabel, bet) from the traversal path is messy here,
-                    # so we iterate the full stats dict below for safety.
-                    pass
-
-    # Safe pass: iterate full path
     for signal, qdict in ntr_tree.items():
         for qlabel, tdict in qdict.items():
-            for target, bdict in tdict.items():
+            for _, bdict in tdict.items():
                 for bet, ntr_val in list(bdict.items()):
                     k = (signal, qlabel, bet)
                     if k in prev_counts and _should_override(ntr_val):
-                        new_ntr = float(prev_counts[k])
-                        bdict[bet] = new_ntr  # write n_trades
+                        bdict[bet] = float(prev_counts[k])
 
 # ========================= SERIES RUNNERS (with override) =====================
 
@@ -410,10 +451,8 @@ def compute_series_continuous_yearaware(
     **kwargs
 ):
     """
-    Continuous runner that, on the *first trading day of each calendar year*, replaces
+    Continuous runner that, on the first trading day of each calendar year, replaces
     n_trades with the size of yesterday's carried book when n_trades would be 0/NaN.
-
-    Recommended: keep empty_day_policy="carry" so the book truly persists across empties.
     """
     import pandas as pd
 
@@ -428,7 +467,6 @@ def compute_series_continuous_yearaware(
         ts = pd.Timestamp(d)
         year_changed = (prev_year is not None) and (ts.year != prev_year)
 
-        # Snapshot previous day's carried book sizes BEFORE computing today's stats
         prev_counts = _snapshot_prev_book_counts(prev) if year_changed else None
 
         stats = compute_daily_stats(df_day, prev_state=prev, **kwargs)
