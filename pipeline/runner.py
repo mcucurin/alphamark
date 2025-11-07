@@ -13,7 +13,7 @@ from pipeline.summary_stats import compute_summary_stats_over_days
 from pipeline.outliers_stats import compute_outliers, save_outliers
 
 # ===================== CONFIG =====================
-FEATURES_INPUT_DIR  = "output/DAILY_FEATURES_PKL"   # where features_{YYYYMMDD}.pkl live
+FEATURES_INPUT_DIR  = "input/DAILY_FEATURES_PKL"   # where features_{YYYYMMDD}.pkl live
 FEATURES_GLOB       = "features_*.pkl"
 
 OUTPUT_ROOT         = "output"
