@@ -87,9 +87,9 @@ CONFIG = {
     "outlier_top_k": 3,
     "outlier_tables_per_page": 3,
 
-    # Styles (minimal, readable defaults)
-    "style_first": "-",
-    "style_second": "--",
+    # Styles (secondary is dotted now)
+    "style_first": "-",     # solid
+    "style_second": ":",    # dotted  (changed from "--")
     "quantile_colors": {"qr_100":"red","qr_75":"green","qr_50":"blue","qr_25":"black"},
 
     # Titles / layout
@@ -246,11 +246,11 @@ bar_width = 0.15
 # -------------------------------------------------
 def _plot_date_axis(ax):
     ax.set_axisbelow(True)
-    ax.grid(True, linestyle='--', alpha=0.35)
-    ax.xaxis.set_major_locator(mdates.YearLocator())
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.grid(True, linestyle=':', alpha=0.35)  # dotted grid
 
-def _ellipsis(s, n): s = "" if s is None else str(s); return s if len(s)<=n else s[:n-1]+"…"
+def _ellipsis(s, n): 
+    s = "" if s is None else str(s); 
+    return s if len(s)<=n else s[:n-1]+"…"
 
 def _heatmap_figure_size(k, widen=1.18, extra_height=0.0):
     s = max(10, min(28, 0.6 * k + 8))
@@ -276,8 +276,12 @@ def _set_title_fit(fig, ax, text, base_size=14, min_size=8, pad=10, loc='center'
             return t
         size -= 1
     if allow_wrap:
+        # Greedy wrap
         words = text.split()
         lines = []; cur = ""
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        ax_bb = ax.get_window_extent(renderer=renderer)
         for w in words:
             trial = (cur + " " + w).strip()
             t = ax.set_title(trial, fontsize=min_size, weight='bold', pad=pad, loc=loc)
@@ -432,6 +436,10 @@ def _ensure_half_tick_and_line(ax):
         ticks = ax.get_yticks()
         if not np.any(np.isclose(ticks, 0.5)):
             ax.set_yticks(np.sort(np.append(ticks, 0.5)))
+
+def _style_name(ls: str) -> str:
+    """Human-friendly linestyle name for titles/legends."""
+    return {"-": "solid", "--": "dashed", "-.": "dashdot", ":": "dotted"}.get(ls, str(ls))
 
 # -------------------------------------------------
 # Build datasets
@@ -848,10 +856,6 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
             ax.text(0.5, 0.5, "Selected outlier metrics not present in file.", fontsize=12)
             savefig_white(pdf, fig); return
 
-    date_min = odf['date'].min()
-    date_max = odf['date'].max()
-    subtitle = f"Metrics: {', '.join(metrics)} | Top-K: {top_k}"
-
     tables = []
     for m in metrics:
         col_labels, rows = _metric_table_rows(odf, m, top_k=top_k, have_z=have_z, have_rule=have_rule)
@@ -865,6 +869,7 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
         fig = plt.figure(figsize=(14, 8.5))
         fig.suptitle("Outlier Tables", fontsize=18, weight='bold', y=0.985)
         if page_idx == 0:
+            subtitle = f"Metrics: {', '.join([m for m,_,_ in tables])} | Top-K: {top_k}"
             fig.text(0.03, 0.955, subtitle, ha='left', va='top', fontsize=11, color='0.25')
         gs = GridSpec(nrows=len(chunk), ncols=1, figure=fig, left=0.03, right=0.97, top=0.90, bottom=0.06, hspace=0.35)
         for row_idx, (metric_name, col_labels, rows) in enumerate(chunk):
@@ -988,7 +993,7 @@ def main():
                     ax.set_ylabel(f"{metric}{unit_suffix}")
                     ax.set_xticks(np.arange(len(x_levels)))
                     ax.set_xticklabels([str(v) for v in x_levels], rotation=45, ha='right', fontsize=11)
-                    ax.grid(axis='y', linestyle='--', alpha=0.35)
+                    ax.grid(axis='y', linestyle=':', alpha=0.35)  # dotted grid
 
                 plt.tight_layout(rect=[0.02, 0.04, 0.98, BAR_AX_TOP])
                 savefig_white(pdf, fig)
@@ -1017,6 +1022,7 @@ def main():
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
             savefig_white(pdf, fig)
 
+            # Temporal lines for H1
             if DO_TEMPORAL:
                 plot_cross_section_corr_lines(
                     pdf, _exclude_all_rows(STATS_DAILY_LOCAL), ALPHAS, stat_type=H1_BASE_STAT,
@@ -1063,6 +1069,7 @@ def main():
                 )
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP]); savefig_white(pdf, fig)
 
+            # Temporal lines for H2
             if DO_TEMPORAL and len(ALPHAS) >= 2:
                 plot_cross_section_corr_lines(
                     pdf, q_masked_df, ALPHAS, stat_type='pnl',
@@ -1093,6 +1100,7 @@ def main():
                 )
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP]); savefig_white(pdf, fig)
 
+            # Temporal lines for H3
             if DO_TEMPORAL and len(ALPHAS) >= 2:
                 plot_pairwise_timecorr_lines(
                     pdf, q_masked_df, ALPHAS, stat_type='pnl',
@@ -1123,7 +1131,7 @@ def main():
                     right_ax = ax.twinx(); right_ax.grid(False)
                     fig.suptitle(
                         f"{target} | {signal} | {bet_strategy}\n"
-                        f"{left_title} (left, solid) vs {right_title} (right, dashed)",
+                        f"{left_title} (left, solid) vs {right_title} (right, {_style_name(CONFIG['style_second'])})",
                         fontsize=16, weight='bold', y=0.96
                     )
 
@@ -1148,7 +1156,7 @@ def main():
                     _plot_date_axis(ax)
                     styles=[]
                     if anyL: styles.append((f"{left_title} (left, solid)", CONFIG["style_first"]))
-                    if anyR: styles.append((f"{right_title} (right, dashed)", CONFIG["style_second"]))
+                    if anyR: styles.append((f"{right_title} (right, {_style_name(CONFIG['style_second'])})", CONFIG["style_second"]))
                     if styles:
                         legL = [Line2D([0],[0], color='gray', lw=2, linestyle=ls, label=lab) for (lab,ls) in styles]
                         leg_styles = ax.legend(handles=legL, loc='upper left', fontsize=9, frameon=True,
@@ -1170,7 +1178,7 @@ def main():
                     right_ax = ax.twinx(); right_ax.grid(False)
                     fig.suptitle(
                         f"{target} | {signal} | {bet_strategy}\n"
-                        f"{left_title} (left, solid) vs {right_title} (right, dashed)",
+                        f"{left_title} (left, solid) vs {right_title} (right, {_style_name(CONFIG['style_second'])})",
                         fontsize=16, weight='bold', y=0.96
                     )
 
@@ -1207,7 +1215,7 @@ def main():
                     _plot_date_axis(ax)
                     styles=[]
                     if anyL: styles.append((f"{left_title} (left, solid)", CONFIG["style_first"]))
-                    if anyR: styles.append((f"{right_title} (right, dashed)", CONFIG["style_second"]))
+                    if anyR: styles.append((f"{right_title} (right, {_style_name(CONFIG['style_second'])})", CONFIG["style_second"]))
                     if styles:
                         legL = [Line2D([0],[0], color='gray', lw=2, linestyle=ls, label=lab) for (lab,ls) in styles]
                         leg_styles = ax.legend(handles=legL, loc='upper left', fontsize=9, frameon=True,
