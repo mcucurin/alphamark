@@ -77,7 +77,7 @@ def _compute_summary_stats_core(
     add_dcor: bool,
     spearman_sample_cap_per_key: int,
     random_state: int | None,
-    spy_col: Optional[str],
+    spy_by_target: Optional[Dict[str, str]],          # map: target -> spy column (same horizon)
 ):
     import pandas as pd
 
@@ -91,14 +91,21 @@ def _compute_summary_stats_core(
     if date_col not in df.columns:
         raise KeyError(f"[summary_stats] date_col '{date_col}' not found in DataFrame.")
 
-    want = [date_col] + list(signal_cols) + list(target_cols) + list(bet_size_cols) + ([spy_col] if spy_col else [])
+    want = [date_col] + list(signal_cols) + list(target_cols) + list(bet_size_cols)
+    # include all spy columns that were provided (if any)
+    if spy_by_target:
+        want += [c for c in spy_by_target.values() if isinstance(c, str)]
     present = [c for c in want if c in df.columns]
     missing = [c for c in want if c not in df.columns]
     if missing:
         print(f"[WARN][summary_stats] Ignoring missing columns: {missing}")
-    if spy_col and (spy_col not in present):
-        print(f"[WARN][summary_stats] spy_col='{spy_col}' not found. 'spy_corr' will be NaN.")
-        spy_col = None
+
+    # If no spy columns effectively present, disable market corr
+    effective_spy_map: Dict[str, str] = {}
+    if spy_by_target:
+        for t, sc in spy_by_target.items():
+            if isinstance(t, str) and isinstance(sc, str) and (t in df.columns) and (sc in df.columns):
+                effective_spy_map[t] = sc
 
     df = df[present].copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
@@ -190,20 +197,14 @@ def _compute_summary_stats_core(
     sum_nrInstr   = defaultdict(float)
     sum_ntrades   = defaultdict(float)
 
-    # per-key daily PnL series vs market (spy_col)
-    spy_pairs = defaultdict(lambda: ([], []))  # key -> (pnl_series, spy_series)
+    # Per-key daily PnL vs SPY (same-horizon) series for Spearman
+    # key -> (list_of_daily_pnl, list_of_daily_spy_ret)
+    spy_pairs = defaultdict(lambda: ([], []))
 
     # --------- Stream each day ---------
     for dt, day in grouped:
         if day.empty:
             continue
-
-        # per-day market value
-        if spy_col:
-            spy_val_day = pd.to_numeric(day[spy_col], errors='coerce')
-            spy_val_day = float(spy_val_day[np.isfinite(spy_val_day)].mean()) if spy_val_day.notna().any() else np.nan
-        else:
-            spy_val_day = np.nan
 
         # Build matrices
         sig_names = [c for c in signal_cols if c in day.columns]
@@ -215,6 +216,16 @@ def _compute_summary_stats_core(
         S = np.column_stack([day[c].to_numpy() for c in sig_names])              # (n, ns)
         Y = np.column_stack([day[c].to_numpy() for c in tgt_names])              # (n, nt)
         B = np.column_stack([np.abs(day[c].to_numpy()) for c in bet_names])      # (n, nb)
+
+        # For each target, pick the *same-horizon* SPY return for this day
+        spy_val_by_t: Dict[str, float] = {}
+        if effective_spy_map:
+            for t_name in tgt_names:
+                sc = effective_spy_map.get(t_name)
+                if sc and sc in day.columns:
+                    vals = np.asarray(day[sc].to_numpy(), dtype="float64")
+                    v = np.nanmean(vals) if vals.size else np.nan
+                    spy_val_by_t[t_name] = float(v) if np.isfinite(v) else np.nan
 
         _, nt = Y.shape
         _, nb = B.shape
@@ -330,7 +341,7 @@ def _compute_summary_stats_core(
                             sum_nrInstr[key] += cnt
                             sum_ntrades[key] += cnt
 
-                            # pooled regression sums + optional sample
+                            # pooled regression sums + optional sample (signal vs target per-row)
                             xs = s_q[m]
                             ys = Y_q[m, ti]
                             nrows = xs.size
@@ -350,21 +361,17 @@ def _compute_summary_stats_core(
                                 if xs.size > cap:
                                     idx = rng.choice(xs.size, size=cap, replace=False)
                                     xs = xs[idx]; ys = ys[idx]
-                                # simple reservoir
-                                if 'sampler' not in locals():
-                                    pass
-                                # Using closure sampler from above:
-                                # (already defined outside loop)
                                 try:
                                     sampler.add(key, xs, ys)
                                 except Exception:
                                     pass
 
-                        # collect per-day pnl for market Spearman
-                        if np.isfinite(p) and np.isfinite(spy_val_day):
+                        # Collect per-day PnL vs same-horizon SPY for Spearman
+                        spy_v = spy_val_by_t.get(t_name, np.nan)
+                        if np.isfinite(p) and np.isfinite(spy_v):
                             pnl_ser, spy_ser = spy_pairs[key]
                             pnl_ser.append(float(p))
-                            spy_ser.append(float(spy_val_day))
+                            spy_ser.append(float(spy_v))
 
     # --------- Finalize into nested output ---------
     out_nested = create_5d_stats()
@@ -378,7 +385,7 @@ def _compute_summary_stats_core(
         s, ql, t, b = key
         out_nested['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
 
-    # r2 and t-stat from pooled sufficient stats
+    # r2 and t-stat from pooled sufficient stats (signal vs target per-row)
     eps = 1e-15
     for key, st in reg.items():
         n = st['n']
@@ -401,7 +408,7 @@ def _compute_summary_stats_core(
         out_nested['r2'][s][ql][t][b] = r2 if np.isfinite(r2) else np.nan
         out_nested['t_stat'][s][ql][t][b] = t_stat if np.isfinite(t_stat) else np.nan
 
-    # Optional: Spearman & DCOR on bounded samples (per-row xs vs ys)
+    # Optional: Spearman & DCOR on bounded samples (signal vs target per-row)
     if add_spearman or add_dcor:
         for key in reg.keys():  # compute only where we had data
             xs, ys = sampler.get(key)
@@ -459,10 +466,9 @@ def _compute_summary_stats_core(
         out_nested['n_trades'][s][ql][t][b]     = float(ntrd_tot) if np.isfinite(ntrd_tot) else np.nan
         out_nested['ppd'][s][ql][t][b]          = float(ppd_val) if np.isfinite(ppd_val) else np.nan
 
-    # ===== Spearman corr between per-day pnl and market (spy_col) =====
-    if spy_col:
+    # ===== Spearman corr between per-day strategy PnL and same-horizon SPY return =====
+    if effective_spy_map:
         for key, (pnl_series, spy_series) in spy_pairs.items():
-            s, ql, t, b = key
             x = np.asarray(pnl_series, dtype=float)
             y = np.asarray(spy_series, dtype=float)
             if x.size >= 3 and y.size >= 3:
@@ -473,6 +479,7 @@ def _compute_summary_stats_core(
                     r = np.nan
             else:
                 r = np.nan
+            s, ql, t, b = key
             out_nested['spy_corr'][s][ql][t][b] = r
 
     return out_nested
@@ -502,9 +509,17 @@ def compute_summary_stats_over_days(
     backend: str = "loky",               # kept for compat
     spearman_sample_cap_per_key: int = 10000,
     random_state: int | None = 123,
-    spy_col: Optional[str] = None,
+    spy_by_target: Optional[Dict[str, str]] = None,  # {target -> spy column}
 ):
-    """Returns ONE summary value per (signal, qrank, target, bet)."""
+    """
+    Returns ONE summary value per (signal, qrank, target, bet).
+
+    If `spy_by_target` is provided as a dict mapping target column -> spy column that
+    holds the *same-horizon* SPY return (broadcast per row), we compute:
+
+        spy_corr[signal][qrank][target][bet]
+            = Spearman corr( daily strategy PnL, daily SPY return at that target's horizon ).
+    """
     signal_cols = _sanitize_list(signal_cols)
     if not signal_cols:
         return create_5d_stats()
@@ -513,7 +528,7 @@ def compute_summary_stats_over_days(
         return _compute_summary_stats_core(
             df, date_col, signal_cols, target_cols, quantiles, bet_size_cols,
             type_quantile, add_spearman, add_dcor, spearman_sample_cap_per_key,
-            random_state, spy_col
+            random_state, spy_by_target
         )
 
     # Parallel across signals
@@ -543,7 +558,7 @@ def compute_summary_stats_over_days(
                 add_dcor,
                 spearman_sample_cap_per_key,
                 None if random_state is None else int(rng.integers(0, 2**31 - 1)),
-                spy_col
+                spy_by_target
             ))
         for fut in as_completed(futs):
             _merge_summary(out, fut.result())

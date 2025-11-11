@@ -431,7 +431,7 @@ def _spearman_corr_pair(x: pd.Series, y: pd.Series, min_periods: int = 2) -> flo
 
 def _ensure_half_tick_and_line(ax):
     ymin, ymax = ax.get_ylim()
-    if ymin <= 0.5 <= ymax:
+    if ymin <= 0.5:
         ax.axhline(y=0.5, color='red', linestyle=':', linewidth=1.5, alpha=0.7, zorder=0)
         ticks = ax.get_yticks()
         if not np.any(np.isclose(ticks, 0.5)):

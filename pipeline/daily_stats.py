@@ -11,6 +11,7 @@ import numpy as np
 from typing import Dict, MutableMapping, Sequence, Tuple, List
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from scipy.stats import spearmanr
 
 # -----------------------------------------------------------------------------
 # Nested metrics store:
@@ -392,6 +393,159 @@ def compute_daily_stats(
 
     return stats
 
+
+# ========================= ALPHA/SPY CORR OVER DAYS (2) & (3) =================
+
+def _summarize_corr_dict(corr_dict: Dict) -> Dict[str, float]:
+    """Mean/median/std over a dict of correlations."""
+    vals = np.asarray(
+        [v for v in corr_dict.values() if np.isfinite(v)],
+        dtype='float64',
+    )
+    if vals.size == 0:
+        return {"mean": np.nan, "median": np.nan, "std": np.nan, "n": 0}
+    mean = float(vals.mean())
+    median = float(np.median(vals))
+    std = float(vals.std(ddof=1)) if vals.size >= 2 else 0.0
+    return {"mean": mean, "median": median, "std": std, "n": int(vals.size)}
+
+
+def compute_alpha_spy_corr_over_days(
+    df,
+    *,
+    date_col: str,
+    stock_col: str = "ticker",
+    signal_cols: Sequence[str],
+    spy_ret_col: str,
+    target_col: str | None = None,
+    bet_size_col: str | None = None,
+    run_alpha_raw_spy_corr: bool = True,
+    run_alpha_pnl_spy_corr: bool = True,
+    min_obs: int = 3,
+):
+    """
+    Cross-day, per-stock correlations between raw alpha signals / per-stock PnL
+    and a daily SPY return series (already horizon-aligned upstream).
+
+    Implements:
+      (2) runAlphaRawSpyCorr:
+            For each stock i and each signal s:
+                corr( alpha_{i,s}(t), SPY_ret(t) ) over days t.
+
+      (3) runAlphaPnlSpyCorr:
+            For each stock i and each signal s:
+                pnl_{i,s}(t) = sign(alpha_{i,s}(t)) * target_i(t) * abs(betsize_i(t))
+                corr( pnl_{i,s}(t), SPY_ret(t) ) over days t.
+
+    No quantile slicing here: it's purely per-stock, over time.
+    """
+    import pandas as pd
+
+    if (not run_alpha_raw_spy_corr) and (not run_alpha_pnl_spy_corr):
+        return {}
+
+    if date_col not in df.columns:
+        raise KeyError(f"[alpha_spy_corr] date_col '{date_col}' not found in DataFrame.")
+    if stock_col not in df.columns:
+        raise KeyError(f"[alpha_spy_corr] stock_col '{stock_col}' not found in DataFrame.")
+    if spy_ret_col not in df.columns:
+        raise KeyError(f"[alpha_spy_corr] spy_ret_col '{spy_ret_col}' not found in DataFrame.")
+
+    signal_cols = [c for c in (signal_cols or []) if c in df.columns]
+    if not signal_cols:
+        return {}
+
+    if run_alpha_pnl_spy_corr:
+        if target_col is None:
+            raise ValueError("[alpha_spy_corr] target_col must be provided for run_alpha_pnl_spy_corr=True.")
+        if bet_size_col is None:
+            raise ValueError("[alpha_spy_corr] bet_size_col must be provided for run_alpha_pnl_spy_corr=True.")
+        if target_col not in df.columns:
+            raise KeyError(f"[alpha_spy_corr] target_col '{target_col}' not found in DataFrame.")
+        if bet_size_col not in df.columns:
+            raise KeyError(f"[alpha_spy_corr] bet_size_col '{bet_size_col}' not found in DataFrame.")
+
+    # Work on a copy with clean dtypes
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col, stock_col])
+    if df.empty:
+        return {}
+
+    def _clean_numeric(col_name: str) -> None:
+        arr = pd.to_numeric(df[col_name], errors="coerce").to_numpy(dtype="float64")
+        arr[~np.isfinite(arr)] = np.nan
+        df[col_name] = arr
+
+    # clean once
+    for col in [spy_ret_col] + list(signal_cols):
+        _clean_numeric(col)
+    if run_alpha_pnl_spy_corr:
+        _clean_numeric(target_col)   # type: ignore[arg-type]
+        _clean_numeric(bet_size_col) # type: ignore[arg-type]
+
+    out: Dict[str, Dict] = {}
+    if run_alpha_raw_spy_corr:
+        out["alpha_raw_spy_corr"] = {}
+    if run_alpha_pnl_spy_corr:
+        out["alpha_pnl_spy_corr"] = {}
+
+    # Group once by stock, then loop signals inside
+    grouped = df.sort_values(date_col).groupby(stock_col, sort=False)
+
+    if run_alpha_raw_spy_corr:
+        raw_corr_per_signal: Dict[str, Dict] = {s: {} for s in signal_cols}
+    if run_alpha_pnl_spy_corr:
+        pnl_corr_per_signal: Dict[str, Dict] = {s: {} for s in signal_cols}
+
+    for stock_id, g in grouped:
+        spy = g[spy_ret_col].to_numpy(dtype="float64")
+        if not np.isfinite(spy).any():
+            continue
+
+        for sig in signal_cols:
+            # (2) Raw alpha vs SPY return
+            if run_alpha_raw_spy_corr:
+                x = g[sig].to_numpy(dtype="float64")
+                mask = np.isfinite(x) & np.isfinite(spy)
+                if mask.sum() >= min_obs:
+                    try:
+                        r = spearmanr(x[mask], spy[mask], nan_policy="omit").correlation
+                    except Exception:
+                        r = np.nan
+                    if np.isfinite(r):
+                        raw_corr_per_signal[sig][stock_id] = float(r)
+
+            # (3) Per-stock PnL vs SPY return
+            if run_alpha_pnl_spy_corr:
+                ax = g[sig].to_numpy(dtype="float64")
+                tgt = g[target_col].to_numpy(dtype="float64")   # type: ignore[index]
+                bs  = g[bet_size_col].to_numpy(dtype="float64") # type: ignore[index]
+                pnl = np.sign(ax) * tgt * np.abs(bs)
+                mask = np.isfinite(pnl) & np.isfinite(spy)
+                if mask.sum() >= min_obs:
+                    try:
+                        r = spearmanr(pnl[mask], spy[mask], nan_policy="omit").correlation
+                    except Exception:
+                        r = np.nan
+                    if np.isfinite(r):
+                        pnl_corr_per_signal[sig][stock_id] = float(r)
+
+    if run_alpha_raw_spy_corr:
+        for sig, corr_map in raw_corr_per_signal.items():
+            out["alpha_raw_spy_corr"][sig] = {
+                "per_stock": corr_map,
+                "summary": _summarize_corr_dict(corr_map),
+            }
+    if run_alpha_pnl_spy_corr:
+        for sig, corr_map in pnl_corr_per_signal.items():
+            out["alpha_pnl_spy_corr"][sig] = {
+                "per_stock": corr_map,
+                "summary": _summarize_corr_dict(corr_map),
+            }
+
+    return out
+
 # ========================= YEAR-AWARE OVERRIDE HELPERS ========================
 
 def _snapshot_prev_book_counts(prev_state: MutableMapping) -> Dict[tuple, int]:
@@ -488,4 +642,5 @@ __all__ = [
     'save_trading_state',
     'load_trading_state',
     'reset_trading_state',
+    'compute_alpha_spy_corr_over_days',
 ]

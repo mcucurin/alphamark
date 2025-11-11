@@ -18,6 +18,7 @@ import pandas as pd
 from pipeline.daily_stats import compute_daily_stats
 from pipeline.summary_stats import compute_summary_stats_over_days
 from pipeline.outliers_stats import compute_outliers, save_outliers
+
 # ===================== DEFAULT CONFIG (edit me) =====================
 # HOW THIS CONFIG IS USED
 # - You can edit values here, or supply a JSON via --config, or use CLI flags.
@@ -31,62 +32,52 @@ DEFAULT_CONFIG: Dict = {
     "output_root": "output",                            # str: root folder; subfolders DAILY_STATS/, SUMMARY_STATS/, OUTLIERS/ are created
 
     # -------- Column selection: how to find signals, targets, bet sizes in your PKLs --------
-    # The runner detects columns either by prefix or by regex. If a *_regex is provided, it is used
-    # INSTEAD of the corresponding prefix. Regex is a standard Python regex pattern.
-    "signal_prefix": "pret_",                           # str: default prefix for signal columns (e.g., pret_alpha, pret_xxx)
-    "target_prefix": "fret_",                           # str: default prefix for forward-return/target columns (e.g., fret_1D, fret_5D)
-    "bet_prefix":    "betsize_",                        # str: default prefix for bet size columns (nonnegative sizing)
-    "signal_regex":  None,                              # Optional[str]: e.g., r"^pret_.*(alpha|beta)$" — overrides signal_prefix if set
-    "target_regex":  None,                              # Optional[str]: e.g., r"^fret_(1D|5D|10D)$" — overrides target_prefix if set
-    "bet_regex":     None,                              # Optional[str]: e.g., r"^betsize_(equal|vol)$" — overrides bet_prefix if set
+    "signal_prefix": "pret_",                           # e.g., pret_alpha, pret_xxx
+    "target_prefix": "fret_",                           # e.g., fret_1D, fret_5D
+    "bet_prefix":    "betsize_",                        # nonnegative sizing
+    "signal_regex":  None,                              # optional regex overrides
+    "target_regex":  None,
+    "bet_regex":     None,
 
-    # -------- Market proxy: create a daily market-return column to correlate with PnL --------
-    # If spy_ticker is provided and present in the day’s data, we compute a single daily SPY return
-    # from a chosen target column and broadcast it to every row as `spy_col_name`.
-    "spy_ticker": "SPY",                                # Optional[str]: set to None to disable market correlation entirely
-    "spy_col_name": "spy_ret",                          # str: name of the derived market-return column added to each day
-    "prefer_target_for_spy": "fret_1D",                 # str: preferred target column to read SPY’s return from; falls back to first target if missing
+    # -------- Market proxy: derive per-day SPY return *per target horizon* --------
+    # We create one SPY column per target (e.g., target 'fret_5D' -> 'spy__fret_5D'),
+    # by pulling the SPY row for that target and broadcasting its value to all rows.
+    "spy_ticker": "SPY",                                # Optional[str]; set None to disable market correlation entirely
+    "spy_col_base": "spy",                              # base name for derived columns, final col is f"{spy_col_base}__{target}"
+    # Back-compat convenience: if you still want a single-column SPY for a specific target,
+    # set this to that target name; the runner will also write {spy_col_name} with that horizon.
+    "spy_col_name": "spy_ret",                          # legacy single SPY column (optional)
+    "prefer_target_for_spy": "fret_1D",                 # which target to mirror into the single-column legacy name
 
     # -------- Stats knobs: how to slice the cross-section by signal strength --------
-    # quantiles semantics:
-    #   - With type_quantile == "cumulative": select the top ceil(q * N) by |signal| (e.g., 0.25 = top 25%).
-    #   - With type_quantile == "quantEach": split |signal| into equal-probability buckets; q refers to the j-th bucket edge.
-    "quantiles": [1.0, 0.75, 0.5, 0.25],               # List[float]: 0<q<=1; use [1.0] for “all”, or e.g. [1.0, 0.2, 0.1]
+    "quantiles": [1.0, 0.75, 0.5, 0.25],               # use [1.0] for “all”, or e.g. [1.0, 0.2, 0.1]
     "type_quantile": "cumulative",                      # "cumulative" | "quantEach"
 
-    # -------- Compute toggles: turn stages on/off --------
-    "do_daily": True,                                   # bool: compute per-day stats and save stats_YYYYMMDD.pkl files
-    "do_summary": True,                                 # bool: aggregate across all days into a single summary_stats_*.pkl
-    "do_outliers": True,                                # bool: detect outliers from the concatenated daily stats
+    # -------- Compute toggles --------
+    "do_daily": True,
+    "do_summary": True,
+    "do_outliers": True,
 
-    # -------- Summary extras: optional correlation diagnostics (memory-safe sampling) --------
-    "add_spearman": False,                              # bool: per-key Spearman(signal, target) using a bounded reservoir
-    "add_dcor": False,                                  # bool: per-key distance correlation (requires `dcor`; returns NaN if unavailable)
-    "spearman_sample_cap_per_key": 10000,               # int: max samples kept per (signal, q, target, bet); memory cap to keep streaming light
+    # -------- Summary extras --------
+    "add_spearman": False,
+    "add_dcor": False,
+    "spearman_sample_cap_per_key": 10000,
 
-    # -------- Outliers: which daily metrics to score and the z-threshold --------
-    # Allowed metric names here are the ones produced by daily_stats: "pnl", "ppd", "sizeNotional", "nrInstr", "n_trades".
-    "outlier_metrics": ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades"],  # List[str]
-    "outlier_z_thresh": 3.0,                            # float: abs(z) >= threshold → flagged as outlier
+    # -------- Outliers --------
+    "outlier_metrics": ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades"],
+    "outlier_z_thresh": 3.0,
 
-    # -------- Daily behavior: how to handle empty slices and trade counting --------
-    # empty_day_policy:
-    #   - "carry": keep yesterday’s book if today’s slice is empty (truthful persistence); n_trades is NaN by default (no fake zero dip)
-    #   - "close": close any carried book when empty (n_trades = #positions closed)
-    #   - "skip" : do not update state; today emits NaN for n_trades
+    # -------- Daily behavior --------
     "empty_day_policy": "carry",                        # "carry" | "close" | "skip"
-    "report_empty_trades_as_nan": True,                 # bool: when policy="carry", emit NaN (not 0) for n_trades on empty days
+    "report_empty_trades_as_nan": True,
 
-    # -------- Parallelism: speed knobs (set thoughtfully; computation is truthful either way) --------
-    # n_jobs_io: parallel file loading (ThreadPool). Good values: 4–16 depending on disk & CPU.
-    # n_jobs_daily: threads per-signal inside daily_stats (>=1). If you have many signals, >1 speeds up.
-    # n_jobs_summary: threads across signals inside summary_stats (>=1). If you have many signals, >1 speeds up.
-    "n_jobs_io": 1,                                     # int >=1
-    "n_jobs_daily": 3,                                  # int >=1
-    "n_jobs_summary": 3,                                # int >=1
+    # -------- Parallelism --------
+    "n_jobs_io": 1,
+    "n_jobs_daily": 3,
+    "n_jobs_summary": 3,
 
     # -------- Reproducibility --------
-    "random_state": 123,                                # Optional[int]: RNG seed for sampling; set None for nondeterministic runs
+    "random_state": 123,
 }
 
 def _dirpaths(output_root: str):
@@ -155,16 +146,16 @@ def run_pipeline(**cfg) -> Dict[str, Optional[str]]:
 
     t0 = time.perf_counter()
 
-    # unpack (local variables for readability)
+    # unpack
     (features_input_dir, features_glob, output_root, signal_prefix, target_prefix, bet_prefix,
-     signal_regex, target_regex, bet_regex, spy_ticker, spy_col_name, prefer_target_for_spy,
+     signal_regex, target_regex, bet_regex, spy_ticker, spy_col_base, spy_col_name, prefer_target_for_spy,
      quantiles, type_quantile, do_daily, do_summary, do_outliers, add_spearman, add_dcor,
      spearman_sample_cap_per_key, outlier_metrics, outlier_z_thresh, empty_day_policy,
      report_empty_trades_as_nan, n_jobs_io, n_jobs_daily, n_jobs_summary, random_state) = (
         cfg["features_input_dir"], cfg["features_glob"], cfg["output_root"],
         cfg["signal_prefix"], cfg["target_prefix"], cfg["bet_prefix"],
         cfg["signal_regex"], cfg["target_regex"], cfg["bet_regex"],
-        cfg["spy_ticker"], cfg["spy_col_name"], cfg["prefer_target_for_spy"],
+        cfg["spy_ticker"], cfg["spy_col_base"], cfg["spy_col_name"], cfg["prefer_target_for_spy"],
         cfg["quantiles"], cfg["type_quantile"], cfg["do_daily"], cfg["do_summary"], cfg["do_outliers"],
         cfg["add_spearman"], cfg["add_dcor"], cfg["spearman_sample_cap_per_key"],
         cfg["outlier_metrics"], cfg["outlier_z_thresh"], cfg["empty_day_policy"],
@@ -191,7 +182,11 @@ def run_pipeline(**cfg) -> Dict[str, Optional[str]]:
             return [c for c in pool if r.search(c)]
         return [c for c in pool if c.startswith(prefix)]
 
-    def _load_one(p: Path) -> Optional[Tuple[pd.Timestamp, str, str, pd.DataFrame]]:
+    def _spy_col_for_target(target_name: str) -> str:
+        # final spy column per target, stable naming
+        return f"{spy_col_base}__{target_name}"
+
+    def _load_one(p: Path) -> Optional[Tuple[pd.Timestamp, str, str, pd.DataFrame, Dict[str,str]]]:
         day_str = _extract_date_str(p.name)
         if not day_str:
             print(f"[skip] cannot parse date from {p.name}")
@@ -216,29 +211,45 @@ def run_pipeline(**cfg) -> Dict[str, Optional[str]]:
         keep = ["ticker"] + sorted(set(signal_cols + target_cols + bet_cols))
         df_use = df[keep].copy()
 
-        # Derive a single daily SPY return and broadcast
-        spy_val = None
+        # Derive per-target SPY columns: for each target, take SPY row's target value and broadcast it
+        spy_map_for_day: Dict[str, str] = {}
         if spy_ticker:
             try:
-                if (df_use['ticker'] == spy_ticker).any():
-                    tcol = prefer_target_for_spy if prefer_target_for_spy in target_cols else (target_cols[0] if target_cols else None)
-                    if tcol:
-                        spy_row = df_use.loc[df_use['ticker'] == spy_ticker, tcol]
-                        if not spy_row.empty:
-                            spy_val = float(pd.to_numeric(spy_row, errors='coerce').dropna().mean())
+                has_spy_row = (df_use['ticker'] == spy_ticker).any()
             except Exception:
-                spy_val = None
-            if spy_val is not None:
-                df_use[spy_col_name] = float(spy_val)
+                has_spy_row = False
+
+            if has_spy_row:
+                spy_sub = df_use.loc[df_use['ticker'] == spy_ticker, target_cols]
+                for tcol in target_cols:
+                    col_name = _spy_col_for_target(tcol)  # e.g., "spy__fret_5D"
+                    try:
+                        v = pd.to_numeric(spy_sub[tcol], errors='coerce').dropna()
+                        spy_val = float(v.mean()) if not v.empty else None
+                    except Exception:
+                        spy_val = None
+                    if spy_val is not None:
+                        df_use[col_name] = spy_val
+                        spy_map_for_day[tcol] = col_name
+
+                # Optional legacy single-column SPY for a chosen target
+                if spy_col_name and prefer_target_for_spy in target_cols:
+                    try:
+                        v = pd.to_numeric(spy_sub[prefer_target_for_spy], errors='coerce').dropna()
+                        legacy_val = float(v.mean()) if not v.empty else None
+                    except Exception:
+                        legacy_val = None
+                    if legacy_val is not None:
+                        df_use[spy_col_name] = legacy_val
 
         day_dt = pd.to_datetime(day_str, format="%Y%m%d", errors="coerce")
         if pd.isna(day_dt):
             print(f"[skip] bad date {day_str} from {p.name}")
             return None
 
-        return (day_dt, day_str, str(p), df_use)
+        return (day_dt, day_str, str(p), df_use, spy_map_for_day)
 
-    items: List[Tuple[pd.Timestamp, str, str, pd.DataFrame]] = []
+    items: List[Tuple[pd.Timestamp, str, str, pd.DataFrame, Dict[str,str]]] = []
     if n_jobs_io <= 1:
         for p in files:
             rec = _load_one(p)
@@ -265,18 +276,22 @@ def run_pipeline(**cfg) -> Dict[str, Optional[str]]:
     per_day_index_rows = []
     raw_days_for_summary = []
     needed_sig, needed_tgt, needed_bet = set(), set(), set()
-    spy_present_anywhere = False
 
-    for day_dt, day_str, src_path, df in items:
+    # collect union mapping {target -> spy_col} across all days (only names; presence checked later)
+    spy_by_target_global: Dict[str, str] = {}
+
+    for day_dt, day_str, src_path, df, spy_map_for_day in items:
         signal_cols    = [c for c in df.columns if c.startswith(signal_prefix)]
         target_cols    = [c for c in df.columns if c.startswith(target_prefix)]
         bet_size_cols  = [c for c in df.columns if c.startswith(bet_prefix)]
-        has_spy_col    = (spy_col_name in df.columns)
 
         needed_sig.update(signal_cols)
         needed_tgt.update(target_cols)
         needed_bet.update(bet_size_cols)
-        spy_present_anywhere = spy_present_anywhere or has_spy_col
+
+        # track spy mapping (names)
+        for t, sc in spy_map_for_day.items():
+            spy_by_target_global[t] = sc
 
         if do_daily:
             stats = compute_daily_stats(
@@ -315,9 +330,11 @@ def run_pipeline(**cfg) -> Dict[str, Optional[str]]:
                 print(f"[skip] {day_str}: no stats produced")
 
         if do_summary:
-            keep_cols = ["date"] + signal_cols + target_cols + bet_size_cols + ([spy_col_name] if has_spy_col else [])
+            # include any spy columns we created this day
+            spy_cols_today = list(spy_map_for_day.values())
+            keep_cols = ["date"] + signal_cols + target_cols + bet_size_cols + spy_cols_today
             raw_days_for_summary.append(
-                df[signal_cols + target_cols + bet_size_cols + ([spy_col_name] if has_spy_col else [])]
+                df[signal_cols + target_cols + bet_size_cols + spy_cols_today]
                   .assign(date=day_dt)[keep_cols]
             )
 
@@ -329,6 +346,11 @@ def run_pipeline(**cfg) -> Dict[str, Optional[str]]:
         sig_list = sorted([c for c in needed_sig if c in big_df.columns])
         tgt_list = sorted([c for c in needed_tgt if c in big_df.columns])
         bet_list = sorted([c for c in needed_bet if c in big_df.columns])
+
+        # Limit spy map to columns actually present in big_df
+        spy_by_target_effective = {
+            t: sc for t, sc in spy_by_target_global.items() if (t in big_df.columns and sc in big_df.columns)
+        }
 
         if sig_list and tgt_list and bet_list:
             summary = compute_summary_stats_over_days(
@@ -344,7 +366,7 @@ def run_pipeline(**cfg) -> Dict[str, Optional[str]]:
                 n_jobs=n_jobs_summary,  # parallel across signals
                 spearman_sample_cap_per_key=spearman_sample_cap_per_key,
                 random_state=random_state,
-                spy_col=spy_col_name if spy_present_anywhere else None,
+                spy_by_target=spy_by_target_effective if spy_by_target_effective else None,
             )
 
             # flatten summary -> rows; tag with date range
@@ -446,7 +468,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--features-input-dir"); p.add_argument("--features-glob"); p.add_argument("--output-root")
     p.add_argument("--signal-prefix"); p.add_argument("--target-prefix"); p.add_argument("--bet-prefix")
     p.add_argument("--signal-regex"); p.add_argument("--target-regex"); p.add_argument("--bet-regex")
-    p.add_argument("--spy-ticker"); p.add_argument("--spy-col-name"); p.add_argument("--prefer-target-for-spy")
+    p.add_argument("--spy-ticker"); p.add_argument("--spy-col-base")
+    p.add_argument("--spy-col-name"); p.add_argument("--prefer-target-for-spy")
     p.add_argument("--quantiles"); p.add_argument("--type-quantile", choices=["cumulative", "quantEach"])
     p.add_argument("--no-daily", action="store_true"); p.add_argument("--no-summary", action="store_true"); p.add_argument("--no-outliers", action="store_true")
     p.add_argument("--add-spearman", action="store_true"); p.add_argument("--add-dcor", action="store_true")
@@ -472,6 +495,7 @@ def _apply_cli_overrides(cfg: Dict, args: argparse.Namespace) -> Dict:
     maybe("target_regex", args.target_regex)
     maybe("bet_regex", args.bet_regex)
     maybe("spy_ticker", args.spy_ticker)
+    maybe("spy_col_base", args.spy_col_base)
     maybe("spy_col_name", args.spy_col_name)
     maybe("prefer_target_for_spy", args.prefer_target_for_spy)
     if args.quantiles: cfg["quantiles"] = [float(x)/100.0 if float(x)>1 else float(x) for x in args.quantiles.split(",")]
