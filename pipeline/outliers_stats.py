@@ -1,68 +1,89 @@
+# pipeline/outliers_stats.py
+from __future__ import annotations
 import os
-from typing import List, Tuple
-
+import pickle
 import numpy as np
 import pandas as pd
+from tempfile import NamedTemporaryFile
+from typing import Iterable, List
 
+def _zscore(s: pd.Series) -> pd.Series:
+    s = pd.to_numeric(s, errors="coerce")
+    m = s.mean(skipna=True)
+    v = s.std(skipna=True, ddof=1)
+    if not np.isfinite(v) or v == 0:
+        return pd.Series(np.nan, index=s.index)
+    return (s - m) / v
 
 def compute_outliers(
     stats_df: pd.DataFrame,
-    stats_list: List[str],
+    stats_list: Iterable[str],
     z_thresh: float = 3.0,
-    top_k: int = 5,  # kept for backward compatibility; UNUSED
-    group_keys: Tuple[str, ...] = ('target', 'signal', 'bet_size_col', 'qrank', 'stat_type'),
 ) -> pd.DataFrame:
     """
-    Flag outliers *only* by |z| within each (target, signal, bet_size_col, qrank, stat_type) group over time.
-    Expects columns: ['date','value','stat_type','signal','target','bet_size_col','qrank'].
+    Compute outliers per requested stat_type using global z-scores on 'value'.
+    Expects a 'long' frame with columns:
+      ['date','signal','target','qrank','stat_type','bet_size_col','value'] (at minimum).
 
-    Rule:
-      - Statistical only: |z| >= z_thresh (computed within group across dates).
-
-    Notes:
-      - 'top_k' is ignored (kept to avoid breaking callers).
-      - Output is sorted by |z| descending, then date descending.
+    Returns a concatenated DataFrame that includes all rows (not just the extremes),
+    with columns:
+      date, signal, target, qrank, stat_type, bet_size_col, value, z, abs_z, is_outlier, rule
     """
-    if not stats_list:
-        raise ValueError("compute_outliers: 'stats_list' must be a non-empty list of stat_type names.")
+    if stats_df is None or len(stats_df) == 0:
+        return pd.DataFrame()
 
-    use = stats_df[stats_df['stat_type'].isin(stats_list)].copy()
-    use['value'] = pd.to_numeric(use['value'], errors='coerce')
-    use = use[np.isfinite(use['value'])]
-    if use.empty:
-        cols = list(set(['date', 'value'] + list(group_keys))) + [
-            'mean', 'std', 'z', 'abs_z', 'is_outlier', 'rule'
-        ]
-        return pd.DataFrame(columns=cols)
+    # Make sure required columns exist
+    need = {'date','signal','target','qrank','stat_type','bet_size_col','value'}
+    missing_cols = need - set(stats_df.columns)
+    if missing_cols:
+        raise ValueError(f"[outliers] stats_df missing required columns: {sorted(missing_cols)}")
 
-    # Ensure datetime
-    use['date'] = pd.to_datetime(use['date'], errors='coerce')
+    # Normalize dtypes
+    df = stats_df.copy()
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df['value'] = pd.to_numeric(df['value'], errors='coerce')
 
-    # Group-wise mean/std/z
-    gkeys = list(group_keys)
-    use['mean'] = use.groupby(gkeys)['value'].transform('mean')
-    use['std']  = use.groupby(gkeys)['value'].transform('std')
-    use['z']    = (use['value'] - use['mean']) / use['std'].replace(0, np.nan)
-    use['abs_z'] = use['z'].abs()
+    # Requested metrics vs actually present in data
+    req = [str(x) for x in (stats_list or [])]
+    present = sorted(df['stat_type'].dropna().astype(str).unique().tolist())
+    use = [m for m in req if m in present]
 
-    # Flag by z only
-    use['is_outlier'] = use['abs_z'] >= float(z_thresh)
-    use.loc[use['is_outlier'], 'rule'] = f'|z|>={z_thresh}'
+    print(f"[outliers] requested: {req}")
+    print(f"[outliers] present  : {present}")
+    print(f"[outliers] using    : {use}  (skipped: {[m for m in req if m not in present]})")
 
-    out = use[use['is_outlier']].copy()
+    if not use:
+        # Nothing to compute — return empty but well-shaped frame
+        return pd.DataFrame(columns=list(need) + ['z','abs_z','is_outlier','rule'])
 
-    # Sort strictly by |z| (desc), then by date (desc)
-    out = out.sort_values(['abs_z', 'date'], ascending=[False, False])
+    frames: List[pd.DataFrame] = []
+    for metric in use:
+        sub = df[df['stat_type'] == metric].copy()
+        # Keep rows that have numeric 'value'
+        sub = sub.dropna(subset=['value'])
+        if sub.empty:
+            continue
 
+        z = _zscore(sub['value'])
+        sub['z'] = z
+        sub['abs_z'] = z.abs()
+        sub['is_outlier'] = sub['abs_z'] > float(z_thresh)
+        sub['rule'] = f"abs_z > {z_thresh:g}"
+        frames.append(sub)
+
+    if not frames:
+        return pd.DataFrame(columns=list(need) + ['z','abs_z','is_outlier','rule'])
+
+    # Keep all rows (not only outliers) so your tables can select highs/lows flexibly
+    out = pd.concat(frames, ignore_index=True)
+    # Stable ordering: by stat, then by date
+    out = out.sort_values(['stat_type','date','signal','target','bet_size_col','qrank'], kind='mergesort')
     return out
 
-
-def save_outliers(odf: pd.DataFrame, path: str) -> None:
-    """Save outliers as a PKL file."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    odf.to_pickle(path)
-
-
-def load_outliers(path: str) -> pd.DataFrame:
-    """Load outliers from a PKL file."""
-    return pd.read_pickle(path)
+def save_outliers(df: pd.DataFrame, path: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with NamedTemporaryFile(dir=os.path.dirname(path) or ".", delete=False) as tmp:
+        pickle.dump(df, tmp, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_name = tmp.name
+    os.replace(tmp_name, path)
+    print(f"[outliers] saved -> {path}  ({len(df)} rows)")

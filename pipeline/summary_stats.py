@@ -1,14 +1,15 @@
 # =============================
-# summary_stats.py (fast, streaming, memory-light)
-# Parallel-per-signal option; efficiencyP removed.
+# summary_stats.py
 # =============================
 from __future__ import annotations
 
+import os
 import numpy as np
+import pandas as pd
 from collections import defaultdict
 from typing import Sequence, List, Dict, Tuple, Optional
-from scipy.stats import spearmanr
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from scipy.stats import spearmanr
 
 # Optional distance correlation
 try:
@@ -24,7 +25,9 @@ except Exception:
     def _distance_correlation(x, y):
         return np.nan
 
-# Reuse nested store
+# We reuse the 5d nested-dict factory from daily_stats
+# It must exist in your repo and return nested dicts:
+# stats[stat_type][signal][qrank][target][bet] = value
 from .daily_stats import create_5d_stats
 
 
@@ -66,7 +69,7 @@ def _topk_mask_desc(abs_vals: np.ndarray, finite_mask: np.ndarray, q: float) -> 
 
 # ===================== INTERNAL CORE (single set of signals) ====================
 def _compute_summary_stats_core(
-    df,
+    df: pd.DataFrame,
     date_col: str,
     signal_cols: Sequence[str],
     target_cols: Sequence[str],
@@ -78,9 +81,11 @@ def _compute_summary_stats_core(
     spearman_sample_cap_per_key: int,
     random_state: int | None,
     spy_by_target: Optional[Dict[str, str]],          # map: target -> spy column (same horizon)
-):
-    import pandas as pd
-
+) -> Dict:
+    """
+    Compute strategy summary stats over all days.
+    Returns nested dict: stats[stat_type][signal][qrank][target][bet] = value
+    """
     out = create_5d_stats()
 
     # Sanitize lists
@@ -91,8 +96,8 @@ def _compute_summary_stats_core(
     if date_col not in df.columns:
         raise KeyError(f"[summary_stats] date_col '{date_col}' not found in DataFrame.")
 
+    # Build the list we actually need present
     want = [date_col] + list(signal_cols) + list(target_cols) + list(bet_size_cols)
-    # include all spy columns that were provided (if any)
     if spy_by_target:
         want += [c for c in spy_by_target.values() if isinstance(c, str)]
     present = [c for c in want if c in df.columns]
@@ -100,25 +105,26 @@ def _compute_summary_stats_core(
     if missing:
         print(f"[WARN][summary_stats] Ignoring missing columns: {missing}")
 
-    # If no spy columns effectively present, disable market corr
+    # Make an effective spy map limited to present columns
     effective_spy_map: Dict[str, str] = {}
     if spy_by_target:
         for t, sc in spy_by_target.items():
             if isinstance(t, str) and isinstance(sc, str) and (t in df.columns) and (sc in df.columns):
                 effective_spy_map[t] = sc
 
+    # Prepare df
     df = df[present].copy()
     df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
     df = df.dropna(subset=[date_col])
     if df.empty:
         return out
 
-    # Pre-clean numeric columns once
+    # Pre-clean numeric columns
     numeric_cols = [c for c in present if c != date_col]
     for c in numeric_cols:
         df[c] = _float_clean(df[c].to_numpy())
 
-    # Group in chronological order
+    # Chronological groups
     grouped = df.sort_values(date_col).groupby(date_col, sort=True)
 
     # --------- Streaming accumulators ---------
@@ -126,16 +132,17 @@ def _compute_summary_stats_core(
     rng = np.random.default_rng(random_state)
 
     # Welford stats for daily PPD
-    ppd_stats = defaultdict(lambda: [0, 0.0, 0.0])   # key=(s,q,t,b)
+    from collections import defaultdict as _dd
+    ppd_stats = _dd(lambda: [0, 0.0, 0.0])   # key=(s,q,t,b)
 
     # Regression pooled sufficient stats for r² / t
-    reg = defaultdict(lambda: {'n':0, 'sx':0.0, 'sy':0.0, 'sxx':0.0, 'syy':0.0, 'sxy':0.0})
+    reg = _dd(lambda: {'n':0, 'sx':0.0, 'sy':0.0, 'sxx':0.0, 'syy':0.0, 'sxy':0.0})
 
     # Hit / long ratios
-    hit_num = defaultdict(int)         # key=(s,q,t,b)
-    hit_den = defaultdict(int)
-    long_num = defaultdict(int)        # key=(s,q,b)
-    long_den = defaultdict(int)
+    hit_num = _dd(int)         # key=(s,q,t,b)
+    hit_den = _dd(int)
+    long_num = _dd(int)        # key=(s,q,b)
+    long_den = _dd(int)
 
     # Spearman/DCOR small reservoir (signal vs target per-row)
     class _Reservoir:
@@ -151,17 +158,14 @@ def _compute_summary_stats_core(
                 return
             xs = xs[:m].astype('float64', copy=False)
             ys = ys[:m].astype('float64', copy=False)
-
             if key not in self.store:
                 take = min(self.cap, m)
                 idx = self.rng.choice(m, size=take, replace=False)
                 self.store[key] = (xs[idx].copy(), ys[idx].copy(), m)
                 return
-
             X, Y, seen = self.store[key]
             total = seen + m
 
-            # ensure arrays filled up to cap
             if X.size < self.cap:
                 need = self.cap - X.size
                 add = min(need, m)
@@ -172,7 +176,6 @@ def _compute_summary_stats_core(
                 self.store[key] = (X, Y, seen)
                 return
 
-            # reservoir replacement
             if total > 0:
                 p = self.cap / float(total)
                 rcount = int(self.rng.binomial(m, p))
@@ -192,14 +195,14 @@ def _compute_summary_stats_core(
                          seed=random_state)
 
     # Daily totals accumulators (streamed sums over days)
-    sum_pnl       = defaultdict(float)  # key=(s,q,t,b)
-    sum_notional  = defaultdict(float)
-    sum_nrInstr   = defaultdict(float)
-    sum_ntrades   = defaultdict(float)
+    sum_pnl       = _dd(float)  # key=(s,q,t,b)
+    sum_notional  = _dd(float)
+    sum_nrInstr   = _dd(float)
+    sum_ntrades   = _dd(float)
 
     # Per-key daily PnL vs SPY (same-horizon) series for Spearman
     # key -> (list_of_daily_pnl, list_of_daily_spy_ret)
-    spy_pairs = defaultdict(lambda: ([], []))
+    spy_pairs = _dd(lambda: ([], []))
 
     # --------- Stream each day ---------
     for dt, day in grouped:
@@ -239,7 +242,7 @@ def _compute_summary_stats_core(
             sgn = np.sign(s_all)
             abs_s = np.abs(s_all)
 
-            # quantEach edges if needed
+            # quantile bucket edges if needed
             if type_quantile != 'cumulative':
                 sabs_fin = abs_s[m_fin]
                 if sabs_fin.size:
@@ -377,11 +380,10 @@ def _compute_summary_stats_core(
     out_nested = create_5d_stats()
 
     # Sharpe from daily PPD (Welford)
-    sqrt_252 = np.sqrt(252.0)
     for key, st in ppd_stats.items():
         n, mean, M2 = st
         mu, sd = (mean, np.sqrt(M2 / n)) if n > 1 else (mean, np.nan)
-        sharpe = (mu / sd * sqrt_252) if (np.isfinite(mu) and np.isfinite(sd) and sd > 0) else np.nan
+        sharpe = (mu / sd * np.sqrt(252.0)) if (np.isfinite(mu) and np.isfinite(sd) and sd > 0) else np.nan
         s, ql, t, b = key
         out_nested['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
 
@@ -442,7 +444,6 @@ def _compute_summary_stats_core(
     seen_targets_per_sqb = defaultdict(set)
     for (s, ql, t, b) in ppd_stats.keys():
         seen_targets_per_sqb[(s, ql, b)].add(t)
-
     for (s, ql, b), ln in long_num.items():
         ld = long_den.get((s, ql, b), 0)
         val = (ln / ld) if ld > 0 else np.nan
@@ -494,9 +495,9 @@ def _merge_summary(dst: Dict, src: Dict) -> None:
             dst[stat_type][signal] = q_tree
 
 
-# ===================== PUBLIC API (optionally parallel) ====================
+# ===================== PUBLIC API ====================
 def compute_summary_stats_over_days(
-    df,
+    df: pd.DataFrame,
     date_col: str,
     signal_cols: Sequence[str],
     target_cols: Sequence[str],
@@ -505,12 +506,16 @@ def compute_summary_stats_over_days(
     type_quantile: str = 'cumulative',   # 'cumulative' (>=thr) or 'quantEach' (exact bucket)
     add_spearman: bool = False,
     add_dcor: bool = False,
-    n_jobs: int | None = None,           # threads per-signal
+    n_jobs: int | None = None,           # threads across signals
     backend: str = "loky",               # kept for compat
     spearman_sample_cap_per_key: int = 10000,
     random_state: int | None = 123,
     spy_by_target: Optional[Dict[str, str]] = None,  # {target -> spy column}
-):
+    # NEW (optional) — per-id (e.g., per-ticker) corr dumps
+    id_col: Optional[str] = None,
+    dump_alpha_raw_corr_path: Optional[str] = None,
+    dump_alpha_pnl_corr_path: Optional[str] = None,
+) -> Dict:
     """
     Returns ONE summary value per (signal, qrank, target, bet).
 
@@ -519,49 +524,172 @@ def compute_summary_stats_over_days(
 
         spy_corr[signal][qrank][target][bet]
             = Spearman corr( daily strategy PnL, daily SPY return at that target's horizon ).
+
+    If `id_col` is provided and present in df, and any of the dump paths are provided,
+    we also compute per-id Spearman correlations across days and dump them:
+      - alpha_raw_spy_corr  (mean raw alpha per-id vs SPY)
+      - alpha_pnl_spy_corr  (daily per-id PnL vs SPY)
     """
     signal_cols = _sanitize_list(signal_cols)
     if not signal_cols:
         return create_5d_stats()
 
+    # Single-threaded path (common and deterministic)
     if not n_jobs or n_jobs <= 1 or len(signal_cols) == 1:
-        return _compute_summary_stats_core(
+        out = _compute_summary_stats_core(
             df, date_col, signal_cols, target_cols, quantiles, bet_size_cols,
             type_quantile, add_spearman, add_dcor, spearman_sample_cap_per_key,
             random_state, spy_by_target
         )
+    else:
+        # Parallel across signals
+        n_threads = min(len(signal_cols), int(n_jobs))
+        out = create_5d_stats()
 
-    # Parallel across signals
-    n_threads = min(len(signal_cols), int(n_jobs))
-    out = create_5d_stats()
+        def _chunks(lst, k):
+            for i in range(k):
+                yield [lst[j] for j in range(i, len(lst), k)]
 
-    def _chunks(lst, k):
-        for i in range(k):
-            yield [lst[j] for j in range(i, len(lst), k)]
+        with ThreadPoolExecutor(max_workers=n_threads) as ex:
+            futs = []
+            rng = np.random.default_rng(random_state)
+            for sub_signals in _chunks(signal_cols, n_threads):
+                if not sub_signals:
+                    continue
+                futs.append(ex.submit(
+                    _compute_summary_stats_core,
+                    df,
+                    date_col,
+                    sub_signals,
+                    target_cols,
+                    quantiles,
+                    bet_size_cols,
+                    type_quantile,
+                    add_spearman,
+                    add_dcor,
+                    spearman_sample_cap_per_key,
+                    None if random_state is None else int(rng.integers(0, 2**31 - 1)),
+                    spy_by_target
+                ))
+            for fut in as_completed(futs):
+                _merge_summary(out, fut.result())
 
-    with ThreadPoolExecutor(max_workers=n_threads) as ex:
-        futs = []
-        rng = np.random.default_rng(random_state)
-        for sub_signals in _chunks(signal_cols, n_threads):
-            if not sub_signals:
-                continue
-            futs.append(ex.submit(
-                _compute_summary_stats_core,
-                df,
-                date_col,
-                sub_signals,
-                target_cols,
-                quantiles,
-                bet_size_cols,
-                type_quantile,
-                add_spearman,
-                add_dcor,
-                spearman_sample_cap_per_key,
-                None if random_state is None else int(rng.integers(0, 2**31 - 1)),
-                spy_by_target
-            ))
-        for fut in as_completed(futs):
-            _merge_summary(out, fut.result())
+    # =================== NEW: Per-ID (e.g., per-ticker) corr dumps ===================
+    try:
+        do_per_id = (id_col is not None) and (isinstance(id_col, str)) and (id_col in df.columns)
+        have_spy = isinstance(spy_by_target, dict) and (len(spy_by_target) > 0)
+
+        if do_per_id and have_spy and (dump_alpha_raw_corr_path or dump_alpha_pnl_corr_path):
+            import pickle as _p
+
+            work = df.copy()
+            work[date_col] = pd.to_datetime(work[date_col], errors='coerce')
+            work = work.dropna(subset=[date_col, id_col])
+
+            # Effective spy map
+            eff_spy_map = {t: sc for t, sc in (spy_by_target or {}).items() if t in work.columns and sc in work.columns}
+            if eff_spy_map:
+                sigs = [c for c in signal_cols if c in work.columns]
+                tgts = [c for c in target_cols if c in work.columns]
+                bets = [c for c in bet_size_cols if c in work.columns]
+                if sigs and tgts and bets:
+                    recs_raw = [] if dump_alpha_raw_corr_path else None
+                    recs_pnl = [] if dump_alpha_pnl_corr_path else None
+
+                    for dt, day in work.groupby(date_col, sort=True):
+                        for s_name in sigs:
+                            svals = np.asarray(day[s_name], float)
+                            sfin  = np.isfinite(svals)
+                            sgn   = np.sign(svals)
+                            abs_s = np.abs(svals)
+
+                            for q in quantiles:
+                                qlbl = _qlabel(q)
+                                if q >= 1.0:
+                                    mask_q = sfin
+                                else:
+                                    idx_fin = np.where(sfin)[0]
+                                    mask_q = np.zeros_like(sfin, bool)
+                                    if idx_fin.size:
+                                        k = int(np.ceil(q * idx_fin.size))
+                                        order = np.argsort(-abs_s[idx_fin], kind="mergesort")
+                                        choose = idx_fin[order[:k]]
+                                        mask_q[choose] = True
+                                if not mask_q.any():
+                                    continue
+
+                                s_q   = svals[mask_q]
+                                ids_q = day.loc[mask_q, id_col].astype(str).values
+
+                                for t_name in tgts:
+                                    if t_name not in eff_spy_map:
+                                        continue
+                                    spy_col = eff_spy_map[t_name]
+                                    spy_vals = np.asarray(day[spy_col], float)
+                                    spy_v = np.nanmean(spy_vals) if spy_vals.size else np.nan
+                                    if not np.isfinite(spy_v):
+                                        continue
+
+                                    y = np.asarray(day[t_name], float)[mask_q]
+                                    yfin = np.isfinite(y)
+                                    if not yfin.any():
+                                        continue
+
+                                    # RAW alpha (mean per id)
+                                    if recs_raw is not None:
+                                        dfraw = pd.DataFrame({id_col: ids_q, 'alpha_raw': s_q})
+                                        raw_per_id = dfraw.groupby(id_col)['alpha_raw'].mean()
+                                        for name_i, val in raw_per_id.items():
+                                            if np.isfinite(val):
+                                                recs_raw.append((
+                                                    str(name_i), s_name, qlbl, t_name, "__RAW__", pd.Timestamp(dt), float(val), float(spy_v)
+                                                ))
+
+                                    # PNL per id (for each bet)
+                                    if recs_pnl is not None:
+                                        for b_name in bets:
+                                            bcol = np.asarray(day[b_name], float)[mask_q]
+                                            bcol = np.where(np.isfinite(bcol), np.abs(bcol), np.nan)
+                                            pnl_row = y * np.sign(s_q) * bcol
+                                            dfp = pd.DataFrame({id_col: ids_q, 'pnl': pnl_row})
+                                            pnl_per_id = dfp.groupby(id_col)['pnl'].sum()
+                                            for name_i, val in pnl_per_id.items():
+                                                if np.isfinite(val):
+                                                    recs_pnl.append((
+                                                        str(name_i), s_name, qlbl, t_name, b_name, pd.Timestamp(dt), float(val), float(spy_v)
+                                                    ))
+
+                    def _collapse_and_dump(records, out_path, metric_name):
+                        if (records is None) or (out_path is None) or (len(records) == 0):
+                            return
+                        cols = [id_col, 'signal', 'qrank', 'target', 'bet_size_col', 'date', 'series', 'spy']
+                        dfrec = pd.DataFrame.from_records(records, columns=cols)
+                        out_rows = []
+                        for keys, grp in dfrec.groupby([id_col,'signal','qrank','target','bet_size_col'], sort=False):
+                            x = pd.to_numeric(grp['series'], errors='coerce')
+                            y = pd.to_numeric(grp['spy'], errors='coerce')
+                            m = x.notna() & y.notna()
+                            if m.sum() >= 3 and x[m].nunique() >= 2 and y[m].nunique() >= 2:
+                                r = spearmanr(x[m], y[m], nan_policy='omit').correlation
+                                val = float(r) if np.isfinite(r) else np.nan
+                            else:
+                                val = np.nan
+                            out_rows.append((*keys, metric_name, val))
+                        dfout = pd.DataFrame.from_records(
+                            out_rows,
+                            columns=[id_col, 'signal','qrank','target','bet_size_col','stat_type','value']
+                        )
+                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                        with open(out_path + ".tmp", "wb") as _f:
+                            _p.dump(dfout, _f, protocol=_p.HIGHEST_PROTOCOL)
+                        os.replace(out_path + ".tmp", out_path)
+                        print(f"[summary_stats] Wrote per-id corr: {out_path}  ({len(dfout)} rows)")
+
+                    _collapse_and_dump(recs_raw, dump_alpha_raw_corr_path, "alpha_raw_spy_corr")
+                    _collapse_and_dump(recs_pnl, dump_alpha_pnl_corr_path, "alpha_pnl_spy_corr")
+
+    except Exception as _e:
+        print(f"[WARN][summary_stats] per-id corr dump failed: {_e}")
 
     return out
 

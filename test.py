@@ -2,7 +2,7 @@ import pickle
 import pandas as pd
 from pprint import pprint
 
-path = "input/DAILY_FEATURES_PKL/features_20000103.pkl"  # <- change me
+path = "output/DAILY_STATS/stats_20211130.pkl"  # <- change me
 
 with open(path, "rb") as f:
     obj = pickle.load(f)
