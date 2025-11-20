@@ -6,15 +6,9 @@ Add your raw data files to the data/RAW_DATA folder.
 
 python main.py
 
-After running, the output .pkl and .csv files will be saved in the output/DAILY_SUMMARIES folder.
+NEED TO CHANGE:
 
-python plotting/plot_quantile_bars.py
-
-After running, the pdf of visuals will be saved in the output folder and each image as a png will be saved in the outputs/PLOTS folder.
-
-
-NEED TO CHANGE: 
-- validate values (pnl, ppd, sharpe, etc. and cumsum graphs) (DHRUV)
-- add user inputs / make dynamic (LUCAS)
-- improve parallel processing of data, ideally get rid of nested loops
-- next step: add sample file with signals/target/bet size columns
+ccf
+clean up code
+verify calculations
+vectorize and parallelize
