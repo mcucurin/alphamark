@@ -18,9 +18,9 @@ Pages
 2) H1: average daily cross-section correlation across alphas (Spearman), using base stat:
        alpha_sum > alpha_strength > pnl (no quantile/target/bet filter; uses all rows).
    H1 temporal lines (pairwise Spearman by day, optionally smoothed). No legend — line end labels.
-3) H2: per-quantile PnL daily cross-section correlation (fixed target & bet) — Spearman.
+3) H2: per-quantile PnL daily cross-section correlation (all targets, all bet sizes) — Spearman.
    H2 temporal lines for the same filter. No legend — line end labels.
-4) H3: per-quantile time-series correlation of summed daily PnL vectors (Spearman).
+4) H3: per-quantile time-series correlation of summed daily PnL vectors (Spearman, all targets / bets).
    H3 temporal lines (rolling/expanding time corr). No legend — line end labels.
 5) Temporal pages per (target, signal, bet): cumulative P&L vs nrInstr; cumulative PPD vs Size Notional; daily n_trades.
 6) Distributions: histograms (RAW↔SPY corr, PNL↔SPY corr) with mean/median/std annotations (if files exist).
@@ -979,7 +979,6 @@ def generate_quantile_report(config: dict):
     Required keys in `config` (all configured in main.py):
       - daily_dir, summary_dir, per_ticker_dir, outliers_dir, output_pdf
       - qranks, allow_missing_qranks
-      - H2_targets, H2_bets, H3_targets, H3_bets
       - roll_* windows, bar_* settings, outlier_* settings, styles, quantile_colors
       - interval_start, interval_end (for informational/meta only; data is already trimmed upstream)
     """
@@ -994,10 +993,8 @@ def generate_quantile_report(config: dict):
     qranks_requested = [str(q) for q in config.get("qranks", [])][:4]
     allow_missing_q  = bool(config.get("allow_missing_qranks", False))
 
-    H2_targets_cfg   = config.get("H2_targets", "AUTO")
-    H2_bets_cfg      = config.get("H2_bets", "AUTO")
-    H3_targets_cfg   = config.get("H3_targets", "AUTO")
-    H3_bets_cfg      = config.get("H3_bets", "AUTO")
+    # H2/H3 now always use *all* targets and bet sizes for heatmaps/temporal plots,
+    # so we ignore any H2_/H3_ target/bet config for those sections.
 
     roll_h1_lines    = int(config.get("roll_h1_lines", 60))
     roll_h2_lines    = int(config.get("roll_h2_lines", 60))
@@ -1091,7 +1088,7 @@ def generate_quantile_report(config: dict):
     os.makedirs(os.path.dirname(output_pdf) or ".", exist_ok=True)
 
     with PdfPages(output_pdf) as pdf:
-        print("[INFO] Requested QR: {qranks_requested}")
+        print(f"[INFO] Requested QR: {qranks_requested}")
         print(f"[INFO] Window printed on each page: {META_TEXT}")
 
         # ---------- Bar Plots (SUMMARY only) ----------
@@ -1215,7 +1212,7 @@ def generate_quantile_report(config: dict):
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
             savefig_white(pdf, fig)
 
-            # H1 temporal
+            # H1 temporal (all targets, all bet sizes)
             if do_temporal:
                 plot_cross_section_corr_lines(
                     pdf,
@@ -1230,51 +1227,23 @@ def generate_quantile_report(config: dict):
                     bets=None,
                 )
 
-        # ---------- Heatmaps 2 & 3 per-quantile ----------
+        # ---------- Heatmaps 2 & 3 per-quantile (ALL targets/bets) ----------
         stats_daily_plot_nonall = stats_daily_nonall
-        try:
-            H2_TARGETS_RES = _resolve_fixed("H2_TARGETS", H2_targets_cfg,
-                                            stats_daily_plot_nonall['target'],
-                                            prefer_prefix="fret_", top_k=2)
-        except Exception as e:
-            print(f"[WARN] H2 target resolution failed: {e}")
-            H2_TARGETS_RES = []
-        try:
-            H2_BETS_RES    = _resolve_fixed("H2_BETS", H2_bets_cfg,
-                                            stats_daily_plot_nonall['bet_size_col'],
-                                            prefer_prefix="betsize_", top_k=2)
-        except Exception as e:
-            print(f"[WARN] H2 bet resolution failed: {e}")
-            H2_BETS_RES = []
-        try:
-            H3_TARGETS_RES = _resolve_fixed("H3_TARGETS", H3_targets_cfg,
-                                            stats_daily_plot_nonall['target'],
-                                            prefer_prefix="fret_", top_k=1)
-        except Exception as e:
-            print(f"[WARN] H3 target resolution failed: {e}")
-            H3_TARGETS_RES = []
-        try:
-            H3_BETS_RES    = _resolve_fixed("H3_BETS", H3_bets_cfg,
-                                            stats_daily_plot_nonall['bet_size_col'],
-                                            prefer_prefix="betsize_", top_k=1)
-        except Exception as e:
-            print(f"[WARN] H3 bet resolution failed: {e}")
-            H3_BETS_RES = []
 
         for q in qranks:
             q_masked_df = stats_daily_plot_nonall[stats_daily_plot_nonall['qrank'] == q].copy()
 
-            # Heatmap 2 — cross-section corr of P&L, fixed (target, bet)
+            # Heatmap 2 — cross-section corr of P&L, across all targets/bets
             H2, labels2, n_days2 = compute_heatmap_daily_avg(
                 q_masked_df, alphas, stat_type='pnl', min_pairs=2,
                 qfilter=[q] if q else None,
-                targets=H2_TARGETS_RES if H2_TARGETS_RES else None,
-                bets=H2_BETS_RES if H2_BETS_RES else None
+                targets=None,
+                bets=None
             )
             k2 = len(labels2) if labels2 else 0
             fig, ax, cax = _centered_heatmap_axes(k2)
-            tdesc2 = f"target={', '.join(H2_TARGETS_RES)}" if H2_TARGETS_RES else "target=AUTO"
-            bdesc2 = f"bet={', '.join(H2_BETS_RES)}" if H2_BETS_RES else "bet=AUTO"
+            tdesc2 = "targets=ALL"
+            bdesc2 = "bets=ALL"
             if H2 is None or n_days2 == 0:
                 ax.axis('off')
                 _set_title_fit(
@@ -1283,21 +1252,21 @@ def generate_quantile_report(config: dict):
                     base_size=13, pad=8, loc='center'
                 )
                 ax.text(0.5, 0.5,
-                        "No sufficient daily cross-sections for 'pnl' with fixed filters.\n"
-                        "Tip: ensure ≥2 rows/day across (target, bet).",
+                        "No sufficient daily cross-sections for 'pnl'.\n"
+                        "Tip: ensure ≥2 rows/day across (signal, target, bet).",
                         ha='center', va='center')
                 if cax is not None: cax.axis('off')
             else:
                 _plot_matrix_heatmap(
                     fig, ax, cax, H2, labels2,
-                    f"Heatmap 2 — Cross-section corr of daily PnLs (Spearman) [{q}] [{tdesc2} | {bdesc2}] "
-                    f"(avg over {n_days2} days)",
+                    f"Heatmap 2 — Cross-section corr of daily PnLs (Spearman) "
+                    f"[{q}] [{tdesc2} | {bdesc2}] (avg over {n_days2} days)",
                     vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
                 )
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
             savefig_white(pdf, fig)
 
-            # H2 temporal
+            # H2 temporal (all targets/bets)
             if do_temporal and len(alphas) >= 2 and (H2 is not None):
                 plot_cross_section_corr_lines(
                     pdf,
@@ -1308,20 +1277,19 @@ def generate_quantile_report(config: dict):
                     smooth_window=roll_h2_lines,
                     height=6.0,
                     qfilter=[q],
-                    targets=H2_TARGETS_RES if H2_TARGETS_RES else None,
-                    bets=H2_BETS_RES if H2_BETS_RES else None,
+                    targets=None,
+                    bets=None,
                 )
 
-            # Heatmap 3 — time-series corr of summed daily P&L vectors, fixed (target, bet)
+            # Heatmap 3 — time-series corr of summed daily P&L vectors, all targets/bets
             C3, labels3, n_days3 = compute_timeseries_heatmap(
                 q_masked_df, alphas, stat_type='pnl', min_days=5, agg='sum',
-                qfilter=[q], targets=H3_TARGETS_RES if H3_TARGETS_RES else None,
-                bets=H3_BETS_RES if H3_BETS_RES else None
+                qfilter=[q], targets=None, bets=None
             )
             k3 = len(labels3) if labels3 else 0
             fig, ax, cax = _centered_heatmap_axes(k3)
-            tdesc3 = f"target={', '.join(H3_TARGETS_RES)}" if H3_TARGETS_RES else "target=AUTO"
-            bdesc3 = f"bet={', '.join(H3_BETS_RES)}" if H3_BETS_RES else "bet=AUTO"
+            tdesc3 = "targets=ALL"
+            bdesc3 = "bets=ALL"
             if C3 is None or n_days3 < 5:
                 ax.axis('off')
                 _set_title_fit(
@@ -1342,36 +1310,21 @@ def generate_quantile_report(config: dict):
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
             savefig_white(pdf, fig)
 
-            # H3 temporal
+            # H3 temporal (all targets/bets)
             if do_temporal and len(alphas) >= 2 and (C3 is not None):
-                corr_map = compute_pairwise_rolling_time_corr(
-                    q_masked_df, alphas, stat_type='pnl',
-                    window=roll_h3_lines, qfilter=[q],
-                    targets=H3_TARGETS_RES if H3_TARGETS_RES else None,
-                    bets=H3_BETS_RES if H3_BETS_RES else None,
-                    agg='sum'
+                plot_pairwise_timecorr_lines(
+                    pdf,
+                    q_masked_df,
+                    alphas,
+                    stat_type='pnl',
+                    title_prefix=f"[H3 | {q}] Alpha vs Alpha — Time corr (P&L vectors)",
+                    window=roll_h3_lines,
+                    height=6.0,
+                    qfilter=[q],
+                    targets=None,
+                    bets=None,
+                    agg='sum',
                 )
-                title_text = (
-                    f"[H3 | {q}] Alpha vs Alpha — Time corr (P&L vectors) — "
-                    f"{'Rolling ' + str(int(roll_h3_lines)) + 'D' if int(roll_h3_lines) > 1 else 'Expanding'} "
-                    f"— tgt={','.join(H3_TARGETS_RES) if H3_TARGETS_RES else 'AUTO'} "
-                    f"| bet={','.join(H3_BETS_RES) if H3_BETS_RES else 'AUTO'}"
-                )
-                dates_all = sorted(q_masked_df['date'].dropna().unique())
-                fig, ax = plt.subplots(figsize=(14, 6.0))
-                _set_title_fit(fig, ax, title_text, base_size=14, pad=10, loc='center')
-
-                coverage = [(k, v.notna().sum()) for k, v in corr_map.items()]
-                coverage.sort(key=lambda x: x[1], reverse=True)
-                chosen = [k for k, cnt in coverage[:8] if cnt > 0]
-                series_map = {k: corr_map[k].copy().sort_index() for k in chosen}
-                _label_last_points(ax, series_map)
-                if dates_all:
-                    ax.set_xlim(pd.to_datetime(dates_all[0]), pd.to_datetime(dates_all[-1]))
-                ax.set_ylabel("Spearman corr (time)")
-                _plot_date_axis(ax)
-                fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
-                savefig_white(pdf, fig)
 
         # ---------- Temporal pages per (target, signal, bet) ----------
         stats_daily_plot_local = stats_daily_plot_nonall
@@ -1594,4 +1547,3 @@ def generate_quantile_report(config: dict):
 
 if __name__ == "__main__":
     raise SystemExit("This module is intended to be called via generate_quantile_report(config) from main.py.")
-
