@@ -80,6 +80,14 @@ DEFAULT_RUNNER_CONFIG = {
     "dump_alpha_raw_per_id": True,
     "dump_alpha_pnl_per_id": True,
 
+    # -------- Per-ID CCF (alpha vs SPY) dump toggles --------
+    # These are consumed inside the runner when calling compute_summary_stats_over_days
+    # and will generate per_ticker_alpha_*_spy_ccf_*.pkl in per_ticker_dir.
+    "ccf_enable": True,
+    "ccf_max_lag": 5,
+    "dump_alpha_raw_ccf_per_id": True,
+    "dump_alpha_pnl_ccf_per_id": True,
+
     # -------- Outliers --------
     "outlier_metrics": ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades"],
     "outlier_z_thresh": 3.0,
@@ -98,7 +106,7 @@ DEFAULT_RUNNER_CONFIG = {
 
     # -------- Interval filter (inclusive) --------
     # Accepts many formats: "2021-01-01", "01/01/2021", "20210101"
-    "interval_start": "2020-01-01",
+    "interval_start": "2021-11-01",
     "interval_end": None,
 }
 
@@ -146,6 +154,11 @@ DEFAULT_PLOT_CONFIG = {
     "style_second": ":",    # dotted
     "quantile_colors": {"qr_100": "red", "qr_75": "green", "qr_50": "blue",  "qr_25": "black"},
 
+    # CCF (cross-correlation vs SPY) plots using per-ticker dumps in per_ticker_dir
+    # MAX_LAG = ccf_max_lag; we use lags in [-MAX_LAG, ..., +MAX_LAG]
+    "ccf_enable": True,
+    "ccf_max_lag": 5,
+
     # Titles / layout
     "meta_text": None,      # printed top-right on every page; if None, plotting will auto-fill
 }
@@ -182,6 +195,10 @@ if __name__ == '__main__':
     # ---- Keep plotting interval in sync with runner ----
     plot_cfg["interval_start"] = runner_cfg.get("interval_start")
     plot_cfg["interval_end"] = runner_cfg.get("interval_end")
+
+    # ---- Keep CCF settings in sync between runner & plotting ----
+    plot_cfg["ccf_enable"] = runner_cfg.get("ccf_enable", True)
+    plot_cfg["ccf_max_lag"] = runner_cfg.get("ccf_max_lag", 5)
 
     # -----------------------------------------------------------------
     # 2) Run pipeline with centralized config

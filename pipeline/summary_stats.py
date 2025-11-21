@@ -511,10 +511,13 @@ def compute_summary_stats_over_days(
     spearman_sample_cap_per_key: int = 10000,
     random_state: int | None = 123,
     spy_by_target: Optional[Dict[str, str]] = None,  # {target -> spy column}
-    # NEW (optional) — per-id (e.g., per-ticker) corr dumps
+    # NEW (optional) — per-id (e.g., per-ticker) corr & CCF dumps
     id_col: Optional[str] = None,
     dump_alpha_raw_corr_path: Optional[str] = None,
     dump_alpha_pnl_corr_path: Optional[str] = None,
+    ccf_max_lag: int = 5,
+    dump_alpha_raw_ccf_path: Optional[str] = None,
+    dump_alpha_pnl_ccf_path: Optional[str] = None,
 ) -> Dict:
     """
     Returns ONE summary value per (signal, qrank, target, bet).
@@ -529,6 +532,13 @@ def compute_summary_stats_over_days(
     we also compute per-id Spearman correlations across days and dump them:
       - alpha_raw_spy_corr  (mean raw alpha per-id vs SPY)
       - alpha_pnl_spy_corr  (daily per-id PnL vs SPY)
+
+    Additionally, if `ccf_max_lag > 0` and CCF dump paths are provided, we compute per-id
+    cross-correlation functions (CCF) vs SPY across lags in [-ccf_max_lag, +ccf_max_lag]:
+      - alpha_raw_spy_ccf
+      - alpha_pnl_spy_ccf
+
+    CCF is Spearman-based, using corr(x_t, spy_{t+lag}) with both series aligned on calendar dates.
     """
     signal_cols = _sanitize_list(signal_cols)
     if not signal_cols:
@@ -574,12 +584,14 @@ def compute_summary_stats_over_days(
             for fut in as_completed(futs):
                 _merge_summary(out, fut.result())
 
-    # =================== NEW: Per-ID (e.g., per-ticker) corr dumps ===================
+    # =================== NEW: Per-ID (e.g., per-ticker) corr & CCF dumps ===================
     try:
         do_per_id = (id_col is not None) and (isinstance(id_col, str)) and (id_col in df.columns)
         have_spy = isinstance(spy_by_target, dict) and (len(spy_by_target) > 0)
+        want_corr = (dump_alpha_raw_corr_path is not None) or (dump_alpha_pnl_corr_path is not None)
+        want_ccf  = (dump_alpha_raw_ccf_path is not None) or (dump_alpha_pnl_ccf_path is not None)
 
-        if do_per_id and have_spy and (dump_alpha_raw_corr_path or dump_alpha_pnl_corr_path):
+        if do_per_id and have_spy and (want_corr or want_ccf):
             import pickle as _p
 
             work = df.copy()
@@ -593,8 +605,8 @@ def compute_summary_stats_over_days(
                 tgts = [c for c in target_cols if c in work.columns]
                 bets = [c for c in bet_size_cols if c in work.columns]
                 if sigs and tgts and bets:
-                    recs_raw = [] if dump_alpha_raw_corr_path else None
-                    recs_pnl = [] if dump_alpha_pnl_corr_path else None
+                    recs_raw = [] if (dump_alpha_raw_corr_path or dump_alpha_raw_ccf_path) else None
+                    recs_pnl = [] if (dump_alpha_pnl_corr_path or dump_alpha_pnl_ccf_path) else None
 
                     for dt, day in work.groupby(date_col, sort=True):
                         for s_name in sigs:
@@ -665,7 +677,7 @@ def compute_summary_stats_over_days(
                         cols = [id_col, 'signal', 'qrank', 'target', 'bet_size_col', 'date', 'series', 'spy']
                         dfrec = pd.DataFrame.from_records(records, columns=cols)
                         out_rows = []
-                        for keys, grp in dfrec.groupby([id_col,'signal','qrank','target','bet_size_col'], sort=False):
+                        for keys, grp in dfrec.groupby([id_col, 'signal', 'qrank', 'target', 'bet_size_col'], sort=False):
                             x = pd.to_numeric(grp['series'], errors='coerce')
                             y = pd.to_numeric(grp['spy'], errors='coerce')
                             m = x.notna() & y.notna()
@@ -677,7 +689,7 @@ def compute_summary_stats_over_days(
                             out_rows.append((*keys, metric_name, val))
                         dfout = pd.DataFrame.from_records(
                             out_rows,
-                            columns=[id_col, 'signal','qrank','target','bet_size_col','stat_type','value']
+                            columns=[id_col, 'signal', 'qrank', 'target', 'bet_size_col', 'stat_type', 'value']
                         )
                         os.makedirs(os.path.dirname(out_path), exist_ok=True)
                         with open(out_path + ".tmp", "wb") as _f:
@@ -685,11 +697,71 @@ def compute_summary_stats_over_days(
                         os.replace(out_path + ".tmp", out_path)
                         print(f"[summary_stats] Wrote per-id corr: {out_path}  ({len(dfout)} rows)")
 
+                    def _collapse_and_dump_ccf(records, out_path, metric_name, max_lag: int):
+                        """
+                        For each (id, signal, qrank, target, bet), build a date-indexed series
+                        of 'series' vs 'spy' and compute Spearman cross-correlation at lags
+                        in [-max_lag, +max_lag].  Writes columns:
+                          [id_col, signal, qrank, target, bet_size_col, stat_type, lag, corr]
+                        """
+                        if (records is None) or (out_path is None) or (len(records) == 0):
+                            return
+                        if max_lag is None or int(max_lag) <= 0:
+                            return
+                        max_lag = int(max_lag)
+
+                        cols = [id_col, 'signal', 'qrank', 'target', 'bet_size_col', 'date', 'series', 'spy']
+                        dfrec = pd.DataFrame.from_records(records, columns=cols)
+                        out_rows = []
+
+                        for keys, grp in dfrec.groupby([id_col, 'signal', 'qrank', 'target', 'bet_size_col'], sort=False):
+                            grp = grp.copy()
+                            grp['date'] = pd.to_datetime(grp['date'], errors='coerce')
+                            grp = grp.dropna(subset=['date'])
+                            if grp.empty:
+                                continue
+
+                            grp = grp.sort_values('date')
+                            x = pd.to_numeric(grp['series'], errors='coerce')
+                            y = pd.to_numeric(grp['spy'], errors='coerce')
+                            idx = grp['date']
+
+                            sx = pd.Series(x.values, index=idx)
+                            sy = pd.Series(y.values, index=idx)
+
+                            for L in range(-max_lag, max_lag + 1):
+                                # corr(sx_t, sy_{t+L}); implement by shifting sy
+                                sy_shift = sy.shift(-L)
+                                df_xy = pd.concat({'x': sx, 'y': sy_shift}, axis=1).dropna()
+                                if df_xy.shape[0] < 5:
+                                    continue
+                                r = df_xy['x'].corr(df_xy['y'], method='spearman')
+                                if np.isfinite(r):
+                                    out_rows.append((*keys, metric_name, int(L), float(r)))
+
+                        if not out_rows:
+                            return
+
+                        dfout = pd.DataFrame.from_records(
+                            out_rows,
+                            columns=[id_col, 'signal', 'qrank', 'target', 'bet_size_col', 'stat_type', 'lag', 'corr']
+                        )
+                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                        with open(out_path + ".tmp", "wb") as _f:
+                            _p.dump(dfout, _f, protocol=_p.HIGHEST_PROTOCOL)
+                        os.replace(out_path + ".tmp", out_path)
+                        print(f"[summary_stats] Wrote per-id CCF: {out_path}  ({len(dfout)} rows)")
+
+                    # Corr dumps
                     _collapse_and_dump(recs_raw, dump_alpha_raw_corr_path, "alpha_raw_spy_corr")
                     _collapse_and_dump(recs_pnl, dump_alpha_pnl_corr_path, "alpha_pnl_spy_corr")
 
+                    # CCF dumps
+                    _collapse_and_dump_ccf(recs_raw, dump_alpha_raw_ccf_path, "alpha_raw_spy_ccf", ccf_max_lag)
+                    _collapse_and_dump_ccf(recs_pnl, dump_alpha_pnl_ccf_path, "alpha_pnl_spy_ccf", ccf_max_lag)
+
     except Exception as _e:
-        print(f"[WARN][summary_stats] per-id corr dump failed: {_e}")
+        print(f"[WARN][summary_stats] per-id corr/ccf dump failed: {_e}")
 
     return out
 

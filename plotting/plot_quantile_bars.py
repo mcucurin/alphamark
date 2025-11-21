@@ -1,14 +1,16 @@
 # plotting/plot_quantile_bars.py
 """
-Quantile Report PDF Generator (fixed H1 temporal coverage, restored distributions, compact outliers)
+Quantile Report PDF Generator (fixed H1 temporal coverage, restored distributions, compact outliers, CCF pages)
 
 What this module does (when called via generate_quantile_report(config)):
 - Loads precomputed DAILY stats (required) and SUMMARY stats (optional) from:
     <config['daily_dir']>/stats_YYYYMMDD.pkl
     <config['summary_dir']>/summary_stats_YYYYMMDD_YYYYMMDD.pkl
-- Optionally loads per-ticker correlation dumps produced by the runner (if configured):
+- Optionally loads per-ticker correlation / CCF dumps produced by the runner (if configured):
     <config['per_ticker_dir']>/per_ticker_alpha_raw_spy_corr_*.pkl
     <config['per_ticker_dir']>/per_ticker_alpha_pnl_spy_corr_*.pkl
+    <config['per_ticker_dir']>/per_ticker_alpha_raw_spy_ccf_*.pkl
+    <config['per_ticker_dir']>/per_ticker_alpha_pnl_spy_ccf_*.pkl
 - Optionally loads outlier PKLs from:
     <config['outliers_dir']>/outliers_*.pkl
 - Builds a multi-page PDF at: config['output_pdf']
@@ -23,7 +25,13 @@ Pages
 4) H3: per-quantile time-series correlation of summed daily PnL vectors (Spearman, all targets / bets).
    H3 temporal lines (rolling/expanding time corr). No legend — line end labels.
 5) Temporal pages per (target, signal, bet): cumulative P&L vs nrInstr; cumulative PPD vs Size Notional; daily n_trades.
-6) Distributions: histograms (RAW↔SPY corr, PNL↔SPY corr) with mean/median/std annotations (if files exist).
+6) Distributions / CCF:
+   - If CCF PKLs exist:
+       - CCF summary page (mean/median/std vs lag) for RAW & PnL.
+       - Histogram grids of CCF per lag (RAW vs SPY, PnL vs SPY).
+     (MAX_LAG = config['ccf_max_lag'], default 5; lags in [-MAX_LAG, …, +MAX_LAG].)
+   - Else:
+       - Histograms (RAW↔SPY corr, PNL↔SPY corr) with mean/median/std annotations (if files exist).
 7) Outlier tables (compact): top/bottom K for selected metrics (default: pnl, ppd, sizeNotional, nrInstr, n_trades).
 
 Expected DAILY/SUMMARY columns:
@@ -645,10 +653,12 @@ def _label_last_points(ax, series_map, cmap=None, fontsize=9):
         color = cmap(i % cmap.N)
         ax.plot(s.index, s.values, lw=1.8, alpha=0.95, color=color)
         v = s.values
-        finite_idx = np.where(np.isfinite(v))[0]
+        if np.isfinite(v).any():
+            all_vals = v[np.isfinite(v)]
+        finite_idx = np.where(np.isfinite(s.values))[0]
         if finite_idx.size:
             j = finite_idx[-1]
-            ax.text(s.index[j], v[j], f"  {name}", color=color, fontsize=fontsize, va='center')
+            ax.text(s.index[j], s.values[j], f"  {name}", color=color, fontsize=fontsize, va='center')
 
 
 # ---- Temporal plot helpers ----
@@ -972,6 +982,203 @@ def _distrib_page(pdf, df, title, bins=40):
     savefig_white(pdf, fig)
 
 
+# =====================================================
+# CCF helpers: per-ticker RAW/PnL vs SPY cross-corr
+# =====================================================
+def _load_latest_ccf_pkl(root: str, pattern: str):
+    """Return latest non-empty DataFrame for given CCF glob pattern or None."""
+    if root is None or not os.path.isdir(root):
+        return None
+    paths = sorted(glob.glob(os.path.join(root, pattern)))
+    if not paths:
+        return None
+    path = paths[-1]
+    try:
+        df = read_pickle_compat(path)
+    except Exception as e:
+        print(f"[WARN] Failed to read CCF PKL {path}: {e}")
+        return None
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        print(f"[WARN] CCF PKL {path} is empty or not a DataFrame.")
+        return None
+    print(f"[INFO] Loaded CCF PKL: {os.path.basename(path)}  shape={df.shape}")
+    return df
+
+
+def _ccf_prepare_df(df: pd.DataFrame, max_lag: int | None):
+    """Normalize CCF DF to have integer 'lag' and float 'corr', filter by [-max_lag, +max_lag]."""
+    if df is None or df.empty:
+        return None
+    df = df.copy()
+
+    if 'lag' not in df.columns:
+        print("[WARN] CCF DF missing 'lag' column; skipping.")
+        return None
+    if 'corr' not in df.columns:
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        if num_cols:
+            df = df.rename(columns={num_cols[0]: 'corr'})
+        else:
+            print("[WARN] CCF DF missing numeric correlation column; skipping.")
+            return None
+
+    df['lag'] = pd.to_numeric(df['lag'], errors='coerce')
+    df['corr'] = pd.to_numeric(df['corr'], errors='coerce')
+    df = df[np.isfinite(df['lag']) & np.isfinite(df['corr'])]
+    if df.empty:
+        return None
+
+    if max_lag is not None:
+        max_lag = int(max_lag)
+        df = df[(df['lag'] >= -max_lag) & (df['lag'] <= max_lag)]
+    if df.empty:
+        return None
+
+    df['lag'] = df['lag'].astype(int)
+    return df
+
+
+def _ccf_bar_summary_page(pdf, df_raw_ccf: pd.DataFrame | None,
+                          df_pnl_ccf: pd.DataFrame | None,
+                          max_lag: int = 5):
+    """CCF summary: mean/median/std vs lag for RAW and PnL."""
+    df_raw_ccf = _ccf_prepare_df(df_raw_ccf, max_lag)
+    df_pnl_ccf = _ccf_prepare_df(df_pnl_ccf, max_lag)
+
+    if df_raw_ccf is None and df_pnl_ccf is None:
+        return
+
+    n_panels = 1 if (df_raw_ccf is None or df_pnl_ccf is None) else 2
+    fig, axs = plt.subplots(1, n_panels, figsize=(14, 4.8))
+    axs = np.atleast_1d(axs)
+
+    def _plot_one(ax, df, title):
+        stats = (df.groupby('lag')['corr']
+                 .agg(['mean', 'median', 'std'])
+                 .sort_index())
+        if stats.empty:
+            ax.axis('off')
+            ax.set_title(title + " — no data", fontsize=11)
+            return
+        lags = stats.index.values
+        ax.errorbar(lags, stats['mean'].values, yerr=stats['std'].values,
+                    fmt='-o', linewidth=1.8, capsize=3, label='mean ± std')
+        ax.plot(lags, stats['median'].values,
+                linestyle=':', marker='x', linewidth=1.5, label='median')
+        ax.axhline(0.0, linestyle='--', linewidth=0.8, alpha=0.7)
+        ax.set_xlabel("Lag")
+        ax.set_ylabel("Correlation")
+        ax.set_xticks(lags)
+        ax.grid(True, linestyle=":", alpha=0.35, axis='y')
+        ax.set_title(title, fontsize=11)
+        ax.legend(loc='best', fontsize=8, frameon=True)
+
+    idx = 0
+    if df_raw_ccf is not None:
+        _plot_one(axs[idx], df_raw_ccf, "RAW alpha vs SPY — CCF summary")
+        idx += 1
+    if df_pnl_ccf is not None:
+        _plot_one(axs[idx], df_pnl_ccf, "PnL vs SPY — CCF summary")
+
+    fig.suptitle(
+        "Cross-correlation vs SPY (per-ticker; aggregated across stocks)",
+        fontsize=16, weight='bold', y=0.96
+    )
+    fig.tight_layout(rect=[0.03, 0.05, 0.97, 0.90])
+    savefig_white(pdf, fig)
+
+
+def _ccf_hist_pages(pdf, df_ccf: pd.DataFrame, title_prefix: str,
+                    max_lag: int = 5, bins: int = 40):
+    """Histogram grids over CCF distributions per lag, across stocks."""
+    df_ccf = _ccf_prepare_df(df_ccf, max_lag)
+    if df_ccf is None or df_ccf.empty:
+        fig, ax = plt.subplots(figsize=(14, 4)); ax.axis('off')
+        ax.set_title(title_prefix); ax.text(0.5, 0.5, "No CCF data", ha='center', va='center')
+        savefig_white(pdf, fig); return
+
+    lags = sorted(df_ccf['lag'].unique())
+    if not lags:
+        fig, ax = plt.subplots(figsize=(14, 4)); ax.axis('off')
+        ax.set_title(title_prefix); ax.text(0.5, 0.5, "No lag values", ha='center', va='center')
+        savefig_white(pdf, fig); return
+
+    rows, cols = 3, 4
+    per_page = rows * cols
+
+    for page_start in range(0, len(lags), per_page):
+        page_lags = lags[page_start:page_start + per_page]
+        fig, axs = plt.subplots(rows, cols, figsize=(14, 8.5))
+        axs = np.atleast_1d(axs).ravel()
+
+        for ax in axs:
+            ax.axis('off')
+
+        for ax, lag in zip(axs, page_lags):
+            sub = df_ccf[df_ccf['lag'] == lag]
+            x = pd.to_numeric(sub['corr'], errors='coerce')
+            x = x[np.isfinite(x)]
+            if x.empty:
+                continue
+            ax.hist(x.values, bins=bins, edgecolor='white', alpha=0.9)
+            m = float(np.nanmean(x)); med = float(np.nanmedian(x)); sd = float(np.nanstd(x))
+            n = int(x.size)
+            ax.axvline(m,   linestyle='-',  linewidth=1.2)
+            ax.axvline(med, linestyle=':',  linewidth=1.2)
+            ax.axvline(m + sd, linestyle='--', linewidth=0.9)
+            ax.axvline(m - sd, linestyle='--', linewidth=0.9)
+            ax.set_title(f"lag={lag}  n={n}\nμ={m:.3f}  med={med:.3f}  σ={sd:.3f}",
+                         fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.grid(True, linestyle=":", alpha=0.25, axis='y')
+
+        fig.suptitle(title_prefix, fontsize=16, weight='bold', y=0.98)
+        fig.tight_layout(rect=[0.03, 0.04, 0.97, 0.94])
+        savefig_white(pdf, fig)
+
+
+def append_ccf_pages(per_ticker_dir: str, pdf, max_lag: int = 5) -> bool:
+    """
+    Build CCF pages if per-ticker CCF PKLs exist.
+
+    Files:
+      per_ticker_alpha_raw_spy_ccf_*.pkl
+      per_ticker_alpha_pnl_spy_ccf_*.pkl
+
+    Returns True if any CCF page was generated, else False.
+    """
+    if per_ticker_dir is None or not os.path.isdir(per_ticker_dir):
+        return False
+
+    df_raw_ccf = _load_latest_ccf_pkl(
+        per_ticker_dir,
+        "per_ticker_alpha_raw_spy_ccf_*.pkl",
+    )
+    df_pnl_ccf = _load_latest_ccf_pkl(
+        per_ticker_dir,
+        "per_ticker_alpha_pnl_spy_ccf_*.pkl",
+    )
+
+    if df_raw_ccf is None and df_pnl_ccf is None:
+        print("[INFO] No CCF PKLs found; skipping CCF pages.")
+        return False
+
+    # Metric (1): spy corr bar/line summary using CCF (RAW & PnL)
+    _ccf_bar_summary_page(pdf, df_raw_ccf, df_pnl_ccf, max_lag=max_lag)
+
+    # Metrics (2) & (3): distributions of CCF across stocks per lag
+    if df_raw_ccf is not None:
+        _ccf_hist_pages(pdf, df_raw_ccf,
+                        "CCF distributions — RAW alpha vs SPY (per lag)",
+                        max_lag=max_lag)
+    if df_pnl_ccf is not None:
+        _ccf_hist_pages(pdf, df_pnl_ccf,
+                        "CCF distributions — PnL vs SPY (per lag)",
+                        max_lag=max_lag)
+
+    return True
+
+
 def generate_quantile_report(config: dict):
     """
     Entry point used by main.py.
@@ -1016,6 +1223,9 @@ def generate_quantile_report(config: dict):
     style_first      = config.get("style_first", "-")
     style_second     = config.get("style_second", ":")
     quantile_colors_cfg = dict(config.get("quantile_colors", {}))
+
+    ccf_enable       = bool(config.get("ccf_enable", True))
+    ccf_max_lag      = int(config.get("ccf_max_lag", 5))
 
     # Load data
     stats_daily, stats_summary, interval_min, interval_max, interval_ndays = _load_data(daily_dir, summary_dir)
@@ -1144,45 +1354,98 @@ def generate_quantile_report(config: dict):
                         data = data.sort_values('date')
 
                     if data['qrank'].notna().any():
+                        # ---- Per-quantile grouped bars ----
                         keys = ['x_key', 'qrank']
                         data_dedup = data.drop_duplicates(subset=keys, keep='last')
+
                         try:
-                            pivot = data_dedup.pivot(index='x_key', columns='qrank', values='value')
+                            pivot = data_dedup.pivot(
+                                index='x_key',
+                                columns='qrank',
+                                values='value',
+                            )
                         except ValueError:
-                            data_dedup = (data_dedup.groupby(keys, as_index=False).first())
-                            pivot = data_dedup.pivot(index='x_key', columns='qrank', values='value')
+                            # If there are multiple rows per (x_key, qrank), aggregate first
+                            data_dedup = (
+                                data_dedup.groupby(keys, as_index=False)['value'].mean()
+                            )
+                            pivot = data_dedup.pivot(
+                                index='x_key',
+                                columns='qrank',
+                                values='value',
+                            )
 
                         use_q = [q for q in qranks if q in pivot.columns]
                         x = np.arange(len(x_levels))
                         plotted = False
-                        if use_q:
-                            q_offsets = np.arange(-(len(use_q) - 1) / 2, (len(use_q) + 1) / 2) * bar_width
-                            for j, q in enumerate(use_q):
-                                vals = pd.to_numeric(pivot.get(q), errors='coerce').reindex(x_levels).astype(float)
-                                if vals.notna().any():
-                                    ax.bar(x + q_offsets[j],
-                                           vals.fillna(0.0).values,
-                                           width=bar_width,
-                                           color=quantile_colors.get(q, 'gray'),
-                                           label=q)
-                                    plotted = True
-                        if plotted:
-                            ax.legend(title='Quantile (color)', bbox_to_anchor=(1.02, 0.98),
-                                      loc='upper left', fontsize=9, frameon=True)
-                    else:
-                        data_dedup = data.drop_duplicates(subset=['x_key'], keep='last')
-                        vals = (data_dedup.set_index('x_key')['value']
-                                .reindex(x_levels).fillna(0.0).values)
-                        ax.bar(np.arange(len(x_levels)), vals, width=bar_width, color='gray')
 
+                        if use_q:
+                            # Center the bars around each x position
+                            q_offsets = (
+                                np.arange(-(len(use_q) - 1) / 2, (len(use_q) + 1) / 2)
+                                * bar_width
+                            )
+                            for j, q in enumerate(use_q):
+                                vals = (
+                                    pd.to_numeric(pivot.get(q), errors='coerce')
+                                    .reindex(x_levels)
+                                    .astype(float)
+                                )
+                                if vals.notna().any():
+                                    ax.bar(
+                                        x + q_offsets[j],
+                                        vals.fillna(0.0).values,
+                                        width=bar_width,
+                                        color=quantile_colors.get(q, 'gray'),
+                                        label=q,
+                                    )
+                                    plotted = True
+
+                        if plotted:
+                            ax.legend(
+                                title='Quantile (color)',
+                                bbox_to_anchor=(1.02, 0.98),
+                                loc='upper left',
+                                fontsize=9,
+                                frameon=True,
+                            )
+                    else:
+                        # ---- Single bar per x_key (no quantiles) ----
+                        data_dedup = data.drop_duplicates(subset=['x_key'], keep='last')
+                        vals = (
+                            data_dedup.set_index('x_key')['value']
+                            .reindex(x_levels)
+                            .fillna(0.0)
+                            .values
+                        )
+                        ax.bar(
+                            np.arange(len(x_levels)),
+                            vals,
+                            width=bar_width,
+                            color='gray',
+                        )
+
+                    # Reference line for ratios
                     if metric in ('long_ratio', 'hit_ratio'):
                         ymin, ymax = ax.get_ylim()
                         if ymin <= 0.5 <= ymax:
-                            ax.axhline(y=0.5, color='red', linestyle=':', linewidth=1.5, alpha=0.7, zorder=0)
+                            ax.axhline(
+                                y=0.5,
+                                color='red',
+                                linestyle=':',
+                                linewidth=1.5,
+                                alpha=0.7,
+                                zorder=0,
+                            )
 
                     ax.set_ylabel(f"{metric}{unit_suffix}")
                     ax.set_xticks(np.arange(len(x_levels)))
-                    ax.set_xticklabels([str(v) for v in x_levels], rotation=45, ha='right', fontsize=11)
+                    ax.set_xticklabels(
+                        [str(v) for v in x_levels],
+                        rotation=45,
+                        ha='right',
+                        fontsize=11,
+                    )
                     ax.grid(axis='y', linestyle=':', alpha=0.35)
 
                 plt.tight_layout(rect=[0.02, 0.04, 0.98, BAR_AX_TOP])
@@ -1192,23 +1455,55 @@ def generate_quantile_report(config: dict):
         stats_daily_nonall = _exclude_all_rows(stats_daily)
         if len(alphas) >= 2:
             H1, labels1, n_days1 = compute_heatmap_daily_avg(
-                stats_daily_nonall, alphas, stat_type=h1_base_stat,
-                min_pairs=2, qfilter=None, targets=None, bets=None
+                stats_daily_nonall,
+                alphas,
+                stat_type=h1_base_stat,
+                min_pairs=2,
+                qfilter=None,
+                targets=None,
+                bets=None,
             )
             k1 = len(labels1) if labels1 else 0
             fig, ax, cax = _centered_heatmap_axes(k1)
-            base_desc = ("Alpha Cross-Section Corr (Spearman)"
-                         if h1_base_stat in ('alpha_sum', 'alpha_strength')
-                         else f"Cross-Section Corr (Spearman, {h1_base_stat})")
+            base_desc = (
+                "Alpha Cross-Section Corr (Spearman)"
+                if h1_base_stat in ("alpha_sum", "alpha_strength")
+                else f"Cross-Section Corr (Spearman, {h1_base_stat})"
+            )
+
             if H1 is None or n_days1 == 0:
-                ax.axis('off')
-                _set_title_fit(fig, ax, f"Heatmap 1 — {base_desc}", base_size=13, pad=8, loc='center')
-                ax.text(0.5, 0.5, "No sufficient daily cross-sections.", ha='center', va='center')
-                if cax is not None: cax.axis('off')
+                ax.axis("off")
+                _set_title_fit(
+                    fig,
+                    ax,
+                    f"Heatmap 1 — {base_desc}",
+                    base_size=13,
+                    pad=8,
+                    loc="center",
+                )
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No sufficient daily cross-sections.",
+                    ha="center",
+                    va="center",
+                )
+                if cax is not None:
+                    cax.axis("off")
             else:
-                _plot_matrix_heatmap(fig, ax, cax, H1, labels1,
-                                     f"Heatmap 1 — {base_desc} (avg over {n_days1} days)",
-                                     vmin=-1, vmax=1, annotate_lower=True, fmt=".2f")
+                _plot_matrix_heatmap(
+                    fig,
+                    ax,
+                    cax,
+                    H1,
+                    labels1,
+                    f"Heatmap 1 — {base_desc} (avg over {n_days1} days)",
+                    vmin=-1,
+                    vmax=1,
+                    annotate_lower=True,
+                    fmt=".2f",
+                )
+
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
             savefig_white(pdf, fig)
 
@@ -1231,38 +1526,61 @@ def generate_quantile_report(config: dict):
         stats_daily_plot_nonall = stats_daily_nonall
 
         for q in qranks:
-            q_masked_df = stats_daily_plot_nonall[stats_daily_plot_nonall['qrank'] == q].copy()
+            q_masked_df = stats_daily_plot_nonall[
+                stats_daily_plot_nonall["qrank"] == q
+            ].copy()
 
             # Heatmap 2 — cross-section corr of P&L, across all targets/bets
             H2, labels2, n_days2 = compute_heatmap_daily_avg(
-                q_masked_df, alphas, stat_type='pnl', min_pairs=2,
+                q_masked_df,
+                alphas,
+                stat_type="pnl",
+                min_pairs=2,
                 qfilter=[q] if q else None,
                 targets=None,
-                bets=None
+                bets=None,
             )
             k2 = len(labels2) if labels2 else 0
             fig, ax, cax = _centered_heatmap_axes(k2)
             tdesc2 = "targets=ALL"
             bdesc2 = "bets=ALL"
+
             if H2 is None or n_days2 == 0:
-                ax.axis('off')
+                ax.axis("off")
                 _set_title_fit(
-                    fig, ax,
-                    f"Heatmap 2 — Cross-section corr of daily PnLs (Spearman) [{q}] [{tdesc2} | {bdesc2}]",
-                    base_size=13, pad=8, loc='center'
+                    fig,
+                    ax,
+                    f"Heatmap 2 — Cross-section corr of daily PnLs (Spearman) "
+                    f"[{q}] [{tdesc2} | {bdesc2}]",
+                    base_size=13,
+                    pad=8,
+                    loc="center",
                 )
-                ax.text(0.5, 0.5,
-                        "No sufficient daily cross-sections for 'pnl'.\n"
-                        "Tip: ensure ≥2 rows/day across (signal, target, bet).",
-                        ha='center', va='center')
-                if cax is not None: cax.axis('off')
+                ax.text(
+                    0.5,
+                    0.5,
+                    "No sufficient daily cross-sections for 'pnl'.\n"
+                    "Tip: ensure ≥2 rows/day across (signal, target, bet).",
+                    ha="center",
+                    va="center",
+                )
+                if cax is not None:
+                    cax.axis("off")
             else:
                 _plot_matrix_heatmap(
-                    fig, ax, cax, H2, labels2,
+                    fig,
+                    ax,
+                    cax,
+                    H2,
+                    labels2,
                     f"Heatmap 2 — Cross-section corr of daily PnLs (Spearman) "
                     f"[{q}] [{tdesc2} | {bdesc2}] (avg over {n_days2} days)",
-                    vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
+                    vmin=-1,
+                    vmax=1,
+                    annotate_lower=True,
+                    fmt=".2f",
                 )
+
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
             savefig_white(pdf, fig)
 
@@ -1272,7 +1590,7 @@ def generate_quantile_report(config: dict):
                     pdf,
                     q_masked_df,
                     alphas,
-                    stat_type='pnl',
+                    stat_type="pnl",
                     title_prefix=f"[H2 | {q}] PnL vs PnL",
                     smooth_window=roll_h2_lines,
                     height=6.0,
@@ -1283,30 +1601,56 @@ def generate_quantile_report(config: dict):
 
             # Heatmap 3 — time-series corr of summed daily P&L vectors, all targets/bets
             C3, labels3, n_days3 = compute_timeseries_heatmap(
-                q_masked_df, alphas, stat_type='pnl', min_days=5, agg='sum',
-                qfilter=[q], targets=None, bets=None
+                q_masked_df,
+                alphas,
+                stat_type="pnl",
+                min_days=5,
+                agg="sum",
+                qfilter=[q],
+                targets=None,
+                bets=None,
             )
             k3 = len(labels3) if labels3 else 0
             fig, ax, cax = _centered_heatmap_axes(k3)
             tdesc3 = "targets=ALL"
             bdesc3 = "bets=ALL"
+
             if C3 is None or n_days3 < 5:
-                ax.axis('off')
+                ax.axis("off")
                 _set_title_fit(
-                    fig, ax,
-                    f"Heatmap 3 — Time-series corr of summed daily P&L (Spearman) [{q}] [{tdesc3} | {bdesc3}]",
-                    base_size=13, pad=8, loc='center'
+                    fig,
+                    ax,
+                    f"Heatmap 3 — Time-series corr of summed daily P&L (Spearman) "
+                    f"[{q}] [{tdesc3} | {bdesc3}]",
+                    base_size=13,
+                    pad=8,
+                    loc="center",
                 )
-                ax.text(0.5, 0.5, "Not enough days (need ≥5) for time-series correlations.",
-                        ha='center', va='center')
-                if cax is not None: cax.axis('off')
+                ax.text(
+                    0.5,
+                    0.5,
+                    "Not enough days (need ≥5) for time-series correlations.",
+                    ha="center",
+                    va="center",
+                )
+                if cax is not None:
+                    cax.axis("off")
             else:
                 _plot_matrix_heatmap(
-                    fig, ax, cax, C3, labels3,
-                    f"Heatmap 3 — corr of daily P&L vectors (sum across day, Spearman) "
+                    fig,
+                    ax,
+                    cax,
+                    C3,
+                    labels3,
+                    f"Heatmap 3 — corr of daily P&L vectors "
+                    f"(sum across day, Spearman) "
                     f"[{q}] [{tdesc3} | {bdesc3}] (days={n_days3})",
-                    vmin=-1, vmax=1, annotate_lower=True, fmt=".2f"
+                    vmin=-1,
+                    vmax=1,
+                    annotate_lower=True,
+                    fmt=".2f",
                 )
+
             fig.tight_layout(rect=[0.02, 0.06, 0.98, HEATMAP_AX_TOP])
             savefig_white(pdf, fig)
 
@@ -1316,234 +1660,325 @@ def generate_quantile_report(config: dict):
                     pdf,
                     q_masked_df,
                     alphas,
-                    stat_type='pnl',
+                    stat_type="pnl",
                     title_prefix=f"[H3 | {q}] Alpha vs Alpha — Time corr (P&L vectors)",
                     window=roll_h3_lines,
                     height=6.0,
                     qfilter=[q],
                     targets=None,
                     bets=None,
-                    agg='sum',
+                    agg="sum",
                 )
 
         # ---------- Temporal pages per (target, signal, bet) ----------
         stats_daily_plot_local = stats_daily_plot_nonall
-        for target in sorted(stats_daily_plot_local['target'].dropna().unique()):
-            for signal in sorted(stats_daily_plot_local['signal'].dropna().unique()):
-                for bet_strategy in sorted(stats_daily_plot_local['bet_size_col'].dropna().unique()):
+
+        for target in sorted(stats_daily_plot_local["target"].dropna().unique()):
+            for signal in sorted(stats_daily_plot_local["signal"].dropna().unique()):
+                for bet_strategy in sorted(
+                    stats_daily_plot_local["bet_size_col"].dropna().unique()
+                ):
                     mask_base = (
-                        (stats_daily_plot_local['target'] == target) &
-                        (stats_daily_plot_local['signal'] == signal) &
-                        (stats_daily_plot_local['bet_size_col'] == bet_strategy)
+                        (stats_daily_plot_local["target"] == target)
+                        & (stats_daily_plot_local["signal"] == signal)
+                        & (stats_daily_plot_local["bet_size_col"] == bet_strategy)
                     )
                     sub_all = stats_daily_plot_local[mask_base].copy()
                     if sub_all.empty:
                         continue
 
-                    # ---- PnL (cum) vs nrInstr (daily)
-                    left_title  = _title_token("P&L", roll_pnl, cumulative=True)
-                    right_title = _title_token("nrInstr", roll_nrinstr, cumulative=False)
+                    # ---- (1) PnL (cum) vs nrInstr ----
+                    left_title = _title_token("P&L", roll_pnl, cumulative=True)
+                    right_title = _title_token(
+                        "nrInstr", roll_nrinstr, cumulative=False
+                    )
 
                     fig, ax = plt.subplots(figsize=(14, 6.0))
-                    right_ax = ax.twinx(); right_ax.grid(False)
+                    right_ax = ax.twinx()
+                    right_ax.grid(False)
+
                     fig.suptitle(
                         f"{target} | {signal} | {bet_strategy}\n"
                         f"{left_title} (left, solid) vs {right_title} (right, dotted)",
-                        fontsize=16, weight='bold', y=0.96
+                        fontsize=16,
+                        weight="bold",
+                        y=0.96,
                     )
 
                     anyL = anyR = False
                     for q in qranks:
-                        sq = sub_all[sub_all['qrank'] == q]
-                        if sq.empty: continue
-                        color = quantile_colors.get(q, 'gray')
+                        sq = sub_all[sub_all["qrank"] == q]
+                        if sq.empty:
+                            continue
+                        color = quantile_colors.get(q, "gray")
 
-                        pnl  = _series(sq, 'pnl')
-                        nrin = _series(sq, 'nrInstr')
+                        pnl = _series(sq, "pnl")
+                        nrin = _series(sq, "nrInstr")
 
                         if not pnl.empty:
                             cum_pnl = pnl.cumsum()
                             yL = _roll_mean(cum_pnl, roll_pnl)
-                            ax.plot(yL.index, yL.values, color=color,
-                                    linestyle=style_first, linewidth=1.8)
+                            ax.plot(
+                                yL.index,
+                                yL.values,
+                                color=color,
+                                linestyle=style_first,
+                                linewidth=1.8,
+                            )
                             anyL = True
 
                         if not nrin.empty:
                             yR = _roll_mean(nrin, roll_nrinstr)
-                            right_ax.plot(yR.index, yR.values, color=color,
-                                          linestyle=style_second, linewidth=1.8)
+                            right_ax.plot(
+                                yR.index,
+                                yR.values,
+                                color=color,
+                                linestyle=style_second,
+                                linewidth=1.8,
+                            )
                             anyR = True
 
                     if anyL:
                         ax.set_ylabel(left_title)
                     if anyR:
                         right_ax.set_ylabel(right_title)
+
                     _plot_date_axis(ax)
 
                     handles_styles = [
-                        Line2D([0], [0], color='gray', lw=2, linestyle=style_first,
-                               label=f"{left_title} (left)"),
-                        Line2D([0], [0], color='gray', lw=2, linestyle=style_second,
-                               label=f"{right_title} (right)")
+                        Line2D(
+                            [0],
+                            [0],
+                            color="black",
+                            linestyle=style_first,
+                            label=left_title,
+                        ),
+                        Line2D(
+                            [0],
+                            [0],
+                            color="black",
+                            linestyle=style_second,
+                            label=right_title,
+                        ),
                     ]
-                    leg_styles = ax.legend(handles=handles_styles, loc='upper left',
-                                           fontsize=9, frameon=True, bbox_to_anchor=(0, 0.98))
-                    ax.add_artist(leg_styles)
-                    if qranks:
-                        handles_q = [
-                            Line2D([0], [0],
-                                   color=quantile_colors.get(str(q), 'gray'),
-                                   lw=2, label=str(q))
-                            for q in qranks
-                        ]
-                        ax.legend(handles=handles_q, title="Quantiles",
-                                  loc="upper right", fontsize=9, frameon=True,
-                                  bbox_to_anchor=(1, 0.98))
-                    plt.tight_layout(rect=[0, 0.03, 1, 0.90])
+                    ax.legend(
+                        handles=handles_styles,
+                        loc="upper left",
+                        fontsize=9,
+                        frameon=True,
+                    )
+
+                    fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
                     savefig_white(pdf, fig)
 
-                    # ---- PPD (cum) vs Size Notional (daily)
-                    left_title_base  = _title_token("PPD", roll_ppd, cumulative=True)
-                    right_title_base = _title_token("Size Notional", roll_size_notnl, cumulative=False)
-                    left_title_ppd   = f"{left_title_base} (bpts)"
-                    right_title_sz   = f"{right_title_base} ($M)"
+                    # ---- (2) PPD (cum) vs Size Notional ----
+                    left_title2 = _title_token("PPD", roll_ppd, cumulative=True)
+                    right_title2 = _title_token(
+                        "Size Notional", roll_size_notnl, cumulative=False
+                    )
 
                     fig, ax = plt.subplots(figsize=(14, 6.0))
                     right_ax = ax.twinx()
                     right_ax.grid(False)
+
                     fig.suptitle(
                         f"{target} | {signal} | {bet_strategy}\n"
-                        f"{left_title_ppd} (left, solid) vs {right_title_sz} (right, dotted)",
-                        fontsize=16, weight='bold', y=0.96
+                        f"{left_title2} (left, solid) vs {right_title2} (right, dotted)",
+                        fontsize=16,
+                        weight="bold",
+                        y=0.96,
                     )
 
                     anyL = anyR = False
                     for q in qranks:
-                        sq = sub_all[sub_all['qrank'] == q]
+                        sq = sub_all[sub_all["qrank"] == q]
                         if sq.empty:
                             continue
-                        color = quantile_colors.get(q, 'gray')
+                        color = quantile_colors.get(q, "gray")
 
-                        pnl   = _series(sq, 'pnl')
-                        notnl = _series(sq, 'sizeNotional')
+                        ppd = _series(sq, "ppd")
+                        sizeN = _series(sq, "sizeNotional")
 
-                        if not pnl.empty and not notnl.empty:
-                            merged = pd.DataFrame({'pnl': pnl, 'notional': notnl}).fillna(0.0)
-                            cum_pnl = merged['pnl'].cumsum()
-                            cum_notnl = merged['notional'].cumsum()
-                            cum_ppd = pd.Series(
-                                np.where(cum_notnl > 0, cum_pnl / cum_notnl, np.nan),
-                                index=cum_pnl.index
-                            ).ffill()
-                            cum_ppd_bpts = cum_ppd * 10000
-                            yL = _roll_mean(cum_ppd_bpts, roll_ppd)
-                            ax.plot(yL.index, yL.values, color=color,
-                                    linestyle=style_first, linewidth=1.8, alpha=0.9)
+                        if not ppd.empty:
+                            cum_ppd = ppd.cumsum()
+                            yL = _roll_mean(cum_ppd, roll_ppd)
+                            ax.plot(
+                                yL.index,
+                                yL.values,
+                                color=color,
+                                linestyle=style_first,
+                                linewidth=1.8,
+                            )
                             anyL = True
 
-                        if not notnl.empty:
-                            notnl_millions = notnl / 1e6
-                            yR = _roll_mean(notnl_millions, roll_size_notnl)
-                            right_ax.plot(yR.index, yR.values, color=color,
-                                          linestyle=style_second, linewidth=1.8, alpha=0.9)
+                        if not sizeN.empty:
+                            yR = _roll_mean(sizeN, roll_size_notnl)
+                            right_ax.plot(
+                                yR.index,
+                                yR.values,
+                                color=color,
+                                linestyle=style_second,
+                                linewidth=1.8,
+                            )
                             anyR = True
 
                     if anyL:
-                        ax.set_ylabel(left_title_ppd)
+                        ax.set_ylabel(left_title2)
                     if anyR:
-                        right_ax.set_ylabel(right_title_sz)
+                        right_ax.set_ylabel(right_title2)
+
                     _plot_date_axis(ax)
 
-                    handles_styles = [
-                        Line2D([0], [0], color='gray', lw=2, linestyle=style_first,
-                               label=f"{left_title_ppd} (left)"),
-                        Line2D([0], [0], color='gray', lw=2, linestyle=style_second,
-                               label=f"{right_title_sz} (right)")
+                    handles_styles2 = [
+                        Line2D(
+                            [0],
+                            [0],
+                            color="black",
+                            linestyle=style_first,
+                            label=left_title2,
+                        ),
+                        Line2D(
+                            [0],
+                            [0],
+                            color="black",
+                            linestyle=style_second,
+                            label=right_title2,
+                        ),
                     ]
-                    leg_styles = ax.legend(handles=handles_styles, loc='upper left',
-                                           fontsize=9, frameon=True, bbox_to_anchor=(0, 0.98))
-                    ax.add_artist(leg_styles)
-                    if qranks:
-                        handles_q = [
-                            Line2D([0], [0],
-                                   color=quantile_colors.get(str(q), 'gray'),
-                                   lw=2, label=str(q))
-                            for q in qranks
-                        ]
-                        ax.legend(handles=handles_q, title="Quantiles",
-                                  loc="upper right", fontsize=9, frameon=True,
-                                  bbox_to_anchor=(1, 0.98))
-                    plt.tight_layout(rect=[0, 0.03, 1, 0.90])
+                    ax.legend(
+                        handles=handles_styles2,
+                        loc="upper left",
+                        fontsize=9,
+                        frameon=True,
+                    )
+
+                    fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
                     savefig_white(pdf, fig)
 
-                    # ---- Number of Trades (daily)
-                    title_trades = _title_token("Trades", roll_trades, cumulative=False)
-                    fig, ax = plt.subplots(figsize=(14, 5.5))
+                    # ---- (3) Daily number of trades ----
+                    fig, ax = plt.subplots(figsize=(14, 5.0))
                     fig.suptitle(
-                        f"{target} | {signal} | {bet_strategy}\n{title_trades}",
-                        fontsize=16, weight='bold', y=0.96
+                        f"{target} | {signal} | {bet_strategy}\nDaily n_trades (smoothed)",
+                        fontsize=16,
+                        weight="bold",
+                        y=0.96,
                     )
-                    anyPlot = False
+
+                    any_trades = False
                     for q in qranks:
-                        sq = sub_all[sub_all['qrank'] == q]
+                        sq = sub_all[sub_all["qrank"] == q]
                         if sq.empty:
                             continue
-                        color = quantile_colors.get(q, 'gray')
-                        trades = _series(sq, 'n_trades')
+                        color = quantile_colors.get(q, "gray")
+                        trades = _series(sq, "n_trades")
                         if trades.empty:
                             continue
                         y = _roll_mean(trades, roll_trades)
-                        ax.plot(y.index, y.values, color=color,
-                                linestyle=style_first, linewidth=1.8)
-                        anyPlot = True
-                    if anyPlot:
-                        ax.set_ylabel(title_trades)
+                        ax.plot(
+                            y.index,
+                            y.values,
+                            color=color,
+                            linestyle="-",
+                            linewidth=1.5,
+                            label=str(q),
+                        )
+                        any_trades = True
+
+                    if any_trades:
+                        ax.set_ylabel("n_trades (smoothed)")
+                        ax.legend(
+                            title="Quantile",
+                            fontsize=9,
+                            frameon=True,
+                            loc="upper left",
+                        )
                     _plot_date_axis(ax)
-                    if qranks:
-                        handles_q = [
-                            Line2D([0], [0],
-                                   color=quantile_colors.get(str(q), 'gray'),
-                                   lw=2, label=str(q))
-                            for q in qranks
-                        ]
-                        ax.legend(handles=handles_q, title="Quantiles",
-                                  loc="upper right", fontsize=9, frameon=True,
-                                  bbox_to_anchor=(1, 0.98))
-                    plt.tight_layout(rect=[0, 0.03, 1, 0.90])
+
+                    fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
                     savefig_white(pdf, fig)
 
-        # ---------- Distributions: per-ticker correlations (if available) ----------
-        raw_pkls = sorted(glob.glob(os.path.join(per_ticker_dir, "per_ticker_alpha_raw_spy_corr_*.pkl")))
-        pnl_pkls = sorted(glob.glob(os.path.join(per_ticker_dir, "per_ticker_alpha_pnl_spy_corr_*.pkl")))
+        # ---------- CCF / correlation distribution pages ----------
+        ccf_done = False
+        if ccf_enable:
+            ccf_done = append_ccf_pages(
+                per_ticker_dir,
+                pdf,
+                max_lag=ccf_max_lag,
+            )
 
-        if raw_pkls:
-            try:
-                df_raw = read_pickle_compat(raw_pkls[-1])
-            except Exception:
-                df_raw = None
-            _distrib_page(pdf, df_raw, "Distribution — Alpha RAW ↔ SPY correlation (per ticker)")
+        if (not ccf_done) and per_ticker_dir and os.path.isdir(per_ticker_dir):
+            # Fallback: distributions of simple SPY correlations if available
+            raw_corr_paths = sorted(
+                glob.glob(
+                    os.path.join(
+                        per_ticker_dir, "per_ticker_alpha_raw_spy_corr_*.pkl"
+                    )
+                )
+            )
+            pnl_corr_paths = sorted(
+                glob.glob(
+                    os.path.join(
+                        per_ticker_dir, "per_ticker_alpha_pnl_spy_corr_*.pkl"
+                    )
+                )
+            )
 
-        if pnl_pkls:
-            try:
-                df_pnl = read_pickle_compat(pnl_pkls[-1])
-            except Exception:
-                df_pnl = None
-            _distrib_page(pdf, df_pnl, "Distribution — Alpha PnL ↔ SPY correlation (per ticker)")
+            if raw_corr_paths:
+                try:
+                    df_raw = read_pickle_compat(raw_corr_paths[-1])
+                    _distrib_page(
+                        pdf,
+                        df_raw,
+                        "Per-ticker correlation: RAW alpha vs SPY",
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to append RAW corr distrib page: {e}")
+            if pnl_corr_paths:
+                try:
+                    df_pnl = read_pickle_compat(pnl_corr_paths[-1])
+                    _distrib_page(
+                        pdf,
+                        df_pnl,
+                        "Per-ticker correlation: PnL vs SPY",
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to append PnL corr distrib page: {e}")
 
-        # ---------- Outlier tables (compact) ----------
-        latest_outliers = _find_latest_outliers_pkl(outliers_dir)
-        append_outlier_pages(
-            latest_outliers,
-            pdf,
-            metrics=outlier_metrics_for_tables,
-            top_k=outlier_top_k,
-            tables_per_page=outlier_tables_per_page,
+        # ---------- Outlier tables ----------
+        outliers_pkl = _find_latest_outliers_pkl(outliers_dir)
+        if outliers_pkl is not None:
+            append_outlier_pages(
+                outliers_pkl,
+                pdf,
+                metrics=outlier_metrics_for_tables,
+                top_k=outlier_top_k,
+                tables_per_page=outlier_tables_per_page,
+            )
+        else:
+            fig, ax = plt.subplots(figsize=(14, 4))
+            ax.axis("off")
+            fig.suptitle(
+                "Outlier Tables",
+                fontsize=18,
+                weight="bold",
+                y=0.985,
+            )
+            ax.text(
+                0.5,
+                0.5,
+                "No outlier PKL found; skipping tables.",
+                ha="center",
+                va="center",
+                fontsize=12,
+            )
+            savefig_white(pdf, fig)
+
+        # ---------- Done ----------
+        t1 = time.perf_counter()
+        print(
+            f"[INFO] Quantile report PDF written to: {output_pdf}"
+        )
+        print(
+            f"[INFO] Total plotting time: {t1 - t0:.2f} seconds"
         )
 
-    t1 = time.perf_counter()
-    print("✅ Saved quantile report to", output_pdf)
-    print(f"Time taken (plotting only): {t1 - t0:.3f} seconds")
-
-
-if __name__ == "__main__":
-    raise SystemExit("This module is intended to be called via generate_quantile_report(config) from main.py.")

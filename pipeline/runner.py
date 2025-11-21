@@ -113,6 +113,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
      signal_regex, target_regex, bet_regex, spy_ticker, spy_col_base, spy_single_name,
      quantiles, type_quantile, do_daily, do_summary, do_outliers, add_spearman, add_dcor,
      spearman_sample_cap_per_key, dump_alpha_raw_per_id, dump_alpha_pnl_per_id,
+     ccf_enable, ccf_max_lag, dump_alpha_raw_ccf_per_id, dump_alpha_pnl_ccf_per_id,
      outlier_metrics, outlier_z_thresh, empty_day_policy,
      report_empty_trades_as_nan, n_jobs_io, n_jobs_daily, n_jobs_summary, random_state,
      interval_start, interval_end) = (
@@ -124,6 +125,8 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         local_cfg["do_daily"], local_cfg["do_summary"], local_cfg["do_outliers"],
         local_cfg["add_spearman"], local_cfg["add_dcor"], local_cfg["spearman_sample_cap_per_key"],
         local_cfg["dump_alpha_raw_per_id"], local_cfg["dump_alpha_pnl_per_id"],
+        local_cfg["ccf_enable"], local_cfg["ccf_max_lag"],
+        local_cfg["dump_alpha_raw_ccf_per_id"], local_cfg["dump_alpha_pnl_ccf_per_id"],
         local_cfg["outlier_metrics"], local_cfg["outlier_z_thresh"], local_cfg["empty_day_policy"],
         local_cfg["report_empty_trades_as_nan"], local_cfg["n_jobs_io"], local_cfg["n_jobs_daily"],
         local_cfg["n_jobs_summary"], local_cfg["random_state"],
@@ -357,13 +360,37 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
             last_day = pd.to_datetime(all_days.max())
 
             # Prepare optional per-ticker dump paths (only if we actually have spy map)
+
+            # (1) Per-id corr dumps (already existed)
             dump_raw = (
-                os.path.join(PER_TICKER_DIR, f"per_ticker_alpha_raw_spy_corr_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl")
+                os.path.join(
+                    PER_TICKER_DIR,
+                    f"per_ticker_alpha_raw_spy_corr_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
+                )
                 if (spy_by_target_effective and dump_alpha_raw_per_id) else None
             )
             dump_pnl = (
-                os.path.join(PER_TICKER_DIR, f"per_ticker_alpha_pnl_spy_corr_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl")
+                os.path.join(
+                    PER_TICKER_DIR,
+                    f"per_ticker_alpha_pnl_spy_corr_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
+                )
                 if (spy_by_target_effective and dump_alpha_pnl_per_id) else None
+            )
+
+            # (2) NEW: per-id CCF dumps
+            dump_raw_ccf = (
+                os.path.join(
+                    PER_TICKER_DIR,
+                    f"per_ticker_alpha_raw_spy_ccf_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
+                )
+                if (spy_by_target_effective and ccf_enable and dump_alpha_raw_ccf_per_id) else None
+            )
+            dump_pnl_ccf = (
+                os.path.join(
+                    PER_TICKER_DIR,
+                    f"per_ticker_alpha_pnl_spy_ccf_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
+                )
+                if (spy_by_target_effective and ccf_enable and dump_alpha_pnl_ccf_per_id) else None
             )
 
             summary = compute_summary_stats_over_days(
@@ -384,6 +411,10 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                 id_col="ticker",
                 dump_alpha_raw_corr_path=dump_raw,
                 dump_alpha_pnl_corr_path=dump_pnl,
+                # NEW: per-ID CCF dumps
+                dump_alpha_raw_ccf_path=dump_raw_ccf,
+                dump_alpha_pnl_ccf_path=dump_pnl_ccf,
+                ccf_max_lag=ccf_max_lag if ccf_enable else 0,
             )
 
             # flatten summary -> rows; tag with date range
