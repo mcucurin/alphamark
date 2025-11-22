@@ -106,7 +106,7 @@ DEFAULT_RUNNER_CONFIG = {
 
     # -------- Interval filter (inclusive) --------
     # Accepts many formats: "2021-01-01", "01/01/2021", "20210101"
-    "interval_start": "2021-11-01",
+    "interval_start": "2021-01-01",
     "interval_end": None,
 }
 
