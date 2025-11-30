@@ -531,7 +531,15 @@ def _compute_summary_stats_core(
             else:
                 r = np.nan
             s, ql, t, b = key
-            out['spy_corr'][s][ql][t][b] = r
+            out['market_corr'][s][ql][t][b] = r
+            out['spy_corr'][s][ql][t][b] = r  # backward compatibility
+        # Guarantee entries exist for every observed (s, q, t, b), even if the SPY
+        # horizon was missing on some days (so bars don't drop those targets).
+        for key in all_keys:
+            s, ql, t, b = key
+            if b not in out['market_corr'][s][ql].get(t, {}):
+                out['market_corr'][s][ql][t][b] = np.nan
+                out['spy_corr'][s][ql][t][b] = np.nan
 
     # --------- NEW: finalize and dump per-ticker PKLs ---------
     if have_id and effective_spy_map:

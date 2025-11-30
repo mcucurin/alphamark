@@ -481,7 +481,15 @@ def _compute_summary_stats_core(
             else:
                 r = np.nan
             s, ql, t, b = key
-            out_nested['spy_corr'][s][ql][t][b] = r
+            out_nested['market_corr'][s][ql][t][b] = r
+            out_nested['spy_corr'][s][ql][t][b] = r  # backward compatibility
+        # Ensure all observed (s, q, t, b) combos have an explicit market_corr entry,
+        # even if the SPY mapping was sparse for a given horizon.
+        for key in all_keys:
+            s, ql, t, b = key
+            if b not in out_nested['market_corr'][s][ql].get(t, {}):
+                out_nested['market_corr'][s][ql][t][b] = np.nan
+                out_nested['spy_corr'][s][ql][t][b] = np.nan
 
     return out_nested
 
@@ -525,8 +533,10 @@ def compute_summary_stats_over_days(
     If `spy_by_target` is provided as a dict mapping target column -> spy column that
     holds the *same-horizon* SPY return (broadcast per row), we compute:
 
-        spy_corr[signal][qrank][target][bet]
+        market_corr[signal][qrank][target][bet]
             = Spearman corr( daily strategy PnL, daily SPY return at that target's horizon ).
+        spy_corr[signal][qrank][target][bet]
+            = same value as market_corr (kept for backward compatibility).
 
     If `id_col` is provided and present in df, and any of the dump paths are provided,
     we also compute per-id Spearman correlations across days and dump them:

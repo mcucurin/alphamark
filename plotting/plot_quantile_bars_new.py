@@ -36,6 +36,8 @@ quantile_colors = {
     'qr_25': 'black'
 }
 bar_width = 0.15
+PAGE_SIZE = (14, 8.5)  # Force every PDF page to the same dimensions
+METRICS_PER_PAGE = 4   # Limit stacked metrics per page to avoid crowding
 
 # ────────────────────────────────────────────────────────────────
 # LOAD DATA
@@ -68,6 +70,10 @@ PRETTY = {'alpha': 'Alpha (signal)', 'target': 'Target', 'bet_size': 'Bet size'}
 # ────────────────────────────────────────────────────────────────
 # HELPERS
 # ────────────────────────────────────────────────────────────────
+def chunked(seq, n):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
 def annotate_corner(fig, text):
     fig.text(0.995, 0.995, text, ha='right', va='top', fontsize=10, alpha=0.75)
 
@@ -109,7 +115,8 @@ def plot_metric_single_x(fig, ax, metric, x_name, fixed_filters, title=None):
         ax.bar(x + offsets[j], values_by_q[qrank], width=bar_width, label=qrank, color=color)
     ax.set_ylabel(metric, fontsize=10)
     ax.set_xticks(x)
-    ax.set_xticklabels([str(v) for v in x_vals], rotation=45, ha='right')
+    ax.set_xticklabels([str(v) for v in x_vals], rotation=45, ha='right', fontsize=9)
+    ax.tick_params(axis='y', labelsize=9)
     ax.grid(axis='y', linestyle='--', alpha=0.4)
     if title:
         ax.set_title(title, fontsize=12)
@@ -137,6 +144,7 @@ def plot_small_multiple_for_metric_two(fig, axes, metric, x_pair, fixed_filters,
                 ax.bar(j, heights[j], width=0.8, color=color)
             ax.set_xticks(x)
             ax.set_xticklabels(qranks_all, rotation=45, ha='right', fontsize=8)
+            ax.tick_params(axis='y', labelsize=8)
             ax.grid(axis='y', linestyle='--', alpha=0.3)
             ax.set_title(f"{PRETTY[v1]}={val1} | {PRETTY[v2]}={val2}", fontsize=9)
     fig.supylabel(metric)
@@ -151,6 +159,16 @@ def tile_sequence_two(x_pair, grid_vals):
 
 def pretty_combo(d):
     return " | ".join(f"{PRETTY[k]}={d[k]}" for k in d)
+
+def finalize_page(fig, pdf, rect=None):
+    """Enforce consistent page size and apply tight layout before saving."""
+    fig.set_size_inches(*PAGE_SIZE, forward=True)
+    if rect:
+        fig.tight_layout(rect=rect)
+    else:
+        fig.tight_layout()
+    pdf.savefig(fig)
+    plt.close(fig)
 
 # ────────────────────────────────────────────────────────────────
 # CUMULATIVE PAGE MAKERS (4 types)
@@ -170,7 +188,7 @@ def make_cum_pnl_ppd_page(selection, title_note, pdf):
     subset = _subset_for_selection(['pnl', 'sizeNotional'], selection)
     if subset.empty:
         return
-    fig, ax1 = plt.subplots(figsize=(14, 6))
+    fig, ax1 = plt.subplots(figsize=PAGE_SIZE)
     ax2 = ax1.twinx()
     ax1.set_title(f"Cumulative P&L + Cumulative PPD  |  {title_note}", fontsize=16)
 
@@ -202,15 +220,13 @@ def make_cum_pnl_ppd_page(selection, title_note, pdf):
     fig.autofmt_xdate()
     ax1.legend(title='Quantile Rank', loc='upper left')
     annotate_corner(fig, title_note)
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
+    finalize_page(fig, pdf, rect=[0.02, 0.05, 0.98, 0.94])
 
 def make_cum_trades_ppt_page(selection, title_note, pdf):
     subset = _subset_for_selection(['pnl', 'n_trades'], selection)
     if subset.empty:
         return
-    fig, ax1 = plt.subplots(figsize=(14, 6))
+    fig, ax1 = plt.subplots(figsize=PAGE_SIZE)
     ax2 = ax1.twinx()
     ax1.set_title(f"Cumulative Trades + Cumulative PPT  |  {title_note}", fontsize=16)
 
@@ -242,15 +258,13 @@ def make_cum_trades_ppt_page(selection, title_note, pdf):
     fig.autofmt_xdate()
     ax1.legend(title='Quantile Rank', loc='upper left')
     annotate_corner(fig, title_note)
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
+    finalize_page(fig, pdf, rect=[0.02, 0.05, 0.98, 0.94])
 
 def make_cum_size_notional_page(selection, title_note, pdf):
     subset = _subset_for_selection(['sizeNotional'], selection)
     if subset.empty:
         return
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=PAGE_SIZE)
     ax.set_title(f"Cumulative Size Notional  |  {title_note}", fontsize=16)
 
     for qrank in qranks_all:
@@ -268,16 +282,14 @@ def make_cum_size_notional_page(selection, title_note, pdf):
     fig.autofmt_xdate()
     ax.legend(title='Quantile Rank', loc='upper left')
     annotate_corner(fig, title_note)
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
+    finalize_page(fig, pdf, rect=[0.02, 0.05, 0.98, 0.94])
 
 def make_cum_bet_total_page(selection, title_note, pdf):
     # bet_total = mean bet size (stat_type 'bet_size') * nrInstr (stat_type 'nrInstr')
     subset = _subset_for_selection(['bet_size', 'nrInstr'], selection)
     if subset.empty:
         return
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=PAGE_SIZE)
     ax.set_title(f"Cumulative Total Bet Size (mean bet × #instr)  |  {title_note}", fontsize=16)
 
     for qrank in qranks_all:
@@ -301,9 +313,7 @@ def make_cum_bet_total_page(selection, title_note, pdf):
     fig.autofmt_xdate()
     ax.legend(title='Quantile Rank', loc='upper left')
     annotate_corner(fig, title_note)
-    plt.tight_layout()
-    pdf.savefig(fig)
-    plt.close(fig)
+    finalize_page(fig, pdf, rect=[0.02, 0.05, 0.98, 0.94])
 
 # ────────────────────────────────────────────────────────────────
 # PAGE ORCHESTRATION
@@ -332,25 +342,31 @@ with PdfPages(out_pdf) as pdf:
         x_values = NAME2ALL[xvar]
 
         for fcombo in fixed_combos:
-            # Bar page with all metrics stacked vertically
-            fig, axs = plt.subplots(len(metrics_to_plot), 1, figsize=(14, 2.7 * len(metrics_to_plot)))
-            fig.suptitle(
-                f"{PRETTY[xvar]} on X   |   " +
-                (" | ".join(f"{PRETTY[k]}={fcombo[k]}" for k in fcombo) if fcombo else "(no fixed vars)"),
-                fontsize=18, weight='bold'
-            )
-            annotate_corner(fig, pretty_combo(fcombo) if fcombo else "")
+            metric_chunks = list(chunked(metrics_to_plot, METRICS_PER_PAGE))
+            total_pages = len(metric_chunks)
 
-            for i, metric in enumerate(metrics_to_plot):
-                ax = axs[i] if isinstance(axs, np.ndarray) else axs
-                plot_metric_single_x(fig, ax, metric, xvar, fixed_filters=fcombo,
-                                     title=None if i else f"Bars colored by Quantile Rank")
-                if i == 0:
-                    ax.legend(title='Quantile Rank', bbox_to_anchor=(1.01, 1), loc='upper left')
+            for page_idx, metric_chunk in enumerate(metric_chunks, 1):
+                fig, axs = plt.subplots(len(metric_chunk), 1, figsize=PAGE_SIZE)
+                axs = np.atleast_1d(axs)
+                page_suffix = f" (page {page_idx}/{total_pages})" if total_pages > 1 else ""
+                fig.suptitle(
+                    f"{PRETTY[xvar]} on X   |   " +
+                    (" | ".join(f"{PRETTY[k]}={fcombo[k]}" for k in fcombo) if fcombo else "(no fixed vars)") +
+                    page_suffix,
+                    fontsize=18, weight='bold'
+                )
+                annotate_corner(fig, pretty_combo(fcombo) if fcombo else "")
 
-            plt.tight_layout(rect=[0, 0.03, 1, 0.97])
-            pdf.savefig(fig)
-            plt.close(fig)
+                for i, metric in enumerate(metric_chunk):
+                    ax = axs[i]
+                    plot_metric_single_x(fig, ax, metric, xvar, fixed_filters=fcombo,
+                                         title=None if i else f"Bars colored by Quantile Rank")
+
+                handles = [plt.Rectangle((0, 0), 1, 1, color=quantile_colors.get(q, 'gray')) for q in qranks_all]
+                fig.legend(handles, qranks_all, title='Quantile Rank',
+                           loc='upper center', ncol=len(qranks_all), bbox_to_anchor=(0.5, 0.96))
+
+                finalize_page(fig, pdf, rect=[0.03, 0.05, 0.97, 0.9])
 
             # After-page cumulative sequence per x in order
             for xv in x_values:
@@ -367,12 +383,10 @@ with PdfPages(out_pdf) as pdf:
         v1, v2 = xvars
         v1_vals, v2_vals = NAME2ALL[v1], NAME2ALL[v2]
         grid_vals = {v1: v1_vals, v2: v2_vals}
-        fig_w = 3.6 * max(2, len(v2_vals))
-        fig_h = 2.8 * max(2, len(v1_vals))
 
         for fcombo in fixed_combos:
             for metric in metrics_to_plot:
-                fig, axes = plt.subplots(len(v1_vals), len(v2_vals), figsize=(fig_w, fig_h), squeeze=False)
+                fig, axes = plt.subplots(len(v1_vals), len(v2_vals), figsize=PAGE_SIZE, squeeze=False)
                 supt = (f"Small Multiples by {PRETTY[v1]}×{PRETTY[v2]} | " +
                         (pretty_combo(fcombo) if fcombo else "(no fixed vars)") +
                         f" | metric={metric}")
@@ -384,9 +398,7 @@ with PdfPages(out_pdf) as pdf:
                 fig.legend(handles, qranks_all, title='Quantile Rank',
                            loc='upper center', ncol=len(qranks_all), bbox_to_anchor=(0.5, 0.995))
 
-                plt.tight_layout(rect=[0.02, 0.03, 0.98, 0.95])
-                pdf.savefig(fig)
-                plt.close(fig)
+                finalize_page(fig, pdf, rect=[0.03, 0.05, 0.97, 0.9])
 
                 # After-page cumulative sequence per cell (row-major)
                 for cell in tile_sequence_two([v1, v2], grid_vals):
@@ -407,12 +419,10 @@ with PdfPages(out_pdf) as pdf:
         v1, v2, v3 = xvars
         v1_vals, v2_vals = NAME2ALL[v1], NAME2ALL[v2]
         grid_vals = {v1: v1_vals, v2: v2_vals}
-        fig_w = 3.6 * max(2, len(v2_vals))
-        fig_h = 2.8 * max(2, len(v1_vals))
 
         for fcombo in fixed_combos:
             for metric in metrics_to_plot:
-                fig, axes = plt.subplots(len(v1_vals), len(v2_vals), figsize=(fig_w, fig_h), squeeze=False)
+                fig, axes = plt.subplots(len(v1_vals), len(v2_vals), figsize=PAGE_SIZE, squeeze=False)
                 supt = (f"Small Multiples by {PRETTY[v1]}×{PRETTY[v2]} | "
                         f"Aggregated over {PRETTY[v3]} (sum) " +
                         ("| " + pretty_combo(fcombo) if fcombo else "") +
@@ -430,9 +440,7 @@ with PdfPages(out_pdf) as pdf:
                 fig.legend(handles, qranks_all, title='Quantile Rank',
                            loc='upper center', ncol=len(qranks_all), bbox_to_anchor=(0.5, 0.995))
 
-                plt.tight_layout(rect=[0.02, 0.03, 0.98, 0.95])
-                pdf.savefig(fig)
-                plt.close(fig)
+                finalize_page(fig, pdf, rect=[0.03, 0.05, 0.97, 0.9])
 
                 # After-page cumulative per tile (aggregated over v3)
                 for cell in tile_sequence_two([v1, v2], grid_vals):

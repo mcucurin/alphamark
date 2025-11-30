@@ -7,10 +7,10 @@ What this module does (when called via generate_quantile_report(config)):
     <config['daily_dir']>/stats_YYYYMMDD.pkl
     <config['summary_dir']>/summary_stats_YYYYMMDD_YYYYMMDD.pkl
 - Optionally loads per-ticker correlation / CCF dumps produced by the runner (if configured):
-    <config['per_ticker_dir']>/per_ticker_alpha_raw_spy_corr_*.pkl
-    <config['per_ticker_dir']>/per_ticker_alpha_pnl_spy_corr_*.pkl
-    <config['per_ticker_dir']>/per_ticker_alpha_raw_spy_ccf_*.pkl
-    <config['per_ticker_dir']>/per_ticker_alpha_pnl_spy_ccf_*.pkl
+    <config['per_ticker_dir']>/mds_alpha_raw_spy_corr_*.pkl
+    <config['per_ticker_dir']>/mds_alpha_pnl_spy_corr_*.pkl
+    <config['per_ticker_dir']>/mds_alpha_raw_spy_ccf_*.pkl
+    <config['per_ticker_dir']>/mds_alpha_pnl_spy_ccf_*.pkl
 - Optionally loads outlier PKLs from:
     <config['outliers_dir']>/outliers_*.pkl
 - Builds a multi-page PDF at: config['output_pdf']
@@ -24,7 +24,8 @@ Pages
    H2 temporal lines for the same filter. No legend — line end labels.
 4) H3: per-quantile time-series correlation of summed daily PnL vectors (Spearman, all targets / bets).
    H3 temporal lines (rolling/expanding time corr). No legend — line end labels.
-5) Temporal pages per (target, signal, bet): cumulative P&L vs nrInstr; cumulative PPD vs Size Notional; daily n_trades.
+5) Temporal pages per (target, signal, bet): configurable metric grid (default: pnl, ppd, n_trades, sizeNotional)
+   with rolling/cumulative options and optional rolling Sharpe.
 6) Distributions / CCF:
    - If CCF PKLs exist:
        - CCF summary page (mean/median/std vs lag) for RAW & PnL.
@@ -36,7 +37,7 @@ Pages
 
 Expected DAILY/SUMMARY columns:
   date (YYYY-MM-DD), signal, target, qrank (e.g., qr_100), bet_size_col,
-  stat_type ('pnl','ppd','n_trades','nrInstr','sizeNotional','sharpe','spy_corr',...),
+  stat_type ('pnl','ppd','n_trades','nrInstr','sizeNotional','sharpe','market_corr',...),
   value (float)
 
 Note
@@ -50,6 +51,7 @@ import time
 import pickle as pkl
 from itertools import product, combinations
 from contextlib import contextmanager
+import re
 
 import numpy as np
 import pandas as pd
@@ -68,7 +70,15 @@ mpl.rcParams.update({
     "savefig.facecolor": "white",
     "savefig.edgecolor": "white",
     "axes.grid": False,
+    "font.size": 12,
+    "axes.titlesize": 16,
+    "axes.labelsize": 13,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 11,
+    "figure.titlesize": 18,
 })
+PAGE_SIZE = (14, 8.5)  # Standardize all PDF pages
 
 # --- Layout guardrails ---
 BAR_TITLE_Y     = 0.985
@@ -80,12 +90,66 @@ TEMPORAL_AX_TOP = 0.90
 # Global meta text (set by generate_quantile_report)
 META_TEXT = None
 
+# Backward-compatible stat_type aliases
+STAT_ALIASES = {
+    "spy_corr": "market_corr",
+    "mkt_corr": "market_corr",
+    "nrTrades": "n_trades",
+    "nr_trades": "n_trades",
+    "ntrades": "n_trades",
+}
+
 
 # -------------------------------------------------
 # Utilities
 # -------------------------------------------------
+def _canonical_stat(stat: str) -> str:
+    """Normalize stat_type tokens for plotting."""
+    return STAT_ALIASES.get(stat, stat)
+
+
+def _apply_stat_aliases(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Rename legacy stat_type labels (e.g., spy_corr -> market_corr)."""
+    if df is None or not isinstance(df, pd.DataFrame):
+        return df
+    if "stat_type" not in df.columns:
+        return df
+    out = df.copy()
+    out["stat_type"] = (
+        out["stat_type"]
+        .astype("string")
+        .map(lambda x: STAT_ALIASES.get(x, x))
+        .astype("category")
+    )
+    return out
+
+
+def _normalize_metric_list(metrics) -> list[str]:
+    """Deduplicate/alias a user-provided metric list."""
+    out: list[str] = []
+    for m in metrics or []:
+        if m is None:
+            continue
+        name = _canonical_stat(str(m))
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def _metric_label(metric: str) -> str:
+    """Human-readable metric label; only PNL/PPD are fully uppercased."""
+    name = _canonical_stat(str(metric))
+    if name in ("pnl", "ppd"):
+        return name.upper()
+    # Split camelCase/snake_case into words, then title-case
+    spaced = re.sub(r"(?<!^)(?=[A-Z])", " ", name)
+    spaced = spaced.replace("_", " ")
+    return spaced.title()
+
+
 def savefig_white(pdf, fig):
     """Save with white background; print META_TEXT if set (supplied via main.py)."""
+    fig.set_size_inches(*PAGE_SIZE, forward=True)
     fig.patch.set_facecolor("white")
     fig.patch.set_alpha(1.0)
     if META_TEXT:
@@ -233,6 +297,8 @@ def _ensure_quantile_colors(labels, base_map):
 def _plot_date_axis(ax):
     ax.set_axisbelow(True)
     ax.grid(True, linestyle=":", alpha=0.35)
+    ax.tick_params(axis="both", labelsize=11)
+    ax.margins(x=0.02, y=0.08)
 
 
 def _ellipsis(s, n):
@@ -241,8 +307,8 @@ def _ellipsis(s, n):
 
 
 def _heatmap_figure_size(k, widen=1.18, extra_height=0.0):
-    s = max(10, min(28, 0.6 * k + 8))
-    return (s * widen, s + extra_height)
+    s = max(12, min(30, 0.7 * k + 10))
+    return (s * (widen + 0.04), s + extra_height + 0.5)
 
 
 @contextmanager
@@ -420,6 +486,24 @@ def _minp(window, floor=3):
 def _roll_mean(s: pd.Series, window: int):
     mp = _minp(window, floor=3)
     return s.rolling(window, min_periods=mp).mean()
+
+
+def _rolling_sharpe(s: pd.Series, window: int):
+    """Rolling Sharpe using daily series; annualized with sqrt(252)."""
+    if s is None or len(s) == 0:
+        return pd.Series(dtype=float)
+
+    w = max(1, int(window))
+    mp = _minp(w, floor=5)
+
+    def _sharpe(x):
+        mu = np.nanmean(x)
+        sd = np.nanstd(x)
+        if not np.isfinite(mu) or not np.isfinite(sd) or sd <= 0:
+            return np.nan
+        return mu / sd * np.sqrt(252.0)
+
+    return s.rolling(w, min_periods=mp).apply(_sharpe, raw=False)
 
 
 def _as_list(x):
@@ -831,10 +915,18 @@ def _find_latest_outliers_pkl(root: str):
 def _metric_table_rows(odf, metric, top_k, have_z, have_rule):
     sub = odf[odf['stat_type'] == metric].copy()
     if sub.empty: return None, None
-    sub = sub.sort_values('value')
-    lows = sub.head(top_k).copy()
-    highs = sub.tail(top_k).iloc[::-1].copy()
-    labels_tbl = ["Type", "Date", "Signal", "Bet", "Target", "Q", "Value"] + (["z"] if have_z else []) + (["Rule"] if have_rule else [])
+    # Order by z if present; otherwise by absolute value
+    if 'z' in sub.columns:
+        sub['z'] = pd.to_numeric(sub['z'], errors='coerce')
+        sub['abs_z'] = sub['z'].abs()
+        sub = sub.sort_values('z')
+        lows = sub.head(top_k).copy()           # most negative z
+        highs = sub.tail(top_k).iloc[::-1].copy()  # most positive z
+    else:
+        sub = sub.sort_values('value')
+        lows = sub.head(top_k).copy()
+        highs = sub.tail(top_k).iloc[::-1].copy()
+    labels_tbl = ["Type", "Date", "Signal", "Bet", "Target", "Q", "Value"] + (["z"] if have_z else [])
 
     def row(r, kind):
         base = [
@@ -844,7 +936,6 @@ def _metric_table_rows(odf, metric, top_k, have_z, have_rule):
         ]
         base = [kind] + base
         if have_z:    base.append("" if pd.isna(r.get('z')) else f"{r.get('z'):.2f}")
-        if have_rule: base.append(_ellipsis(r.get('rule', ''), 18))
         return base
 
     rows = [row(r, "High") for _, r in highs.iterrows()] + [row(r, "Low") for _, r in lows.iterrows()]
@@ -890,9 +981,10 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
         savefig_white(pdf, fig); return
 
     odf = odf.copy()
+    odf = _apply_stat_aliases(odf)
     odf['date'] = pd.to_datetime(odf['date'], errors='coerce')
     odf = odf.dropna(subset=['date', 'value'])
-    have_rule = 'rule' in odf.columns
+    have_rule = False  # hide rule column from output
     have_z    = 'z' in odf.columns
 
     if metrics is None:
@@ -918,7 +1010,7 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
         fig = plt.figure(figsize=(14, 8.5))
         fig.suptitle("Outlier Tables (compact)", fontsize=18, weight='bold', y=0.985)
         if page_idx == 0:
-            subtitle = f"Metrics: {', '.join([m for m, _, _ in tables])} | Top-K: {top_k}"
+            subtitle = f"Metrics: {', '.join([m for m, _, _ in tables])} | Top-K by z-score: {top_k}"
             fig.text(0.03, 0.955, subtitle, ha='left', va='top', fontsize=11, color='0.25')
         gs = GridSpec(nrows=len(chunk), ncols=1, figure=fig, left=0.03, right=0.97, top=0.90, bottom=0.06, hspace=0.35)
         for row_idx, (metric_name, col_labels, rows) in enumerate(chunk):
@@ -982,14 +1074,179 @@ def _distrib_page(pdf, df, title, bins=40):
     savefig_white(pdf, fig)
 
 
+def _metric_series_for_temporal(metric: str, df: pd.DataFrame, roll_windows: dict,
+                                roll_sharpe: int):
+    """Return (title, series) for a temporal metric, handling cumulative/rolling logic."""
+    name = _canonical_stat(str(metric))
+    if df is None or df.empty:
+        return None, None
+
+    if name == "pnl":
+        s = _series(df, "pnl")
+        if s.empty:
+            return None, None
+        y = _roll_mean(s.cumsum(), roll_windows.get("pnl", 1))
+        title = _title_token(_metric_label("pnl"), roll_windows.get("pnl", 1), cumulative=True)
+        return title, y
+
+    if name == "ppd":
+        s = _series(df, "ppd")
+        if s.empty:
+            return None, None
+        s = s * 10000.0  # basis points
+        y = _roll_mean(s.cumsum(), roll_windows.get("ppd", 1))
+        title = _title_token("PPD (bps)", roll_windows.get("ppd", 1), cumulative=True)
+        return title, y
+
+    if name == "nrInstr":
+        s = _series(df, "nrInstr")
+        if s.empty:
+            return None, None
+        window = roll_windows.get("nrInstr", 1)
+        y = _roll_mean(s, window)
+        title = _title_token("nrInstr", window, cumulative=False)
+        return title, y
+
+    if name == "n_trades":
+        s = _series(df, "n_trades")
+        if s.empty:
+            return None, None
+        window = roll_windows.get("n_trades", 1)
+        y = _roll_mean(s, window)
+        title = _title_token("n_trades", window, cumulative=False)
+        return title, y
+
+    if name == "sizeNotional":
+        s = _series(df, "sizeNotional")
+        if s.empty:
+            return None, None
+        window = roll_windows.get("sizeNotional", 1)
+        y = _roll_mean(s, window)
+        title = _title_token("Size Notional", window, cumulative=False)
+        return title, y
+
+    if name == "sharpe":
+        pnl_series = _series(df, "pnl")
+        if pnl_series.empty:
+            return None, None
+        window = max(1, int(roll_sharpe))
+        y = _rolling_sharpe(pnl_series, window)
+        return f"Rolling Sharpe ({window}D)", y
+
+    s = _series(df, name)
+    if s.empty:
+        return None, None
+    window = roll_windows.get(name, roll_windows.get("__default__", 1))
+    y = _roll_mean(s, window) if window and int(window) > 1 else s
+    title = _title_token(name, window, cumulative=False)
+    return title, y
+
+
+def _plot_temporal_grid(pdf,
+                        df: pd.DataFrame,
+                        qranks: list[str],
+                        quantile_colors: dict,
+                        metrics: list[str],
+                        roll_windows: dict,
+                        roll_sharpe: int,
+                        grid_shape: tuple[int, int],
+                        title_prefix: str,
+                        style: str = "-"):
+    """Plot a grid of temporal metrics for one (target, signal, bet) combination."""
+    rows, cols = grid_shape
+    per_page = max(1, rows * cols)
+    metrics = [m for m in metrics if m]  # defensive
+    if not metrics:
+        return
+
+    legend_handles = [
+        Line2D([0], [0], color=quantile_colors.get(q, "gray"), linestyle=style, label=str(q))
+        for q in qranks
+    ]
+
+    n_pages = int(np.ceil(len(metrics) / per_page))
+
+    for page_idx, start in enumerate(range(0, len(metrics), per_page), start=1):
+        chunk = metrics[start:start + per_page]
+        fig, axs = plt.subplots(
+            rows, cols, figsize=PAGE_SIZE
+        )
+        axs = np.atleast_1d(axs).ravel()
+
+        for ax in axs[len(chunk):]:
+            ax.axis("off")
+
+        any_plotted = False
+        for ax, metric in zip(axs, chunk):
+            metric_any = False
+            metric_title = None
+            for q in qranks:
+                sq = df[df["qrank"] == q]
+                title, series = _metric_series_for_temporal(metric, sq, roll_windows, roll_sharpe)
+                if series is None or series.empty:
+                    continue
+                ax.plot(
+                    series.index,
+                    series.values,
+                    color=quantile_colors.get(q, "gray"),
+                    linestyle=style,
+                    linewidth=1.6,
+                    label=str(q),
+                )
+                metric_any = True
+                metric_title = title if title else metric
+
+            if metric_any:
+                any_plotted = True
+                ax.set_ylabel(metric_title or str(metric))
+                _plot_date_axis(ax)
+            else:
+                ax.axis("off")
+                ax.text(
+                    0.5,
+                    0.5,
+                    f"No data for {metric}",
+                    ha="center",
+                    va="center",
+                    fontsize=9,
+                    color="0.35",
+                )
+
+        fig.suptitle(
+            f"{title_prefix} — Temporal metrics ({page_idx}/{n_pages})",
+            fontsize=16,
+            weight="bold",
+            y=0.97,
+        )
+
+        # Legend just below the title
+        if any_plotted and legend_handles:
+            fig.legend(
+                handles=legend_handles,
+                title="Quantile",
+                fontsize=9,
+                frameon=True,
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.90),
+                ncol=len(legend_handles),
+            )
+
+        fig.tight_layout(rect=[0.04, 0.07, 0.96, 0.88])
+        savefig_white(pdf, fig)
+
+
 # =====================================================
 # CCF helpers: per-ticker RAW/PnL vs SPY cross-corr
 # =====================================================
-def _load_latest_ccf_pkl(root: str, pattern: str):
-    """Return latest non-empty DataFrame for given CCF glob pattern or None."""
+def _load_latest_ccf_pkl(root: str, pattern):
+    """Return latest non-empty DataFrame for given CCF glob pattern(s) or None."""
     if root is None or not os.path.isdir(root):
         return None
-    paths = sorted(glob.glob(os.path.join(root, pattern)))
+    patterns = pattern if isinstance(pattern, (list, tuple)) else [pattern]
+    paths: list[str] = []
+    for pat in patterns:
+        paths.extend(glob.glob(os.path.join(root, pat)))
+    paths = sorted(paths)
     if not paths:
         return None
     path = paths[-1]
@@ -1152,11 +1409,11 @@ def append_ccf_pages(per_ticker_dir: str, pdf, max_lag: int = 5) -> bool:
 
     df_raw_ccf = _load_latest_ccf_pkl(
         per_ticker_dir,
-        "per_ticker_alpha_raw_spy_ccf_*.pkl",
+        ["mds_alpha_raw_spy_ccf_*.pkl", "per_ticker_alpha_raw_spy_ccf_*.pkl"],
     )
     df_pnl_ccf = _load_latest_ccf_pkl(
         per_ticker_dir,
-        "per_ticker_alpha_pnl_spy_ccf_*.pkl",
+        ["mds_alpha_pnl_spy_ccf_*.pkl", "per_ticker_alpha_pnl_spy_ccf_*.pkl"],
     )
 
     if df_raw_ccf is None and df_pnl_ccf is None:
@@ -1211,12 +1468,29 @@ def generate_quantile_report(config: dict):
     roll_trades      = int(config.get("roll_trades", 1))
     roll_pnl         = int(config.get("roll_pnl", 1))
     roll_size_notnl  = int(config.get("roll_size_notional", 1))
+    roll_sharpe      = int(config.get("roll_sharpe", 60))
+
+    temporal_vars_base  = _normalize_metric_list(config.get("variables_temporal_plot", []))
+    temporal_vars_extra = _normalize_metric_list(config.get("variables_temporal_extras", []))
+    temporal_vars = temporal_vars_base or ["pnl", "ppd", "n_trades", "sizeNotional"]
+    for m in temporal_vars_extra:
+        if m not in temporal_vars:
+            temporal_vars.append(m)
+
+    array_dim_cfg = config.get("arrayDim_temporal_plot", (2, 2))
+    try:
+        temp_rows, temp_cols = int(array_dim_cfg[0]), int(array_dim_cfg[1])
+    except Exception:
+        temp_rows, temp_cols = 2, 2
+    temp_rows = max(1, temp_rows)
+    temp_cols = max(1, temp_cols)
 
     bar_page_vars    = list(config.get("bar_page_vars", []))
     bar_x_vars       = list(config.get("bar_x_vars", []))
-    bar_metrics      = list(config.get("bar_metrics", []))
+    bar_metrics      = _normalize_metric_list(config.get("bar_metrics", []))
+    aspect_ratio_barplots = float(config.get("aspect_ratio_barplots", 16 / 9))
 
-    outlier_metrics_for_tables = list(config.get("outlier_metrics_for_tables", []))
+    outlier_metrics_for_tables = _normalize_metric_list(config.get("outlier_metrics_for_tables", []))
     outlier_top_k              = int(config.get("outlier_top_k", 3))
     outlier_tables_per_page    = int(config.get("outlier_tables_per_page", 3))
 
@@ -1229,6 +1503,8 @@ def generate_quantile_report(config: dict):
 
     # Load data
     stats_daily, stats_summary, interval_min, interval_max, interval_ndays = _load_data(daily_dir, summary_dir)
+    stats_daily = _apply_stat_aliases(stats_daily)
+    stats_summary = _apply_stat_aliases(stats_summary)
 
     # Meta text (if caller didn't provide, auto-fill using actual data window)
     if config.get("meta_text"):
@@ -1255,7 +1531,7 @@ def generate_quantile_report(config: dict):
         qranks = [q for q in qranks_requested if (allow_missing_q or q in qranks_all)] or qranks_all
 
     quantile_colors = _ensure_quantile_colors(qranks, quantile_colors_cfg)
-    bar_width = 0.15
+    bar_width = 0.18
 
     # -------------------------------------------------
     # Build datasets
@@ -1325,27 +1601,33 @@ def generate_quantile_report(config: dict):
                 else:
                     subset['x_key'] = "ALL"; x_levels = ["ALL"]
 
-                fig, axs = plt.subplots(len(bar_metrics), 1, figsize=(14, 2.6 * len(bar_metrics)))
-                axs = np.atleast_1d(axs)
+                # Arrange metrics in a 2-column grid to improve readability and keep a single legend
+                n_cols = 2
+                n_rows = int(np.ceil(len(bar_metrics) / n_cols))
+                fig_height = max(PAGE_SIZE[1], 3.2 * n_rows + 1.2)
+                fig_height = max(PAGE_SIZE[1], 3.6 * n_rows + 2.2)
+                fig, axs = plt.subplots(n_rows, n_cols, figsize=(PAGE_SIZE[0], fig_height))
+                axs = np.atleast_1d(axs).ravel()
                 main_title = "Bar Plots | " + " ".join(title_bits)
-
-                fig.suptitle(main_title, fontsize=18, weight='bold', y=BAR_TITLE_Y)
+                fig.suptitle(main_title, fontsize=16, weight='bold', y=0.968)
                 xlabel_descr = " | ".join(bar_x_vars) if bar_x_vars else "ALL"
-                fig.text(0.5, BAR_XLABEL_Y, f"X-axis: {xlabel_descr}",
-                         ha="center", va="top", fontsize=13, color="0.35", weight='bold')
+                fig.text(0.5, 0.94, f"X-axis: {xlabel_descr}", ha="center", va="top", fontsize=10, color="0.35", weight='bold')
 
+                legend_handles = []
+                legend_labels = []
                 for i, metric in enumerate(bar_metrics):
                     ax = axs[i]
+                    metric_display = _metric_label(metric)
                     data = subset[subset['stat_type'] == metric].copy()
                     if data.empty:
-                        ax.set_title(f"{metric}: no data in summary PKL")
+                        ax.set_title(f"{metric_display}: no data in summary PKL", fontsize=11)
                         ax.axis('off')
                         continue
 
                     unit_suffix = ""
                     if metric.lower() == 'ppd':
                         data['value'] = data['value'] * 10000  # bps
-                        unit_suffix = " (bpts)"
+                        unit_suffix = " (bps)"
                     elif metric == 'sizeNotional':
                         data['value'] = data['value'] / 1e6    # $M
                         unit_suffix = " ($M)"
@@ -1400,15 +1682,13 @@ def generate_quantile_report(config: dict):
                                         label=q,
                                     )
                                     plotted = True
+                                    if q not in legend_labels:
+                                        legend_labels.append(q)
+                                        legend_handles.append(
+                                            plt.Rectangle((0, 0), 1, 1, color=quantile_colors.get(q, 'gray'))
+                                        )
 
-                        if plotted:
-                            ax.legend(
-                                title='Quantile (color)',
-                                bbox_to_anchor=(1.02, 0.98),
-                                loc='upper left',
-                                fontsize=9,
-                                frameon=True,
-                            )
+                        # drop per-axes titles; ylabel carries the metric name
                     else:
                         # ---- Single bar per x_key (no quantiles) ----
                         data_dedup = data.drop_duplicates(subset=['x_key'], keep='last')
@@ -1438,17 +1718,36 @@ def generate_quantile_report(config: dict):
                                 zorder=0,
                             )
 
-                    ax.set_ylabel(f"{metric}{unit_suffix}")
+                    ax.set_ylabel(f"{metric_display}{unit_suffix}")
                     ax.set_xticks(np.arange(len(x_levels)))
                     ax.set_xticklabels(
                         [str(v) for v in x_levels],
-                        rotation=45,
-                        ha='right',
-                        fontsize=11,
+                        rotation=10,
+                        ha='center',
+                        fontsize=7,
                     )
                     ax.grid(axis='y', linestyle=':', alpha=0.35)
+                    ax.margins(y=0.2)
+                    ax.tick_params(axis='y', labelsize=8)
+                    ax.set_ylabel(f"{metric_display}{unit_suffix}", fontsize=9)
 
-                plt.tight_layout(rect=[0.02, 0.04, 0.98, BAR_AX_TOP])
+                # Hide any unused subplots
+                for j in range(len(bar_metrics), len(axs)):
+                    axs[j].axis('off')
+
+                if legend_handles:
+                    fig.legend(
+                        legend_handles,
+                        legend_labels,
+                        title='Quantile (color)',
+                        bbox_to_anchor=(0.5, 0.90),
+                        loc='upper center',
+                        ncol=len(legend_handles),
+                        fontsize=9,
+                        frameon=True,
+                    )
+
+                plt.tight_layout(rect=[0.05, 0.08, 0.95, 0.80], h_pad=2.6)
                 savefig_white(pdf, fig)
 
         # ---------- Heatmap 1 (Spearman; raw alpha base) ----------
@@ -1673,6 +1972,15 @@ def generate_quantile_report(config: dict):
         # ---------- Temporal pages per (target, signal, bet) ----------
         stats_daily_plot_local = stats_daily_plot_nonall
 
+        roll_windows = {
+            "pnl": roll_pnl,
+            "ppd": roll_ppd,
+            "n_trades": roll_trades,
+            "sizeNotional": roll_size_notnl,
+            "nrInstr": roll_nrinstr,
+            "__default__": 1,
+        }
+
         for target in sorted(stats_daily_plot_local["target"].dropna().unique()):
             for signal in sorted(stats_daily_plot_local["signal"].dropna().unique()):
                 for bet_strategy in sorted(
@@ -1686,216 +1994,19 @@ def generate_quantile_report(config: dict):
                     sub_all = stats_daily_plot_local[mask_base].copy()
                     if sub_all.empty:
                         continue
-
-                    # ---- (1) PnL (cum) vs nrInstr ----
-                    left_title = _title_token("P&L", roll_pnl, cumulative=True)
-                    right_title = _title_token(
-                        "nrInstr", roll_nrinstr, cumulative=False
+                    title_prefix = f"{target} | {signal} | {bet_strategy}"
+                    _plot_temporal_grid(
+                        pdf,
+                        sub_all,
+                        qranks,
+                        quantile_colors,
+                        temporal_vars,
+                        roll_windows,
+                        roll_sharpe,
+                        (temp_rows, temp_cols),
+                        title_prefix=title_prefix,
+                        style=style_first,
                     )
-
-                    fig, ax = plt.subplots(figsize=(14, 6.0))
-                    right_ax = ax.twinx()
-                    right_ax.grid(False)
-
-                    fig.suptitle(
-                        f"{target} | {signal} | {bet_strategy}\n"
-                        f"{left_title} (left, solid) vs {right_title} (right, dotted)",
-                        fontsize=16,
-                        weight="bold",
-                        y=0.96,
-                    )
-
-                    anyL = anyR = False
-                    for q in qranks:
-                        sq = sub_all[sub_all["qrank"] == q]
-                        if sq.empty:
-                            continue
-                        color = quantile_colors.get(q, "gray")
-
-                        pnl = _series(sq, "pnl")
-                        nrin = _series(sq, "nrInstr")
-
-                        if not pnl.empty:
-                            cum_pnl = pnl.cumsum()
-                            yL = _roll_mean(cum_pnl, roll_pnl)
-                            ax.plot(
-                                yL.index,
-                                yL.values,
-                                color=color,
-                                linestyle=style_first,
-                                linewidth=1.8,
-                            )
-                            anyL = True
-
-                        if not nrin.empty:
-                            yR = _roll_mean(nrin, roll_nrinstr)
-                            right_ax.plot(
-                                yR.index,
-                                yR.values,
-                                color=color,
-                                linestyle=style_second,
-                                linewidth=1.8,
-                            )
-                            anyR = True
-
-                    if anyL:
-                        ax.set_ylabel(left_title)
-                    if anyR:
-                        right_ax.set_ylabel(right_title)
-
-                    _plot_date_axis(ax)
-
-                    handles_styles = [
-                        Line2D(
-                            [0],
-                            [0],
-                            color="black",
-                            linestyle=style_first,
-                            label=left_title,
-                        ),
-                        Line2D(
-                            [0],
-                            [0],
-                            color="black",
-                            linestyle=style_second,
-                            label=right_title,
-                        ),
-                    ]
-                    ax.legend(
-                        handles=handles_styles,
-                        loc="upper left",
-                        fontsize=9,
-                        frameon=True,
-                    )
-
-                    fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
-                    savefig_white(pdf, fig)
-
-                    # ---- (2) PPD (cum) vs Size Notional ----
-                    left_title2 = _title_token("PPD", roll_ppd, cumulative=True)
-                    right_title2 = _title_token(
-                        "Size Notional", roll_size_notnl, cumulative=False
-                    )
-
-                    fig, ax = plt.subplots(figsize=(14, 6.0))
-                    right_ax = ax.twinx()
-                    right_ax.grid(False)
-
-                    fig.suptitle(
-                        f"{target} | {signal} | {bet_strategy}\n"
-                        f"{left_title2} (left, solid) vs {right_title2} (right, dotted)",
-                        fontsize=16,
-                        weight="bold",
-                        y=0.96,
-                    )
-
-                    anyL = anyR = False
-                    for q in qranks:
-                        sq = sub_all[sub_all["qrank"] == q]
-                        if sq.empty:
-                            continue
-                        color = quantile_colors.get(q, "gray")
-
-                        ppd = _series(sq, "ppd")
-                        sizeN = _series(sq, "sizeNotional")
-
-                        if not ppd.empty:
-                            cum_ppd = ppd.cumsum()
-                            yL = _roll_mean(cum_ppd, roll_ppd)
-                            ax.plot(
-                                yL.index,
-                                yL.values,
-                                color=color,
-                                linestyle=style_first,
-                                linewidth=1.8,
-                            )
-                            anyL = True
-
-                        if not sizeN.empty:
-                            yR = _roll_mean(sizeN, roll_size_notnl)
-                            right_ax.plot(
-                                yR.index,
-                                yR.values,
-                                color=color,
-                                linestyle=style_second,
-                                linewidth=1.8,
-                            )
-                            anyR = True
-
-                    if anyL:
-                        ax.set_ylabel(left_title2)
-                    if anyR:
-                        right_ax.set_ylabel(right_title2)
-
-                    _plot_date_axis(ax)
-
-                    handles_styles2 = [
-                        Line2D(
-                            [0],
-                            [0],
-                            color="black",
-                            linestyle=style_first,
-                            label=left_title2,
-                        ),
-                        Line2D(
-                            [0],
-                            [0],
-                            color="black",
-                            linestyle=style_second,
-                            label=right_title2,
-                        ),
-                    ]
-                    ax.legend(
-                        handles=handles_styles2,
-                        loc="upper left",
-                        fontsize=9,
-                        frameon=True,
-                    )
-
-                    fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
-                    savefig_white(pdf, fig)
-
-                    # ---- (3) Daily number of trades ----
-                    fig, ax = plt.subplots(figsize=(14, 5.0))
-                    fig.suptitle(
-                        f"{target} | {signal} | {bet_strategy}\nDaily n_trades (smoothed)",
-                        fontsize=16,
-                        weight="bold",
-                        y=0.96,
-                    )
-
-                    any_trades = False
-                    for q in qranks:
-                        sq = sub_all[sub_all["qrank"] == q]
-                        if sq.empty:
-                            continue
-                        color = quantile_colors.get(q, "gray")
-                        trades = _series(sq, "n_trades")
-                        if trades.empty:
-                            continue
-                        y = _roll_mean(trades, roll_trades)
-                        ax.plot(
-                            y.index,
-                            y.values,
-                            color=color,
-                            linestyle="-",
-                            linewidth=1.5,
-                            label=str(q),
-                        )
-                        any_trades = True
-
-                    if any_trades:
-                        ax.set_ylabel("n_trades (smoothed)")
-                        ax.legend(
-                            title="Quantile",
-                            fontsize=9,
-                            frameon=True,
-                            loc="upper left",
-                        )
-                    _plot_date_axis(ax)
-
-                    fig.tight_layout(rect=[0.02, 0.06, 0.98, TEMPORAL_AX_TOP])
-                    savefig_white(pdf, fig)
 
         # ---------- CCF / correlation distribution pages ----------
         ccf_done = False
@@ -1911,17 +2022,26 @@ def generate_quantile_report(config: dict):
             raw_corr_paths = sorted(
                 glob.glob(
                     os.path.join(
-                        per_ticker_dir, "per_ticker_alpha_raw_spy_corr_*.pkl"
+                        per_ticker_dir, "mds_alpha_raw_spy_corr_*.pkl"
                     )
                 )
             )
             pnl_corr_paths = sorted(
                 glob.glob(
                     os.path.join(
-                        per_ticker_dir, "per_ticker_alpha_pnl_spy_corr_*.pkl"
+                        per_ticker_dir, "mds_alpha_pnl_spy_corr_*.pkl"
                     )
                 )
             )
+            # Backward compat patterns
+            if not raw_corr_paths:
+                raw_corr_paths = sorted(
+                    glob.glob(os.path.join(per_ticker_dir, "per_ticker_alpha_raw_spy_corr_*.pkl"))
+                )
+            if not pnl_corr_paths:
+                pnl_corr_paths = sorted(
+                    glob.glob(os.path.join(per_ticker_dir, "per_ticker_alpha_pnl_spy_corr_*.pkl"))
+                )
 
             if raw_corr_paths:
                 try:
@@ -1981,4 +2101,3 @@ def generate_quantile_report(config: dict):
         print(
             f"[INFO] Total plotting time: {t1 - t0:.2f} seconds"
         )
-

@@ -18,7 +18,7 @@ def _zscore(s: pd.Series) -> pd.Series:
 def compute_outliers(
     stats_df: pd.DataFrame,
     stats_list: Iterable[str],
-    z_thresh: float = 3.0,
+    z_thresh: float = 3.0,  # ignored (kept for signature compatibility)
 ) -> pd.DataFrame:
     """
     Compute outliers per requested stat_type using global z-scores on 'value'.
@@ -67,8 +67,9 @@ def compute_outliers(
         z = _zscore(sub['value'])
         sub['z'] = z
         sub['abs_z'] = z.abs()
-        sub['is_outlier'] = sub['abs_z'] > float(z_thresh)
-        sub['rule'] = f"abs_z > {z_thresh:g}"
+        # No hard threshold: flag everything and let downstream pages take the top |z|
+        sub['is_outlier'] = True
+        sub['rule'] = "ranked by |z| (no threshold)"
         frames.append(sub)
 
     if not frames:
@@ -76,6 +77,9 @@ def compute_outliers(
 
     # Keep all rows (not only outliers) so your tables can select highs/lows flexibly
     out = pd.concat(frames, ignore_index=True)
+    # Drop rule column to keep output compact; plotting ranks by |z| directly
+    if 'rule' in out.columns:
+        out = out.drop(columns=['rule'])
     # Stable ordering: by stat, then by date
     out = out.sort_values(['stat_type','date','signal','target','bet_size_col','qrank'], kind='mergesort')
     return out

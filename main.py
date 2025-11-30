@@ -106,7 +106,7 @@ DEFAULT_RUNNER_CONFIG = {
 
     # -------- Interval filter (inclusive) --------
     # Accepts many formats: "2021-01-01", "01/01/2021", "20210101"
-    "interval_start": "2021-01-01",
+    "interval_start": "2021-12-01",
     "interval_end": None,
 }
 
@@ -134,14 +134,21 @@ DEFAULT_PLOT_CONFIG = {
     "roll_trades": 1,
     "roll_pnl": 1,
     "roll_size_notional": 1,
+    "roll_sharpe": 60,  # used for optional rolling Sharpe on temporal plots
+
+    # Temporal plots (per target/signal/bet)
+    "variables_temporal_plot": ["pnl", "ppd", "nrTrades", "sizeNotional"],  # default set
+    "variables_temporal_extras": [],  # e.g., ["hit_ratio", "long_ratio", "r2", "t_stat"]
+    "arrayDim_temporal_plot": (2, 2),  # rows, cols per temporal page
 
     # Bar plots (SUMMARY ONLY)
     "bar_page_vars": ["signal", "bet_size_col"],   # facets
     "bar_x_vars": ["target"],                      # x-axis grouping
     "bar_metrics": [
         "pnl", "ppd", "sharpe", "hit_ratio", "long_ratio",
-        "nrInstr", "sizeNotional", "r2", "t_stat", "n_trades", "spy_corr"
+        "sizeNotional", "r2", "t_stat", "n_trades", "market_corr"
     ],
+    "aspect_ratio_barplots": 16 / 9,  # widescreen layout for bar pages
 
     # Outliers (compact)
     # (Directory will be filled in from pipeline result; only behavior lives here.)
@@ -209,7 +216,7 @@ if __name__ == '__main__':
     summary_path = result.get('summary_path')
     summary_dir = result.get('summary_dir')
     outliers_dir = result.get('outliers_dir')
-    per_ticker_dir = result.get('per_ticker_dir')
+    market_dist_dir = result.get('market_dist_dir') or result.get('per_ticker_dir')
 
     # -----------------------------------------------------------------
     # 3) Build a combined stats_df for backward compatibility
@@ -265,7 +272,7 @@ if __name__ == '__main__':
     output_root = runner_cfg["output_root"]
     plot_cfg["daily_dir"] = daily_dir
     plot_cfg["summary_dir"] = summary_dir
-    plot_cfg["per_ticker_dir"] = per_ticker_dir
+    plot_cfg["per_ticker_dir"] = market_dist_dir
     plot_cfg["outliers_dir"] = outliers_dir
     plot_cfg["output_pdf"] = os.path.join(output_root, "Quantile_Combined_Report.pdf")
 
