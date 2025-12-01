@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Sequence, Optional
 from scipy.stats import spearmanr
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 def _qlabel(q: float) -> str:
@@ -87,29 +88,29 @@ def _collapse_corr(records: list[tuple], id_col: str, out_path: Optional[str], m
     return out_path
 
 
-def _collapse_ccf(records: list[tuple], id_col: str, out_path: Optional[str], metric_name: str, max_lag: int):
+def _collapse_ccf(records: list[tuple], id_col: str, out_path: Optional[str], metric_name: str, max_lag: int, n_jobs: int | None = None):
     if not records or out_path is None or max_lag is None or int(max_lag) <= 0:
         return None
     max_lag = int(max_lag)
     cols = [id_col, "signal", "qrank", "target", "bet_size_col", "date", "series", "spy"]
     dfrec = pd.DataFrame.from_records(records, columns=cols)
-    out_rows = []
+    if dfrec.empty:
+        return None
 
-    for keys, grp in dfrec.groupby([id_col, "signal", "qrank", "target", "bet_size_col"], sort=False):
+    def _one_group(keys, grp):
         grp = grp.copy()
         grp["date"] = pd.to_datetime(grp["date"], errors="coerce")
         grp = grp.dropna(subset=["date"])
         if grp.empty:
-            continue
-
+            return []
         grp = grp.sort_values("date")
         x = pd.to_numeric(grp["series"], errors="coerce")
         y = pd.to_numeric(grp["spy"], errors="coerce")
         idx = grp["date"]
-
         sx = pd.Series(x.values, index=idx)
         sy = pd.Series(y.values, index=idx)
 
+        rows = []
         for lag in range(-max_lag, max_lag + 1):
             sy_shift = sy.shift(-lag)
             df_xy = pd.concat({"x": sx, "y": sy_shift}, axis=1).dropna()
@@ -117,7 +118,20 @@ def _collapse_ccf(records: list[tuple], id_col: str, out_path: Optional[str], me
                 continue
             r = df_xy["x"].corr(df_xy["y"], method="spearman")
             if np.isfinite(r):
-                out_rows.append((*keys, metric_name, int(lag), float(r)))
+                rows.append((*keys, metric_name, int(lag), float(r)))
+        return rows
+
+    out_rows = []
+    groups = list(dfrec.groupby([id_col, "signal", "qrank", "target", "bet_size_col"], sort=False))
+    max_workers = None
+    if n_jobs is not None and int(n_jobs) > 0:
+        max_workers = int(n_jobs)
+    else:
+        max_workers = min(8, max(1, len(groups)))
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_one_group, keys, grp) for keys, grp in groups]
+        for fut in as_completed(futs):
+            out_rows.extend(fut.result())
 
     if not out_rows:
         return None
@@ -143,6 +157,7 @@ def compute_market_dist_stats(
     output_dir: str,
     ccf_enable: bool = True,
     ccf_max_lag: int = 5,
+    n_jobs: int | None = None,
 ) -> Dict[str, Optional[str]]:
     """
     Build per-id corr/CCF files vs SPY into `output_dir`.
@@ -260,8 +275,8 @@ def compute_market_dist_stats(
     paths = {
         "raw_corr": _collapse_corr(recs_raw, id_col, raw_corr_path, "alpha_raw_spy_corr"),
         "pnl_corr": _collapse_corr(recs_pnl, id_col, pnl_corr_path, "alpha_pnl_spy_corr"),
-        "raw_ccf": _collapse_ccf(recs_raw, id_col, raw_ccf_path, "alpha_raw_spy_ccf", ccf_max_lag) if ccf_enable else None,
-        "pnl_ccf": _collapse_ccf(recs_pnl, id_col, pnl_ccf_path, "alpha_pnl_spy_ccf", ccf_max_lag) if ccf_enable else None,
+        "raw_ccf": _collapse_ccf(recs_raw, id_col, raw_ccf_path, "alpha_raw_spy_ccf", ccf_max_lag, n_jobs=n_jobs) if ccf_enable else None,
+        "pnl_ccf": _collapse_ccf(recs_pnl, id_col, pnl_ccf_path, "alpha_pnl_spy_ccf", ccf_max_lag, n_jobs=n_jobs) if ccf_enable else None,
     }
     return paths
 
