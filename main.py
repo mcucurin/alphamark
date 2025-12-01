@@ -38,6 +38,24 @@ def _env_or_none(name: str):
     return v if v.strip() else None
 
 
+def _parse_int_tuple(s: str | None):
+    if not s:
+        return None
+    try:
+        parts = [int(x.strip()) for x in str(s).split(",") if x.strip()]
+        if len(parts) == 2:
+            return tuple(parts)
+    except Exception:
+        return None
+    return None
+
+
+def _parse_list(s: str | None):
+    if not s:
+        return None
+    return [x.strip() for x in str(s).split(",") if x.strip()]
+
+
 # =====================================================================
 #                        CENTRALIZED CONFIG
 # =====================================================================
@@ -118,10 +136,11 @@ DEFAULT_PLOT_CONFIG = {
 
     # Heatmap filters for H2/H3:
     #  "AUTO" picks a common value from DAILY (preferring prefixes); otherwise supply explicit lists.
-    "H2_targets": "AUTO",
-    "H2_bets": "AUTO",
-    "H3_targets": "AUTO",
-    "H3_bets": "AUTO",
+    #  These fix the target/bet used for H2/H3 heatmaps + temporal plots.
+    "H2_targets": ["fret_1_MR"],       # default fixed example; override as needed
+    "H2_bets": ["betsize_cap250k"],    # default fixed example; override as needed
+    "H3_targets": ["fret_1_MR"],       # default fixed example; override as needed
+    "H3_bets": ["betsize_cap250k"],    # default fixed example; override as needed
 
     # Smoothing windows (trading days) for H1/H2/H3 temporal line pages
     "roll_h1_lines": 30,
@@ -137,8 +156,8 @@ DEFAULT_PLOT_CONFIG = {
     "roll_sharpe": 60,  # used for optional rolling Sharpe on temporal plots
 
     # Temporal plots (per target/signal/bet)
-    "variables_temporal_plot": ["pnl", "ppd", "nrTrades", "sizeNotional"],  # default set
-    "variables_temporal_extras": [],  # e.g., ["hit_ratio", "long_ratio", "r2", "t_stat"]
+    # Single list: add/remove metrics directly here (defaults preserved)
+    "variables_temporal_plot": ["pnl", "ppd", "nrTrades", "sizeNotional"],
     "arrayDim_temporal_plot": (2, 2),  # rows, cols per temporal page
 
     # Bar plots (SUMMARY ONLY)
@@ -168,6 +187,8 @@ DEFAULT_PLOT_CONFIG = {
 
     # Titles / layout
     "meta_text": None,      # printed top-right on every page; if None, plotting will auto-fill
+    # Temporal plot grid (rows, cols per page)
+    "arrayDim_temporal_plot": (2, 2),
 }
 
 
@@ -182,6 +203,12 @@ if __name__ == '__main__':
     cfg_path = _env_or_none("FP_CONFIG")
     if cfg_path:
         runner_cfg.update(_load_json(cfg_path))
+        plot_cfg.update(_load_json(cfg_path))
+
+    # ---- Optional JSON overrides for plotting only ----
+    plot_cfg_path = _env_or_none("FP_PLOT_CONFIG")
+    if plot_cfg_path:
+        plot_cfg.update(_load_json(plot_cfg_path))
 
     # ---- Env overrides (interval, I/O) ----
     env_start = _env_or_none("FP_INTERVAL_START")
@@ -198,6 +225,26 @@ if __name__ == '__main__':
     env_output_root = _env_or_none("FP_OUTPUT_ROOT")
     if env_output_root is not None:
         runner_cfg["output_root"] = env_output_root
+
+    # ---- Optional env override for temporal plot grid (rows, cols per page) ----
+    env_temp_grid = _env_or_none("FP_TEMPORAL_GRID")
+    parsed_grid = _parse_int_tuple(env_temp_grid)
+    if parsed_grid:
+        plot_cfg["arrayDim_temporal_plot"] = parsed_grid
+
+    # ---- Optional env overrides for H2/H3 filters (targets/bets) ----
+    env_h2_targets = _parse_list(_env_or_none("FP_H2_TARGETS"))
+    env_h2_bets = _parse_list(_env_or_none("FP_H2_BETS"))
+    env_h3_targets = _parse_list(_env_or_none("FP_H3_TARGETS"))
+    env_h3_bets = _parse_list(_env_or_none("FP_H3_BETS"))
+    if env_h2_targets is not None:
+        plot_cfg["H2_targets"] = env_h2_targets
+    if env_h2_bets is not None:
+        plot_cfg["H2_bets"] = env_h2_bets
+    if env_h3_targets is not None:
+        plot_cfg["H3_targets"] = env_h3_targets
+    if env_h3_bets is not None:
+        plot_cfg["H3_bets"] = env_h3_bets
 
     # ---- Keep plotting interval in sync with runner ----
     plot_cfg["interval_start"] = runner_cfg.get("interval_start")

@@ -238,10 +238,36 @@ def _compute_daily_stats_for_one_signal(
                     pnl = float(np.nansum(pnl_vec))
                     notional = float(np.nansum(b[m]))
                     ppd = (pnl / notional) if notional > 0 else np.nan
+
+                    # Extras
+                    hit_ratio = float(np.nanmean(pnl_vec > 0)) if pnl_vec.size else np.nan
+                    long_ratio = float(np.nanmean(sgn[m] > 0)) if sgn[m].size else np.nan
+                    n = int(m.sum())
+                    # Simple cross-sectional regression stats (y on s)
+                    s_vals = s[m].astype('float64', copy=False)
+                    y_vals = y[m].astype('float64', copy=False)
+                    s_mean = np.nanmean(s_vals)
+                    y_mean = np.nanmean(y_vals)
+                    s_dev = s_vals - s_mean
+                    y_dev = y_vals - y_mean
+                    s_var = float(np.nanvar(s_vals, ddof=1)) if n > 1 else np.nan
+                    cov = float(np.nanmean(s_dev * y_dev)) if n > 0 else np.nan
+                    beta = (cov / s_var) if (np.isfinite(cov) and np.isfinite(s_var) and s_var > 0) else np.nan
+                    s_std = math.sqrt(s_var) if np.isfinite(s_var) and s_var > 0 else np.nan
+                    y_std = float(np.nanstd(y_vals, ddof=1)) if n > 1 else np.nan
+                    r = (cov / (s_std * y_std)) if (np.isfinite(cov) and np.isfinite(s_std) and np.isfinite(y_std) and s_std > 0 and y_std > 0) else np.nan
+                    r2 = float(r * r) if np.isfinite(r) else np.nan
+                    t_stat = (r * math.sqrt(n - 2) / math.sqrt(1 - r * r)) if (np.isfinite(r) and n > 2 and (1 - r * r) > 0) else np.nan
+                    sharpe = (np.nanmean(pnl_vec) / np.nanstd(pnl_vec, ddof=1)) if (pnl_vec.size > 1 and np.nanstd(pnl_vec, ddof=1) > 0) else np.nan
                 else:
                     pnl = 0.0
                     notional = 0.0
                     ppd = np.nan
+                    hit_ratio = np.nan
+                    long_ratio = np.nan
+                    r2 = np.nan
+                    t_stat = np.nan
+                    sharpe = np.nan
 
                 stats['pnl'][signal][qlabel][target][bet]          = pnl
                 stats['ppd'][signal][qlabel][target][bet]          = ppd
@@ -249,6 +275,11 @@ def _compute_daily_stats_for_one_signal(
                 stats['nrInstr'][signal][qlabel][target][bet]      = nr_instr_today
                 ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
                 stats['n_trades'][signal][qlabel][target][bet]     = ntr
+                stats['hit_ratio'][signal][qlabel][target][bet]    = hit_ratio
+                stats['long_ratio'][signal][qlabel][target][bet]   = long_ratio
+                stats['r2'][signal][qlabel][target][bet]           = r2
+                stats['t_stat'][signal][qlabel][target][bet]       = t_stat
+                stats['sharpe'][signal][qlabel][target][bet]       = sharpe
 
     # Optional raw distributions (thin sampling) per signal
     if enable_distributions:
