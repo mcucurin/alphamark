@@ -114,7 +114,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
      quantiles, type_quantile, do_daily, do_summary, do_outliers, add_spearman, add_dcor,
      spearman_sample_cap_per_key, dump_alpha_raw_per_id, dump_alpha_pnl_per_id,
      ccf_enable, ccf_max_lag, dump_alpha_raw_ccf_per_id, dump_alpha_pnl_ccf_per_id,
-     outlier_metrics, outlier_z_thresh, empty_day_policy,
+        outlier_metrics, empty_day_policy,
      report_empty_trades_as_nan, n_jobs_io, n_jobs_daily, n_jobs_summary, random_state,
      interval_start, interval_end) = (
         local_cfg["features_input_dir"], local_cfg["features_glob"], local_cfg["output_root"],
@@ -127,7 +127,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         local_cfg["dump_alpha_raw_per_id"], local_cfg["dump_alpha_pnl_per_id"],
         local_cfg["ccf_enable"], local_cfg["ccf_max_lag"],
         local_cfg["dump_alpha_raw_ccf_per_id"], local_cfg["dump_alpha_pnl_ccf_per_id"],
-        local_cfg["outlier_metrics"], local_cfg["outlier_z_thresh"], local_cfg["empty_day_policy"],
+        local_cfg["outlier_metrics"], local_cfg["empty_day_policy"],
         local_cfg["report_empty_trades_as_nan"], local_cfg["n_jobs_io"], local_cfg["n_jobs_daily"],
         local_cfg["n_jobs_summary"], local_cfg["random_state"],
         local_cfg["interval_start"], local_cfg["interval_end"]
@@ -363,6 +363,24 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
             first_day = pd.to_datetime(all_days.min())
             last_day = pd.to_datetime(all_days.max())
 
+            # Optional per-id CCF dump paths (stored in MDS_STATS/per_ticker_dir)
+            dump_raw_ccf = (
+                os.path.join(
+                    PER_TICKER_DIR,
+                    f"mds_alpha_raw_spy_ccf_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
+                )
+                if (spy_by_target_effective and ccf_enable and dump_alpha_raw_ccf_per_id)
+                else None
+            )
+            dump_pnl_ccf = (
+                os.path.join(
+                    PER_TICKER_DIR,
+                    f"mds_alpha_pnl_spy_ccf_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
+                )
+                if (spy_by_target_effective and ccf_enable and dump_alpha_pnl_ccf_per_id)
+                else None
+            )
+
             summary = compute_summary_stats_over_days(
                 big_df,
                 date_col="date",
@@ -377,6 +395,13 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                 spearman_sample_cap_per_key=spearman_sample_cap_per_key,
                 random_state=random_state,
                 spy_by_target=spy_by_target_effective if spy_by_target_effective else None,
+                # per-ID CCF dumps (corr dumps remain disabled unless added back later)
+                id_col="ticker",
+                dump_alpha_raw_corr_path=None,
+                dump_alpha_pnl_corr_path=None,
+                dump_alpha_raw_ccf_path=dump_raw_ccf,
+                dump_alpha_pnl_ccf_path=dump_pnl_ccf,
+                ccf_max_lag=ccf_max_lag if ccf_enable else 0,
             )
 
             # flatten summary -> rows; tag with date range
@@ -427,7 +452,6 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         odf = compute_outliers(
             stats_all,
             stats_list=outlier_metrics,
-            z_thresh=outlier_z_thresh,
         )
         print(f"[info] outlier metrics requested: {outlier_metrics}")
         print(f"[info] stat_types present in DAILY: {sorted(stats_all['stat_type'].dropna().astype(str).unique().tolist())}")

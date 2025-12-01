@@ -218,37 +218,44 @@ def compute_market_dist_stats(
 
                 for t_name in tgts:
                     spy_col = eff_spy_map.get(t_name)
-                    if not spy_col:
-                        continue
-                    spy_vals = np.asarray(day[spy_col], float)
-                    spy_v = np.nanmean(spy_vals) if spy_vals.size else np.nan
-                    if not np.isfinite(spy_v):
-                        continue
+                spy_col = eff_spy_map.get(t_name)
+                if not spy_col:
+                    continue
+                spy_vals = np.asarray(day[spy_col], float)
+                spy_v = np.nanmean(spy_vals) if spy_vals.size else np.nan
+                if not np.isfinite(spy_v):
+                    continue
 
-                    y = np.asarray(day[t_name], float)[mask_q]
-                    yfin = np.isfinite(y)
-                    if not yfin.any():
-                        continue
+                y = np.asarray(day[t_name], float)[mask_q]
+                if not np.isfinite(y).any():
+                    continue
 
-                    if recs_raw is not None:
-                        raw_per_id = pd.DataFrame({id_col: ids_q, "alpha_raw": s_q}).groupby(id_col)["alpha_raw"].mean()
-                        for name_i, val in raw_per_id.items():
-                            if np.isfinite(val):
-                                recs_raw.append(
-                                    (str(name_i), s_name, _qlabel(q), t_name, "__RAW__", pd.Timestamp(dt), float(val), float(spy_v))
-                                )
+                df_base = pd.DataFrame({
+                    id_col: ids_q,
+                    "alpha_raw": s_q,
+                    "pnl_raw": y * sign_s[mask_q],
+                })
 
-                    if recs_pnl is not None:
-                        for b_name in bets:
-                            bcol = np.asarray(day[b_name], float)[mask_q]
-                            bcol = np.where(np.isfinite(bcol), np.abs(bcol), np.nan)
-                            pnl_row = y * sign_s[mask_q] * bcol
-                            pnl_per_id = pd.DataFrame({id_col: ids_q, "pnl": pnl_row}).groupby(id_col)["pnl"].sum()
-                            for name_i, val in pnl_per_id.items():
-                                if np.isfinite(val):
-                                    recs_pnl.append(
-                                        (str(name_i), s_name, _qlabel(q), t_name, b_name, pd.Timestamp(dt), float(val), float(spy_v))
-                                    )
+                if recs_raw is not None:
+                    raw_per_id = df_base.groupby(id_col, sort=False)["alpha_raw"].mean()
+                    recs_raw.extend([
+                        (str(name_i), s_name, _qlabel(q), t_name, "__RAW__", pd.Timestamp(dt), float(val), float(spy_v))
+                        for name_i, val in raw_per_id.items() if np.isfinite(val)
+                    ])
+
+                if recs_pnl is not None:
+                    for b_name in bets:
+                        bcol = np.asarray(day[b_name], float)[mask_q]
+                        bcol = np.where(np.isfinite(bcol), np.abs(bcol), np.nan)
+                        if not np.isfinite(bcol).any():
+                            continue
+                        df_p = df_base.copy()
+                        df_p["pnl"] = df_p["pnl_raw"] * bcol
+                        pnl_per_id = df_p.groupby(id_col, sort=False)["pnl"].sum()
+                        recs_pnl.extend([
+                            (str(name_i), s_name, _qlabel(q), t_name, b_name, pd.Timestamp(dt), float(val), float(spy_v))
+                            for name_i, val in pnl_per_id.items() if np.isfinite(val)
+                        ])
 
     paths = {
         "raw_corr": _collapse_corr(recs_raw, id_col, raw_corr_path, "alpha_raw_spy_corr"),

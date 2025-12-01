@@ -107,8 +107,7 @@ DEFAULT_RUNNER_CONFIG = {
     "dump_alpha_pnl_ccf_per_id": False,
 
     # -------- Outliers --------
-    "outlier_metrics": ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades"],
-    "outlier_z_thresh": None,  # ignored; outliers are ranked by |z| with no threshold
+    "outlier_metrics": ["pnl", "ppd", "sizeNotional", "n_trades"],
 
     # -------- Daily behavior --------
     "empty_day_policy": "carry",        # "carry" | "close" | "skip"
@@ -125,7 +124,7 @@ DEFAULT_RUNNER_CONFIG = {
     # -------- Interval filter (inclusive) --------
     # Accepts many formats: "2021-01-01", "01/01/2021", "20210101"
     "interval_start": None,
-    "interval_end": None,
+    "interval_end": None
 }
 
 # ---- Plotting / report config (moved from plot_quantile_bars.CONFIG) ----
@@ -171,9 +170,9 @@ DEFAULT_PLOT_CONFIG = {
 
     # Outliers (compact)
     # (Directory will be filled in from pipeline result; only behavior lives here.)
-    "outlier_metrics_for_tables": ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades"],
+    "outlier_metrics_for_tables": ["pnl", "ppd", "sizeNotional", "n_trades"],
     "outlier_top_k": 3,
-    "outlier_tables_per_page": 3,  # compact 2-3 per page works well
+    "outlier_tables_per_page": 2,  # compact 2-3 per page works well
 
     # Styles (secondary is dotted)
     "style_first": "-",     # solid
@@ -182,7 +181,7 @@ DEFAULT_PLOT_CONFIG = {
 
     # CCF (cross-correlation vs SPY) plots using per-ticker dumps in per_ticker_dir
     # MAX_LAG = ccf_max_lag; we use lags in [-MAX_LAG, ..., +MAX_LAG]
-    "ccf_enable": True,
+    "ccf_enable": False,
     "ccf_max_lag": 5,
 
     # Titles / layout
