@@ -1008,14 +1008,11 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
     for page_idx in range(0, len(tables), per_page):
         chunk = tables[page_idx:page_idx + per_page]
         fig = plt.figure(figsize=(14, 8.5))
-        fig.suptitle("Outlier Tables (compact)", fontsize=18, weight='bold', y=0.985)
-        if page_idx == 0:
-            subtitle = f"Metrics: {', '.join([m for m, _, _ in tables])} | Top-K by z-score: {top_k}"
-            fig.text(0.03, 0.955, subtitle, ha='left', va='top', fontsize=11, color='0.25')
+        fig.suptitle("Outlier Tables", fontsize=18, weight='bold', y=0.985)
         gs = GridSpec(nrows=len(chunk), ncols=1, figure=fig, left=0.03, right=0.97, top=0.90, bottom=0.06, hspace=0.35)
         for row_idx, (metric_name, col_labels, rows) in enumerate(chunk):
             ax = fig.add_subplot(gs[row_idx, 0])
-            _draw_table_in_axis(ax, title=f"{metric_name} — Top {top_k} Highs & Lows",
+            _draw_table_in_axis(ax, title=f"{metric_name} — Top Highs & Lows",
                                 col_labels=col_labels, rows=rows, fontsize=9)
         savefig_white(pdf, fig)
 
@@ -1213,7 +1210,7 @@ def _plot_temporal_grid(pdf,
                 )
 
         fig.suptitle(
-            f"{title_prefix} — Temporal metrics ({page_idx}/{n_pages})",
+            f"{title_prefix} — Temporal metrics",
             fontsize=16,
             weight="bold",
             y=0.97,
@@ -1609,9 +1606,9 @@ def generate_quantile_report(config: dict):
                 fig, axs = plt.subplots(n_rows, n_cols, figsize=(PAGE_SIZE[0], fig_height))
                 axs = np.atleast_1d(axs).ravel()
                 main_title = "Bar Plots | " + " ".join(title_bits)
-                fig.suptitle(main_title, fontsize=16, weight='bold', y=0.968)
+                fig.suptitle(main_title, fontsize=16, weight='bold', y=0.97)
                 xlabel_descr = " | ".join(bar_x_vars) if bar_x_vars else "ALL"
-                fig.text(0.5, 0.94, f"X-axis: {xlabel_descr}", ha="center", va="top", fontsize=10, color="0.35", weight='bold')
+                fig.text(0.5, 0.92, f"X-axis: {xlabel_descr}", ha="center", va="top", fontsize=10, color="0.35", weight='bold')
 
                 legend_handles = []
                 legend_labels = []
@@ -1740,14 +1737,14 @@ def generate_quantile_report(config: dict):
                         legend_handles,
                         legend_labels,
                         title='Quantile (color)',
-                        bbox_to_anchor=(0.5, 0.90),
+                        bbox_to_anchor=(0.5, 0.905),
                         loc='upper center',
                         ncol=len(legend_handles),
                         fontsize=9,
                         frameon=True,
                     )
 
-                plt.tight_layout(rect=[0.05, 0.08, 0.95, 0.80], h_pad=2.6)
+                plt.tight_layout(rect=[0.05, 0.10, 0.95, 0.80], h_pad=2.8)
                 savefig_white(pdf, fig)
 
         # ---------- Heatmap 1 (Spearman; raw alpha base) ----------

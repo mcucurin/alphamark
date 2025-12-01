@@ -17,7 +17,6 @@ import pandas as pd
 from pipeline.daily_stats import compute_daily_stats
 from pipeline.summary_stats import compute_summary_stats_over_days
 from pipeline.outliers_stats import compute_outliers, save_outliers
-from pipeline.market_dist_stats import compute_market_dist_stats
 
 
 def _dirpaths(output_root: str):
@@ -135,7 +134,6 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     )
 
     DAILY_STATS_DIR, SUMMARY_STATS_DIR, OUTLIERS_DIR, PER_TICKER_DIR = _ensure_dirs(output_root)
-    mds_paths: Dict[str, Optional[str]] = {}
 
     # Parse interval (inclusive)
     START_DT, END_DT = _parse_interval(interval_start, interval_end)
@@ -407,29 +405,6 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                 _atomic_pickle_dump(summary_df, summary_path)
                 print(f"✅ Saved summary stats PKL -> {summary_path} ({len(summary_df)} rows)")
 
-            # Independent per-id market distribution stats (corr/CCF) into MDS_STATS
-            want_mds = (
-                spy_by_target_effective
-                and (
-                    dump_alpha_raw_per_id
-                    or dump_alpha_pnl_per_id
-                    or (ccf_enable and (dump_alpha_raw_ccf_per_id or dump_alpha_pnl_ccf_per_id))
-                )
-            )
-            if want_mds:
-                mds_paths = compute_market_dist_stats(
-                    big_df,
-                    date_col="date",
-                    id_col="ticker",
-                    signal_cols=sig_list,
-                    target_cols=tgt_list,
-                    bet_size_cols=bet_list,
-                    quantiles=quantiles,
-                    spy_by_target=spy_by_target_effective,
-                    output_dir=PER_TICKER_DIR,
-                    ccf_enable=ccf_enable and (dump_alpha_raw_ccf_per_id or dump_alpha_pnl_ccf_per_id),
-                    ccf_max_lag=ccf_max_lag if ccf_enable else 0,
-                )
             else:
                 print("[info] Summary produced no rows; not saving.")
         else:
@@ -487,7 +462,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         "outliers_dir": OUTLIERS_DIR,
         "per_ticker_dir": PER_TICKER_DIR,
         "market_dist_dir": PER_TICKER_DIR,
-        "market_dist_paths": mds_paths,
+        "market_dist_paths": {},
         "index_csv": index_csv,
         "index_pkl": index_pkl,
         "elapsed_sec": elapsed,

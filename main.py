@@ -77,20 +77,20 @@ DEFAULT_RUNNER_CONFIG = {
     "spearman_sample_cap_per_key": 10000,
 
     # -------- Per-ID (ticker) corr dump toggles --------
-    "dump_alpha_raw_per_id": True,
-    "dump_alpha_pnl_per_id": True,
+    "dump_alpha_raw_per_id": False,
+    "dump_alpha_pnl_per_id": False,
 
     # -------- Per-ID CCF (alpha vs SPY) dump toggles --------
     # These are consumed inside the runner when calling compute_summary_stats_over_days
     # and will generate per_ticker_alpha_*_spy_ccf_*.pkl in per_ticker_dir.
-    "ccf_enable": True,
+    "ccf_enable": False,
     "ccf_max_lag": 5,
-    "dump_alpha_raw_ccf_per_id": True,
-    "dump_alpha_pnl_ccf_per_id": True,
+    "dump_alpha_raw_ccf_per_id": False,
+    "dump_alpha_pnl_ccf_per_id": False,
 
     # -------- Outliers --------
     "outlier_metrics": ["pnl", "ppd", "sizeNotional", "nrInstr", "n_trades"],
-    "outlier_z_thresh": 3.0,
+    "outlier_z_thresh": None,  # ignored; outliers are ranked by |z| with no threshold
 
     # -------- Daily behavior --------
     "empty_day_policy": "carry",        # "carry" | "close" | "skip"
@@ -106,7 +106,7 @@ DEFAULT_RUNNER_CONFIG = {
 
     # -------- Interval filter (inclusive) --------
     # Accepts many formats: "2021-01-01", "01/01/2021", "20210101"
-    "interval_start": "2021-12-01",
+    "interval_start": None,
     "interval_end": None,
 }
 
@@ -272,6 +272,7 @@ if __name__ == '__main__':
     output_root = runner_cfg["output_root"]
     plot_cfg["daily_dir"] = daily_dir
     plot_cfg["summary_dir"] = summary_dir
+    # Provide per-ticker/MDS directory (plotting can choose to use or ignore)
     plot_cfg["per_ticker_dir"] = market_dist_dir
     plot_cfg["outliers_dir"] = outliers_dir
     plot_cfg["output_pdf"] = os.path.join(output_root, "Quantile_Combined_Report.pdf")
