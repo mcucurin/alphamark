@@ -62,132 +62,278 @@ def _parse_list(s: str | None):
 
 # ---- Runner / pipeline config (moved from runner.DEFAULT_CONFIG) ----
 DEFAULT_RUNNER_CONFIG = {
-    # -------- I/O --------
+    # ========== I/O Configuration ==========
+    # Directory containing input feature pickle files (one per day)
     "features_input_dir": "input/DAILY_FEATURES_PKL",
+    
+    # Glob pattern to match feature files within features_input_dir
+    # Example: "features_*.pkl" matches all files starting with "features_" and ending with ".pkl"
     "features_glob": "features_*.pkl",
+    
+    # Root directory for all pipeline outputs (daily stats, summary stats, outliers, etc.)
     "output_root": "output",
 
-    # -------- Column selection --------
+    # ========== Column Selection ==========
+    # Prefix to identify signal columns in input data (e.g., "pret_" matches "pret_signal1")
     "signal_prefix": "pret_",
+    
+    # Prefix to identify target/forward return columns (e.g., "fret_" matches "fret_1_MR")
     "target_prefix": "fret_",
+    
+    # Prefix to identify bet size columns (e.g., "betsize_" matches "betsize_cap250k")
     "bet_prefix": "betsize_",
+    
+    # Optional regex pattern to further filter signal columns (None = use all matching prefix)
+    # Example: r"pret_signal.*" to match only signals starting with "pret_signal"
     "signal_regex": None,
+    
+    # Optional regex pattern to further filter target columns (None = use all matching prefix)
     "target_regex": None,
+    
+    # Optional regex pattern to further filter bet size columns (None = use all matching prefix)
     "bet_regex": None,
 
-    # -------- Market proxy (per-target SPY columns) --------
+    # ========== Market Proxy (SPY) Configuration ==========
+    # Ticker symbol for market proxy (typically "SPY" for S&P 500 ETF)
     "spy_ticker": "SPY",
-    "spy_col_base": "spy",              # per-target columns are f"{spy_col_base}__{target}"
+    
+    # Base name for per-target SPY columns. Final column names are: f"{spy_col_base}__{target}"
+    # Example: if spy_col_base="spy" and target="fret_1_MR", column becomes "spy__fret_1_MR"
+    "spy_col_base": "spy",
+    
+    # Single SPY return column name (used when no per-target SPY columns are available)
     "spy_single_name": "spy_ret",
 
-    # -------- Quantiles --------
+    # ========== Quantile Configuration ==========
+    # List of quantile thresholds to compute (values between 0 and 1)
+    # Example: [1.0, 0.75, 0.5, 0.25] creates top 100%, top 25%, top 50%, top 75% quantiles
     "quantiles": [1.0, 0.75, 0.5, 0.25],
-    "type_quantile": "cumulative",      # "cumulative" | "quantEach"
+    
+    # Quantile computation method:
+    #   "cumulative" = quantile represents >= threshold (e.g., qr_75 = top 25% of signals)
+    #   "quantEach" = quantile represents exact bucket boundaries
+    "type_quantile": "cumulative",
 
-    # -------- Toggles --------
+    # ========== Pipeline Stage Toggles ==========
+    # If True, compute daily statistics (one file per day)
     "do_daily": True,
+    
+    # If True, compute summary statistics aggregated across all days
     "do_summary": True,
+    
+    # If True, compute outlier statistics (extreme values per metric)
     "do_outliers": True,
 
-    # -------- Summary extras --------
+    # ========== Summary Statistics Extras ==========
+    # If True, compute Spearman rank correlation in addition to Pearson correlation
+    # Note: Can be computationally expensive for large datasets
     "add_spearman": False,
+    
+    # If True, compute distance correlation (dCor) in addition to Pearson correlation
+    # Note: Can be computationally expensive for large datasets
     "add_dcor": False,
+    
+    # Maximum number of samples per key when computing Spearman correlation
+    # Used to cap computation time for large datasets
     "spearman_sample_cap_per_key": 10000,
 
-    # -------- Per-ID (ticker) corr dump toggles --------
+    # ========== Per-ID (Ticker) Correlation Dump Toggles ==========
+    # If True, save per-ticker correlation data between raw alpha (signal values) and SPY returns
+    # Output: per_ticker_alpha_raw_spy_corr_*.pkl in per_ticker_dir
+    # Note: Currently not fully implemented in runner (set to None internally)
     "dump_alpha_raw_per_id": False,
+    
+    # If True, save per-ticker correlation data between PnL and SPY returns
+    # Output: per_ticker_alpha_pnl_spy_corr_*.pkl in per_ticker_dir
+    # Note: Currently not fully implemented in runner (set to None internally)
     "dump_alpha_pnl_per_id": False,
 
-    # -------- Per-ID CCF (alpha vs SPY) dump toggles --------
-    # These are consumed inside the runner when calling compute_summary_stats_over_days
-    # and will generate per_ticker_alpha_*_spy_ccf_*.pkl in per_ticker_dir.
+    # ========== Per-ID CCF (Cross-Correlation Function) Dump Toggles ==========
+    # If True, enable cross-correlation function computation between signals/PnL and SPY
+    # CCF analyzes lead/lag relationships across multiple time lags
     "ccf_enable": False,
+    
+    # Maximum lag (in days) for CCF computation. Lags range from -ccf_max_lag to +ccf_max_lag
+    # Example: ccf_max_lag=5 analyzes lags from -5 to +5 days
     "ccf_max_lag": 5,
+    
+    # If True, save per-ticker CCF data between raw alpha and SPY across multiple lags
+    # Output: mds_alpha_raw_spy_ccf_*.pkl in per_ticker_dir
+    # Requires: ccf_enable=True
     "dump_alpha_raw_ccf_per_id": False,
+    
+    # If True, save per-ticker CCF data between PnL and SPY across multiple lags
+    # Output: mds_alpha_pnl_spy_ccf_*.pkl in per_ticker_dir
+    # Requires: ccf_enable=True
     "dump_alpha_pnl_ccf_per_id": False,
 
-    # -------- Outliers --------
+    # ========== Outlier Detection ==========
+    # List of metrics to analyze for outliers (extreme values)
+    # Common metrics: "pnl" (profit/loss), "ppd" (profit per dollar), "sizeNotional" (position size), "n_trades" (number of trades)
     "outlier_metrics": ["pnl", "ppd", "sizeNotional", "n_trades"],
 
-    # -------- Daily behavior --------
-    "empty_day_policy": "carry",        # "carry" | "close" | "skip"
+    # ========== Daily Processing Behavior ==========
+    # Policy for handling days with no valid trades:
+    #   "carry" = carry forward positions from previous day
+    #   "close" = close all positions at end of day
+    #   "skip" = skip the day entirely
+    "empty_day_policy": "carry",
+    
+    # If True, report empty trading days as NaN values instead of zeros
     "report_empty_trades_as_nan": True,
 
-    # -------- Parallelism --------
+    # ========== Parallelism Configuration ==========
+    # Number of parallel jobs for I/O operations (loading feature files)
     "n_jobs_io": 1,
+    
+    # Number of parallel jobs for daily statistics computation
     "n_jobs_daily": 3,
+    
+    # Number of parallel jobs for summary statistics computation
     "n_jobs_summary": 3,
 
-    # -------- Reproducibility --------
+    # ========== Reproducibility ==========
+    # Random seed for any random operations (e.g., sampling for Spearman correlation)
     "random_state": 123,
 
-    # -------- Interval filter (inclusive) --------
-    # Accepts many formats: "2021-01-01", "01/01/2021", "20210101"
-    "interval_start": None,
-    "interval_end": None
+    # ========== Date Range Filter (Inclusive) ==========
+    # Start date for filtering input data (inclusive). Accepts multiple formats:
+    #   "2021-01-01" (ISO format)
+    #   "01/01/2021" (US format)
+    #   "20210101" (compact format)
+    # This date range is applied during pipeline processing AND plotting
+    "interval_start": "2020-01-01",
+    
+    # End date for filtering input data (inclusive). Same format options as interval_start
+    # This date range is applied during pipeline processing AND plotting
+    "interval_end": "2021-01-01"
 }
 
 # ---- Plotting / report config (moved from plot_quantile_bars.CONFIG) ----
 DEFAULT_PLOT_CONFIG = {
-    # Quantiles to display (max ~4 looks best)
+    # ========== Quantile Display Configuration ==========
+    # List of quantile ranks to display in plots (maximum ~4 quantiles recommended for readability)
+    # Quantile ranks correspond to the quantiles defined in DEFAULT_RUNNER_CONFIG
+    # Example: ["qr_100", "qr_75", "qr_50", "qr_25"] displays all 4 quantile levels
     "qranks": ["qr_100", "qr_75", "qr_50", "qr_25"],
+    
+    # If True, allow plotting even if some requested qranks are missing from data
+    # If False, missing qranks will cause warnings and be ignored
     "allow_missing_qranks": False,
 
-    # Heatmap filters for H2/H3:
-    #  "AUTO" picks a common value from DAILY (preferring prefixes); otherwise supply explicit lists.
-    #  These fix the target/bet used for H2/H3 heatmaps + temporal plots.
-    "H2_targets": ["fret_1_MR"],       # default fixed example; override as needed
-    "H2_bets": ["betsize_cap250k"],    # default fixed example; override as needed
-    "H3_targets": ["fret_1_MR"],       # default fixed example; override as needed
-    "H3_bets": ["betsize_cap250k"],    # default fixed example; override as needed
+    # ========== Heatmap Filter Configuration (H2/H3) ==========
+    # Target columns to use for H2 heatmap (per-quantile PnL daily cross-section correlation)
+    # Set to "AUTO" to automatically pick common values from DAILY data (preferring prefixes)
+    # Or provide explicit list: ["fret_1_MR", "fret_5_MR"] to use specific targets
+    "H2_targets": ["fret_1_MR"],
+    
+    # Bet size columns to use for H2 heatmap
+    # Set to "AUTO" for automatic selection, or provide explicit list
+    "H2_bets": ["betsize_cap250k"],
+    
+    # Target columns to use for H3 heatmap (per-quantile time-series correlation of summed daily PnL)
+    # Set to "AUTO" for automatic selection, or provide explicit list
+    "H3_targets": ["fret_1_MR"],
+    
+    # Bet size columns to use for H3 heatmap
+    # Set to "AUTO" for automatic selection, or provide explicit list
+    "H3_bets": ["betsize_cap250k"],
 
-    # Smoothing windows (trading days) for H1/H2/H3 temporal line pages
+    # ========== Temporal Line Smoothing Windows ==========
+    # Rolling window (in trading days) for smoothing H1 temporal line plots
+    # H1 shows average daily cross-section correlation across alphas
     "roll_h1_lines": 30,
+    
+    # Rolling window (in trading days) for smoothing H2 temporal line plots
+    # H2 shows per-quantile PnL daily cross-section correlation
     "roll_h2_lines": 30,
-    "roll_h3_lines": 1,  # 1 => "expanding" style in code below
+    
+    # Rolling window (in trading days) for smoothing H3 temporal line plots
+    # H3 shows per-quantile time-series correlation of summed daily PnL vectors
+    # Note: Setting to 1 creates an "expanding" style (cumulative from start)
+    "roll_h3_lines": 1,
 
-    # Rolling windows for temporal panels
+    # ========== Rolling Windows for Temporal Panels ==========
+    # Rolling window (in trading days) for number of instruments metric
+    # Set to 1 for no smoothing (raw daily values)
     "roll_nrinstr": 1,
+    
+    # Rolling window (in trading days) for profit per dollar (PPD) metric
     "roll_ppd": 1,
+    
+    # Rolling window (in trading days) for number of trades metric
     "roll_trades": 1,
+    
+    # Rolling window (in trading days) for profit and loss (PnL) metric
     "roll_pnl": 1,
+    
+    # Rolling window (in trading days) for size notional metric
     "roll_size_notional": 1,
-    "roll_sharpe": 60,  # used for optional rolling Sharpe on temporal plots
+    
+    # Rolling window (in trading days) for Sharpe ratio metric
+    # Used for optional rolling Sharpe display on temporal plots
+    "roll_sharpe": 60,
 
-    # Temporal plots (per target/signal/bet)
-    # Single list: add/remove metrics directly here (defaults preserved)
+    # ========== Temporal Plot Configuration ==========
+    # List of metrics to display in temporal plots (per target/signal/bet combination)
+    # Available metrics: "pnl", "ppd", "nrTrades", "sizeNotional", "sharpe", etc.
+    # Add or remove metrics from this list to customize temporal plot pages
     "variables_temporal_plot": ["pnl", "ppd", "nrTrades", "sizeNotional"],
-    "arrayDim_temporal_plot": (2, 2),  # rows, cols per temporal page
+    
+    # Grid dimensions for temporal plot pages: (rows, columns) per page
+    # Example: (2, 2) creates a 2x2 grid with 4 subplots per page
+    "arrayDim_temporal_plot": (2, 2),
 
-    # Bar plots (SUMMARY ONLY)
-    "bar_page_vars": ["signal", "bet_size_col"],   # facets
-    "bar_x_vars": ["target"],                      # x-axis grouping
+    # ========== Bar Plot Configuration (SUMMARY Data Only) ==========
+    # Faceting variables for bar plots (creates separate pages/facets for each combination)
+    # Example: ["signal", "bet_size_col"] creates one page per signal/bet combination
+    "bar_page_vars": ["signal", "bet_size_col"],
+    
+    # X-axis grouping variable for bar plots
+    # Example: ["target"] groups bars by target column
+    "bar_x_vars": ["target"],
+    
+    # List of metrics to display in bar plots
+    # Available metrics: "pnl", "ppd", "sharpe", "hit_ratio", "long_ratio", 
+    #                    "sizeNotional", "r2", "t_stat", "n_trades", "market_corr"
     "bar_metrics": [
         "pnl", "ppd", "sharpe", "hit_ratio", "long_ratio",
         "sizeNotional", "r2", "t_stat", "n_trades", "market_corr"
     ],
-    "aspect_ratio_barplots": 16 / 9,  # widescreen layout for bar pages
+    
+    # Aspect ratio (width/height) for bar plot pages
+    # 16/9 creates widescreen layout suitable for presentations
+    "aspect_ratio_barplots": 16 / 9,
 
-    # Outliers (compact)
-    # (Directory will be filled in from pipeline result; only behavior lives here.)
+    # ========== Outlier Table Configuration ==========
+    # List of metrics to analyze for outliers in compact table format
+    # These tables show top/bottom K extreme values per metric
     "outlier_metrics_for_tables": ["pnl", "ppd", "sizeNotional", "n_trades"],
+    
+    # Number of top and bottom outliers to display per metric (K)
+    # Example: outlier_top_k=3 shows top 3 and bottom 3 outliers
     "outlier_top_k": 3,
-    "outlier_tables_per_page": 2,  # compact 2-3 per page works well
+    
+    # Number of outlier tables to display per PDF page
+    # Recommended: 2-3 tables per page for compact, readable layout
+    "outlier_tables_per_page": 2,
 
-    # Styles (secondary is dotted)
-    "style_first": "-",     # solid
-    "style_second": ":",    # dotted
-    "quantile_colors": {"qr_100": "red", "qr_75": "green", "qr_50": "blue",  "qr_25": "black"},
+    # ========== Plot Styling ==========
+    # Line style for primary/primary quantile lines (matplotlib format)
+    # "-" = solid line, "--" = dashed, "-." = dash-dot, ":" = dotted
+    "style_first": "-",
+    
+    # Line style for secondary quantile lines
+    "style_second": ":",
+    
+    # Color mapping for quantile ranks (matplotlib color names or hex codes)
+    # Maps quantile rank labels to colors for consistent visualization
+    "quantile_colors": {"qr_100": "red", "qr_75": "green", "qr_50": "blue", "qr_25": "black"},
 
-    # CCF (cross-correlation vs SPY) plots using per-ticker dumps in per_ticker_dir
-    # MAX_LAG = ccf_max_lag; we use lags in [-MAX_LAG, ..., +MAX_LAG]
-    "ccf_enable": False,
-    "ccf_max_lag": 5,
-
-    # Titles / layout
-    "meta_text": None,      # printed top-right on every page; if None, plotting will auto-fill
-    # Temporal plot grid (rows, cols per page)
-    "arrayDim_temporal_plot": (2, 2),
+    # ========== Layout and Metadata ==========
+    # Custom text to display in top-right corner of every PDF page
+    # If None, plotting module will auto-generate text showing date window and number of days
+    "meta_text": None
 }
 
 

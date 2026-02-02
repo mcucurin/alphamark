@@ -181,8 +181,76 @@ def read_pickle_compat(path: str):
         return NPCompatUnpickler(f).load()
 
 
-def _load_data(daily_dir: str, summary_dir: str):
-    """Load DAILY and SUMMARY PKLs from the provided directories."""
+def _parse_date_range(interval_start: str | None, interval_end: str | None):
+    """
+    Parse date range strings into normalized pd.Timestamps.
+    
+    Args:
+        interval_start: Optional start date string (accepts formats like "2021-01-01", "01/01/2021", "20210101")
+        interval_end: Optional end date string (accepts formats like "2021-01-01", "01/01/2021", "20210101")
+    
+    Returns:
+        Tuple of (start_dt, end_dt) as pd.Timestamp objects, or (None, None) if parsing fails
+    """
+    def _parse_date(date_str):
+        """Parse date string into normalized pd.Timestamp."""
+        if date_str is None:
+            return None
+        try:
+            dt = pd.to_datetime(date_str, errors="coerce")
+            if pd.isna(dt):
+                return None
+            return pd.Timestamp(dt).normalize()
+        except Exception:
+            return None
+    
+    start_dt = _parse_date(interval_start)
+    end_dt = _parse_date(interval_end)
+    
+    if start_dt is not None and end_dt is not None and end_dt < start_dt:
+        # Swap if user reversed them
+        start_dt, end_dt = end_dt, start_dt
+    
+    return start_dt, end_dt
+
+
+def _filter_by_date_range(df: pd.DataFrame, start_dt: pd.Timestamp | None, end_dt: pd.Timestamp | None, data_type: str = "data"):
+    """
+    Filter DataFrame by date range.
+    
+    Args:
+        df: DataFrame with a 'date' column
+        start_dt: Optional start date (inclusive)
+        end_dt: Optional end date (inclusive)
+        data_type: Label for logging (e.g., "daily data", "summary data")
+    
+    Returns:
+        Filtered DataFrame
+    """
+    if start_dt is not None:
+        df = df[df["date"] >= start_dt]
+        print(f"[INFO] Filtered {data_type}: start >= {start_dt:%Y-%m-%d}")
+    
+    if end_dt is not None:
+        df = df[df["date"] <= end_dt]
+        print(f"[INFO] Filtered {data_type}: end <= {end_dt:%Y-%m-%d}")
+    
+    return df
+
+
+def _load_data(daily_dir: str, summary_dir: str, interval_start: str | None = None, interval_end: str | None = None):
+    """
+    Load DAILY and SUMMARY PKLs from the provided directories.
+    
+    Args:
+        daily_dir: Directory containing daily stats PKL files
+        summary_dir: Directory containing summary stats PKL files
+        interval_start: Optional start date for filtering (inclusive). Accepts formats like "2021-01-01", "01/01/2021", "20210101"
+        interval_end: Optional end date for filtering (inclusive). Accepts formats like "2021-01-01", "01/01/2021", "20210101"
+    
+    Returns:
+        Tuple of (stats_daily, stats_summary, dmin, dmax, ndays) where dates are filtered if provided
+    """
     if not os.path.isdir(daily_dir):
         raise FileNotFoundError(f"Expected DAILY stats dir: {daily_dir}")
 
@@ -211,6 +279,12 @@ def _load_data(daily_dir: str, summary_dir: str):
     # Parse + categories
     stats_daily["date"] = pd.to_datetime(stats_daily["date"], errors="coerce")
     stats_daily = stats_daily.dropna(subset=["date"])
+    
+    # Apply date range filter if provided
+    if interval_start is not None or interval_end is not None:
+        start_dt, end_dt = _parse_date_range(interval_start, interval_end)
+        stats_daily = _filter_by_date_range(stats_daily, start_dt, end_dt, "daily data")
+    
     for col in ("signal", "target", "bet_size_col", "qrank", "stat_type"):
         if col not in stats_daily.columns:
             stats_daily[col] = pd.NA
@@ -232,6 +306,12 @@ def _load_data(daily_dir: str, summary_dir: str):
                         stats_summary["date"] = pd.to_datetime(
                             stats_summary["date"], errors="coerce"
                         )
+                    
+                    # Apply date range filter to summary if provided
+                    if interval_start is not None or interval_end is not None:
+                        start_dt, end_dt = _parse_date_range(interval_start, interval_end)
+                        stats_summary = _filter_by_date_range(stats_summary, start_dt, end_dt, "summary data")
+                    
                     if "value" in stats_summary.columns:
                         stats_summary["value"] = pd.to_numeric(
                             stats_summary["value"], errors="coerce"
@@ -295,10 +375,81 @@ def _ensure_quantile_colors(labels, base_map):
 
 
 def _plot_date_axis(ax):
+    """Format date axis with intelligent formatting based on date range."""
     ax.set_axisbelow(True)
     ax.grid(True, linestyle=":", alpha=0.35)
-    ax.tick_params(axis="both", labelsize=11)
     ax.margins(x=0.02, y=0.08)
+    
+    # Try to get date information from the axis
+    try:
+        from matplotlib.dates import num2date, DateFormatter
+        
+        # Get the actual tick locations
+        locs = ax.get_xticks()
+        if len(locs) < 2:
+            ax.tick_params(axis="both", labelsize=11)
+            return
+        
+        # Convert numeric positions to dates if possible
+        # Filter out invalid dates (matplotlib uses large numbers for dates)
+        dates = []
+        for x in locs:
+            try:
+                dt = num2date(x)
+                if dt.year >= 1900 and dt.year <= 2100:  # Reasonable date range
+                    dates.append(dt)
+            except (ValueError, OverflowError, OSError):
+                continue
+        
+        if len(dates) >= 2:
+            # Calculate approximate interval between consecutive dates
+            intervals = []
+            for i in range(1, len(dates)):
+                diff = (dates[i] - dates[i-1]).days
+                if diff > 0:
+                    intervals.append(diff)
+            
+            if intervals:
+                avg_interval = sum(intervals) / len(intervals)
+                
+                # Determine format based on interval
+                if avg_interval >= 25:  # Monthly or longer intervals
+                    # Use shorter format: "Jan 2021"
+                    formatter = DateFormatter("%b %Y")
+                    ax.xaxis.set_major_formatter(formatter)
+                    ax.tick_params(axis="x", labelsize=9, rotation=45)
+                    ax.tick_params(axis="y", labelsize=11)
+                elif avg_interval >= 5:  # Weekly intervals
+                    formatter = DateFormatter("%m/%d")
+                    ax.xaxis.set_major_formatter(formatter)
+                    ax.tick_params(axis="x", labelsize=10, rotation=45)
+                    ax.tick_params(axis="y", labelsize=11)
+                else:  # Daily intervals
+                    formatter = DateFormatter("%m/%d")
+                    ax.xaxis.set_major_formatter(formatter)
+                    ax.tick_params(axis="x", labelsize=10, rotation=45)
+                    ax.tick_params(axis="y", labelsize=11)
+            else:
+                # Fallback: use default formatting with rotation
+                ax.tick_params(axis="x", labelsize=10, rotation=45)
+                ax.tick_params(axis="y", labelsize=11)
+        else:
+            # Fallback: use default formatting with rotation
+            ax.tick_params(axis="x", labelsize=10, rotation=45)
+            ax.tick_params(axis="y", labelsize=11)
+    except Exception:
+        # Fallback if date formatting fails
+        ax.tick_params(axis="x", labelsize=10, rotation=45)
+        ax.tick_params(axis="y", labelsize=11)
+    
+    # Set horizontal alignment on labels after formatting (works for all cases)
+    try:
+        labels = ax.get_xticklabels()
+        if labels:
+            for label in labels:
+                label.set_ha("right")
+    except Exception:
+        pass  # Ignore if labels can't be accessed
 
 
 def _ellipsis(s, n):
@@ -753,7 +904,8 @@ def compute_pairwise_rolling_time_corr(stats_df, alphas, stat_type, window=1, mi
         return out
 
     win = int(window)
-    mp = _minp(win, floor=3) if min_periods is None else int(min_periods)
+    # Use min_periods=1 so values appear from the first day (was _minp(win, floor=3))
+    mp = 1 if min_periods is None else int(min_periods)
     cols = [c for c in daily.columns if daily[c].notna().sum() >= mp]
     pairs = list(combinations(cols, 2))
     out = {}
@@ -825,8 +977,9 @@ def plot_cross_section_corr_lines(pdf, stats_df, alphas, stat_type, title_prefix
     for i, key in enumerate(chosen):
         s = corr_map[key].copy().sort_index()
         if (smooth_window is not None) and int(smooth_window) > 1:
-            win = int(smooth_window); mp = _minp(win, floor=3)
-            s = s.rolling(win, min_periods=mp).mean()
+            win = int(smooth_window)
+            # Use min_periods=1 so values appear from the first day
+            s = s.rolling(win, min_periods=1).mean()
         color = cmap(i % cmap.N)
         ax.plot(s.index, s.values, lw=1.8, alpha=0.95, color=color)
         v = s.values
@@ -1033,6 +1186,9 @@ def append_outlier_pages(outliers_pkl_path: str, pdf,
             fig.suptitle("Outlier Tables", fontsize=18, weight='bold')
             ax.text(0.5, 0.5, "Selected outlier metrics not present in file.", fontsize=12)
             savefig_white(pdf, fig); return
+
+    # Drop __ALL__ targets to avoid duplicate rows
+    odf = odf[odf.get('target', '') != "__ALL__"]
 
     tables = []
     for m in metrics:
@@ -1528,8 +1684,12 @@ def generate_quantile_report(config: dict):
     ccf_enable       = bool(config.get("ccf_enable", True))
     ccf_max_lag      = int(config.get("ccf_max_lag", 5))
 
-    # Load data
-    stats_daily, stats_summary, interval_min, interval_max, interval_ndays = _load_data(daily_dir, summary_dir)
+    # Load data (with optional date range filtering)
+    interval_start = config.get("interval_start")
+    interval_end = config.get("interval_end")
+    stats_daily, stats_summary, interval_min, interval_max, interval_ndays = _load_data(
+        daily_dir, summary_dir, interval_start=interval_start, interval_end=interval_end
+    )
     stats_daily = _apply_stat_aliases(stats_daily)
     stats_summary = _apply_stat_aliases(stats_summary)
 
@@ -2039,6 +2199,9 @@ def generate_quantile_report(config: dict):
                 for bet_strategy in sorted(
                     stats_daily_plot_local["bet_size_col"].dropna().unique()
                 ):
+                    # Skip explicit combination requested by user
+                    if target == "__ALL__":
+                        continue
                     mask_base = (
                         (stats_daily_plot_local["target"] == target)
                         & (stats_daily_plot_local["signal"] == signal)

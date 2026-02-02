@@ -157,6 +157,8 @@ def _compute_daily_stats_for_one_signal(
             nr_instr_today = int(mask_q.sum()) if mask_q.any() else 0
 
         for bet in bet_size_cols:
+            if bet == "__ALL__":
+                continue
             b = bet_abs.get(bet)
             if b is None:
                 continue
@@ -228,11 +230,80 @@ def _compute_daily_stats_for_one_signal(
 
             # per-target metrics
             for target in target_cols:
+                if target == "__ALL__":
+                    # Do not emit n_trades / nrInstr for pseudo targets
+                    continue
                 y = df_np.get(target)
                 if y is None:
                     continue
                 y_fin = np.isfinite(y)
                 m = mask_qb & y_fin
+
+                # nrInstr and n_trades are target-specific
+                if id_arr is not None:
+                    nr_instr_today = int(np.unique(id_arr[m]).size) if m.any() else 0
+                else:
+                    nr_instr_today = int(m.sum()) if m.any() else 0
+
+                key_sqtb = (signal, qlabel, target, bet)
+                prev = prev_state_slice.get(key_sqtb, {})
+                prev_map = prev.get('pos_map', {}) if isinstance(prev.get('pos_map', {}), dict) else {}
+
+                if id_arr is not None:
+                    if m.any():
+                        pos_today = (sgn[m] * b[m]).astype('float64', copy=False)
+                        ids_today = id_arr[m]
+                        pos_map_today: Dict = {inst: float(pos) for inst, pos in zip(ids_today, pos_today)}
+
+                        if not prev_map:
+                            day_trades = len(pos_map_today)
+                        else:
+                            day_trades = 0
+                            for inst, pos in pos_map_today.items():
+                                prev_pos = float(prev_map.get(inst, 0.0))
+                                if pos != prev_pos:
+                                    day_trades += 1
+                            day_trades += len(set(prev_map.keys()) - set(pos_map_today.keys()))
+                        n_trades_today = float(day_trades)
+                        prev_state_slice[key_sqtb] = {
+                            'Bt': float(np.nansum(b[m])),
+                            'mean_bet': float(np.nanmean(b[m])),
+                            'pos_map': pos_map_today,
+                        }
+                    else:
+                        if empty_day_policy == "close":
+                            n_trades_today = float(len(prev_map))
+                            prev_state_slice[key_sqtb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
+                        elif empty_day_policy == "carry":
+                            n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
+                        else:
+                            n_trades_today = np.nan
+                else:
+                    if m.any():
+                        Bt_today = float(np.nansum(b[m]))
+                        mean_bet = float(np.nanmean(b[m]))
+                        prev_Bt = float(prev.get('Bt', np.nan)) if prev and 'Bt' in prev else np.nan
+                        prev_mb = float(prev.get('mean_bet', np.nan)) if prev and 'mean_bet' in prev else np.nan
+
+                        if np.isfinite(prev_Bt):
+                            dBt = abs(Bt_today - prev_Bt)
+                            denom = mean_bet if mean_bet > 0 else (prev_mb if np.isfinite(prev_mb) and prev_mb > 0 else np.nan)
+                            n_trades_today = (dBt / denom) if (np.isfinite(denom) and denom > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
+                        else:
+                            n_trades_today = (Bt_today / mean_bet) if (mean_bet and mean_bet > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
+
+                        prev_state_slice[key_sqtb] = {'Bt': Bt_today, 'mean_bet': mean_bet, 'pos_map': {}}
+                    else:
+                        if empty_day_policy == "close":
+                            prev_Bt = float(prev.get('Bt', 0.0) or 0.0)
+                            prev_mb = float(prev.get('mean_bet', 0.0) or 0.0)
+                            n_trades_today = (prev_Bt / prev_mb) if prev_mb > 0 else 0.0
+                            prev_state_slice[key_sqtb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
+                        elif empty_day_policy == "carry":
+                            n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
+                        else:
+                            n_trades_today = np.nan
+
                 if m.any():
                     pnl_vec = sgn[m] * y[m] * b[m]
                     pnl = float(np.nansum(pnl_vec))
@@ -280,6 +351,11 @@ def _compute_daily_stats_for_one_signal(
                 stats['r2'][signal][qlabel][target][bet]           = r2
                 stats['t_stat'][signal][qlabel][target][bet]       = t_stat
                 stats['sharpe'][signal][qlabel][target][bet]       = sharpe
+
+            # Store nrInstr and n_trades once per (signal, qrank, bet) under target="__ALL__"
+            stats['nrInstr'][signal][qlabel]['__ALL__'][bet] = nr_instr_today
+            ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
+            stats['n_trades'][signal][qlabel]['__ALL__'][bet] = ntr
 
     # Optional raw distributions (thin sampling) per signal
     if enable_distributions:
