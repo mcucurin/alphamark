@@ -2,13 +2,6 @@ Getting started:
 
 pip install -r requirements.txt
 
-Add your raw data files to the data/RAW_DATA folder.
+Create and add input files to the input/DAILY_FEATURES_PKL folder.
 
 python main.py
-
-NEED TO CHANGE:
-
-ccf
-clean up code
-verify calculations
-vectorize and parallelize
