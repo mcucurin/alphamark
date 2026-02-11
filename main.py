@@ -138,6 +138,7 @@ DEFAULT_RUNNER_CONFIG = {
     "spearman_sample_cap_per_key": 10000,
 
     # ========== Per-ID (Ticker) Correlation Dump Toggles ==========
+    # Computationally expensive so be cautious using these variables
     # If True, save per-ticker correlation data between raw alpha (signal values) and SPY returns
     # Output: per_ticker_alpha_raw_spy_corr_*.pkl in per_ticker_dir
     # Note: Currently not fully implemented in runner (set to None internally)
@@ -149,6 +150,7 @@ DEFAULT_RUNNER_CONFIG = {
     "dump_alpha_pnl_per_id": False,
 
     # ========== Per-ID CCF (Cross-Correlation Function) Dump Toggles ==========
+    # Computationally expensive so be cautious using these variables
     # If True, enable cross-correlation function computation between signals/PnL and SPY
     # CCF analyzes lead/lag relationships across multiple time lags
     "ccf_enable": False,
@@ -202,11 +204,11 @@ DEFAULT_RUNNER_CONFIG = {
     #   "01/01/2021" (US format)
     #   "20210101" (compact format)
     # This date range is applied during pipeline processing AND plotting
-    "interval_start": "2020-01-01",
+    "interval_start": "2019-01-01",
     
     # End date for filtering input data (inclusive). Same format options as interval_start
     # This date range is applied during pipeline processing AND plotting
-    "interval_end": "2021-01-01"
+    "interval_end": "2020-01-01"
 }
 
 # ---- Plotting / report config (moved from plot_quantile_bars.CONFIG) ----
