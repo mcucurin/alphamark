@@ -16,5 +16,7 @@ data/
 output/DAILY_SUMMARIES/stats_tensor.pkl
 output/DAILY_SUMMARIES/stats_tensor.csv
 
+.mplconfig/
+
 **/*.csv
 **/*.pkl
