@@ -20,3 +20,4 @@ output/DAILY_SUMMARIES/stats_tensor.csv
 
 **/*.csv
 **/*.pkl
+**/*.json
