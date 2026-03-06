@@ -424,8 +424,4 @@ if __name__ == '__main__':
     generate_quantile_report(plot_cfg)
 
     end = time.perf_counter()
-<<<<<<< Updated upstream
-    print(f"\n⏱️ Total time (pipeline + report): {end - start:.3f} seconds")
-=======
     print(f"\nTotal time (pipeline + report): {end - start:.3f} seconds")
->>>>>>> Stashed changes
