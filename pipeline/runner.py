@@ -1,5 +1,7 @@
 # pipeline/runner.py — consume daily feature PKLs -> produce stats/summary/outliers (all PKL)
 # All user-facing config now lives in main.py and is passed in as a dict to run_pipeline(cfg).
+# Supports three separate input directories for signals, targets, and bet-sizes
+# (or a single combined directory — the default).
 
 import os
 import re
@@ -7,11 +9,13 @@ import json
 import pickle
 import shutil
 import time
+import math
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Dict
 
+import numpy as np
 import pandas as pd
 
 from pipeline.daily_stats import compute_daily_stats
@@ -96,7 +100,130 @@ def _parse_interval(start_s: Optional[str], end_s: Optional[str]) -> Tuple[pd.Ti
     return s, e
 
 
-# ===================== PIPELINE =====================
+# ===================== VERIFICATION =====================
+def _verify_daily_stats(stats: Dict, day_str: str, signal_cols: List[str],
+                        target_cols: List[str], bet_size_cols: List[str],
+                        quantiles: List[float]) -> List[str]:
+    """
+    Run sanity checks on the daily stats dict for one day.
+    Returns a list of warning strings (empty = all checks passed).
+    """
+    warnings_list: List[str] = []
+    expected_qlabels = [f"qr_{int(round(q * 100))}" for q in quantiles]
+
+    for stat_type in ['pnl', 'ppd', 'sizeNotional']:
+        if stat_type not in stats:
+            warnings_list.append(f"  [{day_str}] Missing stat_type '{stat_type}' entirely.")
+            continue
+        for sig in signal_cols:
+            if sig not in stats[stat_type]:
+                continue
+            for ql in expected_qlabels:
+                if ql not in stats[stat_type][sig]:
+                    continue
+                for tgt in target_cols:
+                    if tgt == "__ALL__":
+                        continue
+                    if tgt not in stats[stat_type][sig][ql]:
+                        continue
+                    for bet in bet_size_cols:
+                        val = stats[stat_type][sig][ql].get(tgt, {}).get(bet)
+                        if val is None:
+                            warnings_list.append(
+                                f"  [{day_str}] {stat_type} missing for "
+                                f"sig={sig}, q={ql}, tgt={tgt}, bet={bet}"
+                            )
+
+    # Check PnL = sum(sign(s) * fret * betsize) consistency
+    pnl_tree = stats.get('pnl', {})
+    ppd_tree = stats.get('ppd', {})
+    not_tree = stats.get('sizeNotional', {})
+    for sig in signal_cols:
+        for ql in expected_qlabels:
+            for tgt in target_cols:
+                if tgt == "__ALL__":
+                    continue
+                for bet in bet_size_cols:
+                    pnl_v = pnl_tree.get(sig, {}).get(ql, {}).get(tgt, {}).get(bet)
+                    ppd_v = ppd_tree.get(sig, {}).get(ql, {}).get(tgt, {}).get(bet)
+                    not_v = not_tree.get(sig, {}).get(ql, {}).get(tgt, {}).get(bet)
+                    if (pnl_v is not None and not_v is not None and ppd_v is not None
+                            and np.isfinite(pnl_v) and np.isfinite(not_v) and not_v > 0
+                            and np.isfinite(ppd_v)):
+                        recomputed_ppd = pnl_v / not_v
+                        if abs(recomputed_ppd - ppd_v) > 1e-10:
+                            warnings_list.append(
+                                f"  [{day_str}] PPD mismatch for sig={sig}, q={ql}, tgt={tgt}, bet={bet}: "
+                                f"pnl/notional={recomputed_ppd:.8f} vs stored ppd={ppd_v:.8f}"
+                            )
+    return warnings_list
+
+
+def _verify_summary_stats(summary: Dict, signal_cols: List[str],
+                          target_cols: List[str], bet_size_cols: List[str]) -> List[str]:
+    """
+    Run sanity checks on the aggregated summary stats dict.
+    Returns a list of warning strings.
+    """
+    warnings_list: List[str] = []
+
+    # Check Sharpe is computed from daily PPD mean/std
+    sharpe_tree = summary.get('sharpe', {})
+    ppd_tree = summary.get('ppd', {})
+    for sig, q_dict in sharpe_tree.items():
+        for ql, t_dict in q_dict.items():
+            for tgt, b_dict in t_dict.items():
+                for bet, sr_val in b_dict.items():
+                    if sr_val is not None and np.isfinite(sr_val):
+                        ppd_val = ppd_tree.get(sig, {}).get(ql, {}).get(tgt, {}).get(bet)
+                        if ppd_val is not None and np.isfinite(ppd_val):
+                            if ppd_val == 0.0 and sr_val != 0.0:
+                                warnings_list.append(
+                                    f"  [summary] Sharpe={sr_val:.4f} but PPD=0 for "
+                                    f"sig={sig}, q={ql}, tgt={tgt}, bet={bet}"
+                                )
+
+    # Check PPD = PnL / SizeNotional consistency
+    pnl_tree = summary.get('pnl', {})
+    not_tree = summary.get('sizeNotional', {})
+    for sig, q_dict in ppd_tree.items():
+        for ql, t_dict in q_dict.items():
+            for tgt, b_dict in t_dict.items():
+                for bet, ppd_v in b_dict.items():
+                    pnl_v = pnl_tree.get(sig, {}).get(ql, {}).get(tgt, {}).get(bet)
+                    not_v = not_tree.get(sig, {}).get(ql, {}).get(tgt, {}).get(bet)
+                    if (ppd_v is not None and pnl_v is not None and not_v is not None
+                            and np.isfinite(ppd_v) and np.isfinite(pnl_v)
+                            and np.isfinite(not_v) and not_v > 0):
+                        expected = pnl_v / not_v
+                        if abs(expected - ppd_v) > 1e-8:
+                            warnings_list.append(
+                                f"  [summary] PPD mismatch: pnl/notional={expected:.8f} "
+                                f"vs stored ppd={ppd_v:.8f} for "
+                                f"sig={sig}, q={ql}, tgt={tgt}, bet={bet}"
+                            )
+
+    return warnings_list
+
+
+# ===================== MULTI-DIR LOADING =====================
+def _load_category_files(
+    category_dir: Optional[str],
+    glob_pattern: Optional[str],
+    fallback_dir: str,
+    fallback_glob: str,
+    label: str,
+) -> List[Path]:
+    """Discover PKL files for a given category (signals/targets/betsizes)."""
+    d = category_dir if category_dir else fallback_dir
+    g = glob_pattern if glob_pattern else fallback_glob
+    p = Path(d)
+    if not p.is_dir():
+        print(f"[WARN] {label} directory does not exist: {d}")
+        return []
+    files = sorted(p.glob(g), key=lambda x: x.name)
+    print(f"[info] {label} directory: {d}  ({len(files)} files matching '{g}')")
+    return files
 def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     """
     Run the pipeline.
@@ -104,34 +231,99 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     All configuration must be passed in from main.py via the `cfg` dict.
     This function does *not* define defaults; it assumes the caller populates
     all keys that used to live in DEFAULT_CONFIG.
+
+    Supports three separate input directories for signals, targets, and
+    bet-sizes.  When all three point to the same path (or are None), the
+    pipeline behaves identically to the original single-directory mode.
     """
     t0 = time.perf_counter()
     local_cfg = dict(cfg)  # shallow copy to be safe
 
-    # unpack required config
-    (features_input_dir, features_glob, output_root, signal_prefix, target_prefix, bet_prefix,
-     signal_regex, target_regex, bet_regex, spy_ticker, spy_col_base, spy_single_name,
-     quantiles, type_quantile, do_daily, do_summary, do_outliers, add_spearman, add_dcor,
-     spearman_sample_cap_per_key, dump_alpha_raw_per_id, dump_alpha_pnl_per_id,
-     ccf_enable, ccf_max_lag, dump_alpha_raw_ccf_per_id, dump_alpha_pnl_ccf_per_id,
-        outlier_metrics, empty_day_policy,
-     report_empty_trades_as_nan, n_jobs_io, n_jobs_daily, n_jobs_summary, random_state,
-     interval_start, interval_end) = (
-        local_cfg["features_input_dir"], local_cfg["features_glob"], local_cfg["output_root"],
-        local_cfg["signal_prefix"], local_cfg["target_prefix"], local_cfg["bet_prefix"],
-        local_cfg["signal_regex"], local_cfg["target_regex"], local_cfg["bet_regex"],
-        local_cfg["spy_ticker"], local_cfg["spy_col_base"], local_cfg["spy_single_name"],
-        local_cfg["quantiles"], local_cfg["type_quantile"],
-        local_cfg["do_daily"], local_cfg["do_summary"], local_cfg["do_outliers"],
-        local_cfg["add_spearman"], local_cfg["add_dcor"], local_cfg["spearman_sample_cap_per_key"],
-        local_cfg["dump_alpha_raw_per_id"], local_cfg["dump_alpha_pnl_per_id"],
-        local_cfg["ccf_enable"], local_cfg["ccf_max_lag"],
-        local_cfg["dump_alpha_raw_ccf_per_id"], local_cfg["dump_alpha_pnl_ccf_per_id"],
-        local_cfg["outlier_metrics"], local_cfg["empty_day_policy"],
-        local_cfg["report_empty_trades_as_nan"], local_cfg["n_jobs_io"], local_cfg["n_jobs_daily"],
-        local_cfg["n_jobs_summary"], local_cfg["random_state"],
-        local_cfg["interval_start"], local_cfg["interval_end"]
-    )
+    # ---- Unpack input directories (new dict-based config) ----
+    def _input_spec(key: str, fallback_dir=".", fallback_glob="*.pkl"):
+        """Extract (dir, glob) from a config entry that is either a dict or a legacy string."""
+        v = local_cfg.get(key)
+        if isinstance(v, dict):
+            return v.get("dir", fallback_dir), v.get("glob") or fallback_glob
+        # Legacy: bare string = dir path
+        if isinstance(v, str):
+            return v, fallback_glob
+        return fallback_dir, fallback_glob
+
+    sig_dir, sig_glob   = _input_spec("signals_input")
+    tgt_dir, tgt_glob   = _input_spec("targets_input")
+    bet_dir, bet_glob   = _input_spec("betsizes_input")
+
+    # Legacy fallback: if old-style features_input_dir is set but new keys aren't,
+    # use it for all three.
+    legacy_dir = local_cfg.get("features_input_dir")
+    legacy_glob = local_cfg.get("features_glob", "*.pkl")
+    if legacy_dir and not local_cfg.get("signals_input"):
+        sig_dir, sig_glob = legacy_dir, legacy_glob
+    if legacy_dir and not local_cfg.get("targets_input"):
+        tgt_dir, tgt_glob = legacy_dir, legacy_glob
+    if legacy_dir and not local_cfg.get("betsizes_input"):
+        bet_dir, bet_glob = legacy_dir, legacy_glob
+
+    output_root = local_cfg["output_root"]
+
+    # ---- Column discovery ----
+    signal_prefix = local_cfg["signal_prefix"]
+    target_prefix = local_cfg["target_prefix"]
+    bet_prefix    = local_cfg["bet_prefix"]
+    signal_regex  = local_cfg.get("signal_regex")
+    target_regex  = local_cfg.get("target_regex")
+    bet_regex     = local_cfg.get("bet_regex")
+
+    # ---- SPY ----
+    spy_ticker      = local_cfg["spy_ticker"]
+    spy_col_base    = local_cfg["spy_col_base"]
+    spy_single_name = local_cfg["spy_single_name"]
+
+    # ---- Quantiles ----
+    quantiles      = local_cfg["quantiles"]
+    type_quantile  = local_cfg["type_quantile"]
+
+    # ---- Stage toggles ----
+    do_daily    = local_cfg["do_daily"]
+    do_summary  = local_cfg["do_summary"]
+    do_outliers = local_cfg["do_outliers"]
+
+    # ---- Summary extras ----
+    add_spearman = local_cfg["add_spearman"]
+    add_dcor     = local_cfg["add_dcor"]
+    spearman_sample_cap_per_key = local_cfg["spearman_sample_cap_per_key"]
+
+    # ---- CCF (replaces the 4 old dump_ booleans) ----
+    ccf_enable           = local_cfg.get("ccf_enable", False)
+    ccf_max_lag          = local_cfg.get("ccf_max_lag", 5)
+    ccf_dump_per_ticker  = local_cfg.get("ccf_dump_per_ticker", False)
+
+    # ---- Outlier / daily behaviour ----
+    outlier_metrics            = local_cfg["outlier_metrics"]
+    empty_day_policy           = local_cfg["empty_day_policy"]
+    report_empty_trades_as_nan = local_cfg["report_empty_trades_as_nan"]
+
+    # ---- Parallelism ----
+    n_jobs_io      = local_cfg["n_jobs_io"]
+    n_jobs_daily   = local_cfg["n_jobs_daily"]
+    n_jobs_summary = local_cfg["n_jobs_summary"]
+    random_state   = local_cfg["random_state"]
+
+    # ---- Date range ----
+    interval_start = local_cfg["interval_start"]
+    interval_end   = local_cfg["interval_end"]
+
+    # Determine multi-directory mode
+    _real = lambda d: os.path.realpath(d)
+    multi_dir_mode = not (_real(sig_dir) == _real(tgt_dir) == _real(bet_dir))
+    if multi_dir_mode:
+        print("[info] Multi-directory mode: signals, targets, and bet-sizes loaded from separate directories.")
+        print(f"       signals  : {sig_dir}  (glob: {sig_glob})")
+        print(f"       targets  : {tgt_dir}  (glob: {tgt_glob})")
+        print(f"       betsizes : {bet_dir}  (glob: {bet_glob})")
+    else:
+        print(f"[info] Single-directory mode: {sig_dir}  (glob: {sig_glob})")
 
     DAILY_STATS_DIR, SUMMARY_STATS_DIR, OUTLIERS_DIR, PER_TICKER_DIR = _ensure_dirs(output_root)
 
@@ -146,10 +338,35 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         print(f"[info] Interval end   (inclusive): {END_DT:%Y-%m-%d}")
 
     # 1) Discover and load feature PKLs (one per day) — parallel I/O
-    features_dir = Path(features_input_dir)
-    files = sorted(features_dir.glob(features_glob), key=lambda p: p.name)
-    if not files:
-        print(f"[stop] No feature PKLs matching {features_dir / features_glob}")
+    # In single-dir mode, use sig_dir/sig_glob as the canonical source
+    features_dir = Path(sig_dir)
+    files = sorted(features_dir.glob(sig_glob), key=lambda p: p.name)
+
+    # In multi-dir mode, also discover per-category files
+    if multi_dir_mode:
+        sig_files = _load_category_files(sig_dir, sig_glob, sig_dir, sig_glob, "Signals")
+        tgt_files = _load_category_files(tgt_dir, tgt_glob, sig_dir, sig_glob, "Targets")
+        bet_files = _load_category_files(bet_dir, bet_glob, sig_dir, sig_glob, "Betsizes")
+        # Build date -> path maps for each category
+        def _date_map(file_list):
+            out = {}
+            for p in file_list:
+                ds = _extract_date_str(p.name)
+                if ds:
+                    out[ds] = p
+            return out
+        sig_by_date = _date_map(sig_files)
+        tgt_by_date = _date_map(tgt_files)
+        bet_by_date = _date_map(bet_files)
+        # Union of all dates across categories
+        all_dates = sorted(set(sig_by_date) | set(tgt_by_date) | set(bet_by_date))
+        print(f"[info] Multi-dir: {len(all_dates)} unique dates across all category directories.")
+    else:
+        sig_by_date = tgt_by_date = bet_by_date = None
+        all_dates = None
+
+    if not files and not multi_dir_mode:
+        print(f"[stop] No feature PKLs matching {features_dir / sig_glob}")
         elapsed = time.perf_counter() - t0
         return {
             "daily_dir": DAILY_STATS_DIR,
@@ -176,6 +393,49 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     def _spy_col_for_target(target_name: str) -> str:
         # final spy column per target, stable naming
         return f"{spy_col_base}__{target_name}"
+
+    def _load_and_merge_multi(day_str: str) -> Optional[pd.DataFrame]:
+        """Load signal/target/betsize from separate directories and merge on ticker."""
+        frames = {}
+        col_sets = {}
+        for label, by_date, prefix, regex in [
+            ("signal", sig_by_date, signal_prefix, signal_regex),
+            ("target", tgt_by_date, target_prefix, target_regex),
+            ("betsize", bet_by_date, bet_prefix, bet_regex),
+        ]:
+            p = by_date.get(day_str) if by_date else None
+            if p is None or not p.exists():
+                continue
+            try:
+                df = _read_pickle_compat(p)
+            except Exception as e:
+                print(f"[skip] failed to read {p}: {e}")
+                continue
+            if "ticker" not in df.columns:
+                print(f"[skip] {p.name}: missing 'ticker'")
+                continue
+            cols = _pick_cols(df, prefix, regex)
+            if not cols:
+                continue
+            frames[label] = df[["ticker"] + cols].copy()
+            col_sets[label] = cols
+
+        if not frames:
+            return None
+
+        # Start with whichever frame has ticker
+        base = None
+        for k in ("signal", "target", "betsize"):
+            if k in frames:
+                if base is None:
+                    base = frames[k]
+                else:
+                    base = base.merge(frames[k], on="ticker", how="inner")
+
+        if base is None or "ticker" not in base.columns:
+            return None
+
+        return base
 
     def _load_one(p: Path) -> Optional[Tuple[pd.Timestamp, str, str, pd.DataFrame, Dict[str, str]]]:
         day_str = _extract_date_str(p.name)
@@ -236,19 +496,78 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
 
         return (day_dt, day_str, str(p), df_use, spy_map_for_day)
 
+    def _load_one_multi(day_str: str) -> Optional[Tuple[pd.Timestamp, str, str, pd.DataFrame, Dict[str, str]]]:
+        """Multi-directory loader: merge signal/target/betsize files for one day."""
+        df_use = _load_and_merge_multi(day_str)
+        if df_use is None:
+            return None
+
+        signal_cols = _pick_cols(df_use, signal_prefix, signal_regex)
+        target_cols = _pick_cols(df_use, target_prefix, target_regex)
+        bet_cols = _pick_cols(df_use, bet_prefix, bet_regex)
+
+        if not signal_cols or not target_cols or not bet_cols:
+            print(f"[skip] {day_str}: missing features after merge ({signal_prefix}*, {target_prefix}*, {bet_prefix}*)")
+            return None
+
+        # Derive per-target SPY columns
+        spy_map_for_day: Dict[str, str] = {}
+        if spy_ticker:
+            try:
+                has_spy_row = (df_use['ticker'] == spy_ticker).any()
+            except Exception:
+                has_spy_row = False
+            if has_spy_row:
+                spy_sub = df_use.loc[df_use['ticker'] == spy_ticker, target_cols]
+                for tcol in target_cols:
+                    col_name = _spy_col_for_target(tcol)
+                    try:
+                        v = pd.to_numeric(spy_sub[tcol], errors='coerce').dropna()
+                        spy_val = float(v.mean()) if not v.empty else None
+                    except Exception:
+                        spy_val = None
+                    if spy_val is not None:
+                        df_use[col_name] = spy_val
+                        spy_map_for_day[tcol] = col_name
+
+        day_dt = pd.to_datetime(day_str, format="%Y%m%d", errors="coerce")
+        if pd.isna(day_dt):
+            print(f"[skip] bad date {day_str}")
+            return None
+        if START_DT and (day_dt.normalize() < START_DT):
+            return None
+        if END_DT and (day_dt.normalize() > END_DT):
+            return None
+        return (day_dt, day_str, "multi-dir", df_use, spy_map_for_day)
+
+    # Load items — choose single-dir or multi-dir path
     items: List[Tuple[pd.Timestamp, str, str, pd.DataFrame, Dict[str, str]]] = []
-    if n_jobs_io <= 1:
-        for p in files:
-            rec = _load_one(p)
-            if rec is not None:
-                items.append(rec)
-    else:
-        with ThreadPoolExecutor(max_workers=int(n_jobs_io)) as ex:
-            futs = [ex.submit(_load_one, p) for p in files]
-            for fut in as_completed(futs):
-                rec = fut.result()
+    if multi_dir_mode and all_dates:
+        if n_jobs_io <= 1:
+            for ds in all_dates:
+                rec = _load_one_multi(ds)
                 if rec is not None:
                     items.append(rec)
+        else:
+            with ThreadPoolExecutor(max_workers=int(n_jobs_io)) as ex:
+                futs = [ex.submit(_load_one_multi, ds) for ds in all_dates]
+                for fut in as_completed(futs):
+                    rec = fut.result()
+                    if rec is not None:
+                        items.append(rec)
+    else:
+        if n_jobs_io <= 1:
+            for p in files:
+                rec = _load_one(p)
+                if rec is not None:
+                    items.append(rec)
+        else:
+            with ThreadPoolExecutor(max_workers=int(n_jobs_io)) as ex:
+                futs = [ex.submit(_load_one, p) for p in files]
+                for fut in as_completed(futs):
+                    rec = fut.result()
+                    if rec is not None:
+                        items.append(rec)
 
     # sort chronologically
     items.sort(key=lambda x: x[0])
@@ -279,9 +598,9 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     spy_by_target_global: Dict[str, str] = {}
 
     for day_dt, day_str, src_path, df, spy_map_for_day in items:
-        signal_cols = [c for c in df.columns if c.startswith(signal_prefix)]
-        target_cols = [c for c in df.columns if c.startswith(target_prefix)]
-        bet_size_cols = [c for c in df.columns if c.startswith(bet_prefix)]
+        signal_cols = _pick_cols(df, signal_prefix, signal_regex)
+        target_cols = _pick_cols(df, target_prefix, target_regex)
+        bet_size_cols = _pick_cols(df, bet_prefix, bet_regex)
 
         needed_sig.update(signal_cols)
         needed_tgt.update(target_cols)
@@ -323,7 +642,18 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                 _atomic_pickle_dump(day_df_stats, out_path)
                 per_day_index_rows.append({"date": day_str, "path": out_path, "n_rows": len(day_df_stats)})
                 daily_stats_frames.append(day_df_stats)
-                print(f"📦 Saved daily stats PKL for {day_str} -> {out_path} ({len(day_df_stats)} rows)")
+                print(f"Saved daily stats PKL for {day_str} -> {out_path} ({len(day_df_stats)} rows)")
+
+                # Verification: check internal consistency of daily stats
+                vwarns = _verify_daily_stats(stats, day_str, signal_cols, target_cols,
+                                             bet_size_cols, quantiles)
+                if vwarns:
+                    for w in vwarns[:5]:  # cap at 5 warnings per day
+                        print(f"⚠️  VERIFY {w}")
+                    if len(vwarns) > 5:
+                        print(f"⚠️  VERIFY  ... and {len(vwarns) - 5} more warnings for {day_str}")
+                else:
+                    print(f"Verification passed for {day_str}")
             else:
                 print(f"[skip] {day_str}: no stats produced")
 
@@ -369,7 +699,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                     PER_TICKER_DIR,
                     f"mds_alpha_raw_spy_ccf_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
                 )
-                if (spy_by_target_effective and ccf_enable and dump_alpha_raw_ccf_per_id)
+                if (spy_by_target_effective and ccf_enable and ccf_dump_per_ticker)
                 else None
             )
             dump_pnl_ccf = (
@@ -377,7 +707,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                     PER_TICKER_DIR,
                     f"mds_alpha_pnl_spy_ccf_{first_day:%Y%m%d}_{last_day:%Y%m%d}.pkl",
                 )
-                if (spy_by_target_effective and ccf_enable and dump_alpha_pnl_ccf_per_id)
+                if (spy_by_target_effective and ccf_enable and ccf_dump_per_ticker)
                 else None
             )
 
@@ -428,7 +758,17 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                 )
                 summary_path = os.path.join(SUMMARY_STATS_DIR, f"summary_stats_{date_tag}.pkl")
                 _atomic_pickle_dump(summary_df, summary_path)
-                print(f"✅ Saved summary stats PKL -> {summary_path} ({len(summary_df)} rows)")
+                print(f"Saved summary stats PKL -> {summary_path} ({len(summary_df)} rows)")
+
+                # Verification: check internal consistency of summary stats
+                vwarns = _verify_summary_stats(summary, sig_list, tgt_list, bet_list)
+                if vwarns:
+                    for w in vwarns[:10]:
+                        print(f"⚠️  VERIFY {w}")
+                    if len(vwarns) > 10:
+                        print(f"⚠️  VERIFY  ... and {len(vwarns) - 10} more summary warnings")
+                else:
+                    print(f"Summary verification passed")
 
             else:
                 print("[info] Summary produced no rows; not saving.")
@@ -474,10 +814,10 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
 
         index_pkl = os.path.join(DAILY_STATS_DIR, "_index.pkl")
         _atomic_pickle_dump(index_df, index_pkl)
-        print(f"🧭 Wrote daily index -> {index_csv} and {index_pkl}")
+        print(f"Wrote daily index -> {index_csv} and {index_pkl}")
 
     elapsed = time.perf_counter() - t0
-    print(f"⏱️  Pipeline finished in {elapsed:.3f} seconds.")
+    print(f"Pipeline finished in {elapsed:.3f} seconds.")
     return {
         "daily_dir": DAILY_STATS_DIR,
         "summary_path": summary_path,

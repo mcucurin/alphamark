@@ -63,125 +63,61 @@ def _parse_list(s: str | None):
 # ---- Runner / pipeline config (moved from runner.DEFAULT_CONFIG) ----
 DEFAULT_RUNNER_CONFIG = {
     # ========== I/O Configuration ==========
-    # Directory containing input feature pickle files (one per day)
-    "features_input_dir": "input/DAILY_FEATURES_PKL",
-    
-    # Glob pattern to match feature files within features_input_dir
-    # Example: "features_*.pkl" matches all files starting with "features_" and ending with ".pkl"
-    "features_glob": "features_*.pkl",
-    
-    # Root directory for all pipeline outputs (daily stats, summary stats, outliers, etc.)
+    # Input directories.  In the simple case all three point to the same folder
+    # containing combined daily PKL files (one per day, each with signal + target +
+    # betsize columns).  Set them to different paths when each category lives in a
+    # separate file tree; the pipeline merges on (date, ticker) automatically.
+    #
+    # Each entry is {"dir": <path>, "glob": <pattern>}.
+    # "glob" can be None to fall back to "*.pkl".
+    "signals_input":  {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
+    "targets_input":  {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
+    "betsizes_input": {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
+
+    # Root directory for all pipeline outputs
     "output_root": "output",
 
-    # ========== Column Selection ==========
-    # Prefix to identify signal columns in input data (e.g., "pret_" matches "pret_signal1")
-    "signal_prefix": "pret_",
-    
-    # Prefix to identify target/forward return columns (e.g., "fret_" matches "fret_1_MR")
-    "target_prefix": "fret_",
-    
-    # Prefix to identify bet size columns (e.g., "betsize_" matches "betsize_cap250k")
-    "bet_prefix": "betsize_",
-    
-    # Optional regex pattern to further filter signal columns (None = use all matching prefix)
-    # Example: r"pret_signal.*" to match only signals starting with "pret_signal"
-    "signal_regex": None,
-    
-    # Optional regex pattern to further filter target columns (None = use all matching prefix)
-    "target_regex": None,
-    
-    # Optional regex pattern to further filter bet size columns (None = use all matching prefix)
-    "bet_regex": None,
+    # ========== Column Discovery ==========
+    # Each column category is identified by prefix OR regex.
+    # When regex is set (not None), it takes precedence over prefix.
+    #   prefix:  simple startswith match  (e.g., "pret_" matches "pret_signal1")
+    #   regex:   full regex search        (e.g., r"pret_signal.*")
+    "signal_prefix": "pret_",       "signal_regex": None,
+    "target_prefix": "fret_",       "target_regex": None,
+    "bet_prefix":    "betsize_",    "bet_regex":    None,
 
-    # ========== Market Proxy (SPY) Configuration ==========
-    # Ticker symbol for market proxy (typically "SPY" for S&P 500 ETF)
-    "spy_ticker": "SPY",
-    
-    # Base name for per-target SPY columns. Final column names are: f"{spy_col_base}__{target}"
-    # Example: if spy_col_base="spy" and target="fret_1_MR", column becomes "spy__fret_1_MR"
-    "spy_col_base": "spy",
-    
-    # Single SPY return column name (used when no per-target SPY columns are available)
-    "spy_single_name": "spy_ret",
+    # ========== Market Proxy (SPY) ==========
+    "spy_ticker":      "SPY",       # ticker used as market proxy
+    "spy_col_base":    "spy",       # internal column naming: f"{spy_col_base}__{target}"
+    "spy_single_name": "spy_ret",   # fallback single-column name
 
     # ========== Quantile Configuration ==========
-    # List of quantile thresholds to compute (values between 0 and 1)
-    # Example: [1.0, 0.75, 0.5, 0.25] creates top 100%, top 25%, top 50%, top 75% quantiles
     "quantiles": [1.0, 0.75, 0.5, 0.25],
-    
-    # Quantile computation method:
-    #   "cumulative" = quantile represents >= threshold (e.g., qr_75 = top 25% of signals)
-    #   "quantEach" = quantile represents exact bucket boundaries
-    "type_quantile": "cumulative",
+    "type_quantile": "cumulative",  # "cumulative" (top-K) or "quantEach" (bucket)
 
     # ========== Pipeline Stage Toggles ==========
-    # If True, compute daily statistics (one file per day)
     "do_daily": True,
-    
-    # If True, compute summary statistics aggregated across all days
     "do_summary": True,
-    
-    # If True, compute outlier statistics (extreme values per metric)
     "do_outliers": True,
 
     # ========== Summary Statistics Extras ==========
-    # If True, compute Spearman rank correlation in addition to Pearson correlation
-    # Note: Can be computationally expensive for large datasets
-    "add_spearman": False,
-    
-    # If True, compute distance correlation (dCor) in addition to Pearson correlation
-    # Note: Can be computationally expensive for large datasets
-    "add_dcor": False,
-    
-    # Maximum number of samples per key when computing Spearman correlation
-    # Used to cap computation time for large datasets
+    "add_spearman": False,          # Spearman rank corr (expensive)
+    "add_dcor": False,              # Distance correlation (expensive)
     "spearman_sample_cap_per_key": 10000,
 
-    # ========== Per-ID (Ticker) Correlation Dump Toggles ==========
-    # Computationally expensive so be cautious using these variables
-    # If True, save per-ticker correlation data between raw alpha (signal values) and SPY returns
-    # Output: per_ticker_alpha_raw_spy_corr_*.pkl in per_ticker_dir
-    # Note: Currently not fully implemented in runner (set to None internally)
-    "dump_alpha_raw_per_id": False,
-    
-    # If True, save per-ticker correlation data between PnL and SPY returns
-    # Output: per_ticker_alpha_pnl_spy_corr_*.pkl in per_ticker_dir
-    # Note: Currently not fully implemented in runner (set to None internally)
-    "dump_alpha_pnl_per_id": False,
-
-    # ========== Per-ID CCF (Cross-Correlation Function) Dump Toggles ==========
-    # Computationally expensive so be cautious using these variables
-    # If True, enable cross-correlation function computation between signals/PnL and SPY
-    # CCF analyzes lead/lag relationships across multiple time lags
+    # ========== CCF (Cross-Correlation vs Market Proxy) ==========
+    # When enabled, computes per-ticker cross-correlation between signal/PnL
+    # and SPY at lags in [-ccf_max_lag, +ccf_max_lag].  Expensive.
     "ccf_enable": False,
-    
-    # Maximum lag (in days) for CCF computation. Lags range from -ccf_max_lag to +ccf_max_lag
-    # Example: ccf_max_lag=5 analyzes lags from -5 to +5 days
     "ccf_max_lag": 5,
-    
-    # If True, save per-ticker CCF data between raw alpha and SPY across multiple lags
-    # Output: mds_alpha_raw_spy_ccf_*.pkl in per_ticker_dir
-    # Requires: ccf_enable=True
-    "dump_alpha_raw_ccf_per_id": False,
-    
-    # If True, save per-ticker CCF data between PnL and SPY across multiple lags
-    # Output: mds_alpha_pnl_spy_ccf_*.pkl in per_ticker_dir
-    # Requires: ccf_enable=True
-    "dump_alpha_pnl_ccf_per_id": False,
+    # If True AND ccf_enable=True, dump per-ticker CCF detail PKLs to MDS_STATS/
+    "ccf_dump_per_ticker": False,
 
     # ========== Outlier Detection ==========
-    # List of metrics to analyze for outliers (extreme values)
-    # Common metrics: "pnl" (profit/loss), "ppd" (profit per dollar), "sizeNotional" (position size), "n_trades" (number of trades)
     "outlier_metrics": ["pnl", "ppd", "sizeNotional", "n_trades"],
 
     # ========== Daily Processing Behavior ==========
-    # Policy for handling days with no valid trades:
-    #   "carry" = carry forward positions from previous day
-    #   "close" = close all positions at end of day
-    #   "skip" = skip the day entirely
-    "empty_day_policy": "carry",
-    
-    # If True, report empty trading days as NaN values instead of zeros
+    "empty_day_policy": "carry",          # "carry" | "close" | "skip"
     "report_empty_trades_as_nan": True,
 
     # ========== Parallelism Configuration ==========
@@ -367,7 +303,19 @@ if __name__ == '__main__':
 
     env_features_dir = _env_or_none("FP_FEATURES_DIR")
     if env_features_dir is not None:
-        runner_cfg["features_input_dir"] = env_features_dir
+        # Convenience: set all three input dirs to the same path
+        for k in ("signals_input", "targets_input", "betsizes_input"):
+            runner_cfg[k] = {"dir": env_features_dir, "glob": runner_cfg[k].get("glob")}
+
+    # Per-category env overrides (take precedence over FP_FEATURES_DIR)
+    for env_key, cfg_key in [
+        ("FP_SIGNALS_DIR", "signals_input"),
+        ("FP_TARGETS_DIR", "targets_input"),
+        ("FP_BETSIZES_DIR", "betsizes_input"),
+    ]:
+        v = _env_or_none(env_key)
+        if v is not None:
+            runner_cfg[cfg_key] = {"dir": v, "glob": runner_cfg[cfg_key].get("glob")}
 
     env_output_root = _env_or_none("FP_OUTPUT_ROOT")
     if env_output_root is not None:
@@ -437,9 +385,9 @@ if __name__ == '__main__':
         # Very defensive fallback
         stats_df = pd.DataFrame(columns=DEFAULT_COLS)
 
-    print(f"\nLoaded stats_df with shape: {stats_df.shape}")
-    print("Columns:", stats_df.columns.tolist())
-    print("\nPreview of stats_df:")
+    print(f"\n📦 Loaded stats_df with shape: {stats_df.shape}")
+    print("📄 Columns:", stats_df.columns.tolist())
+    print("\n🔍 Preview of stats_df:")
     print(stats_df.head(10))
 
     # --- Backwards-compatible outputs in DAILY_SUMMARIES ---
