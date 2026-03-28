@@ -70,9 +70,9 @@ DEFAULT_RUNNER_CONFIG = {
     #
     # Each entry is {"dir": <path>, "glob": <pattern>}.
     # "glob" can be None to fall back to "*.pkl".
-    "signals_input":  {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
-    "targets_input":  {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
-    "betsizes_input": {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
+    "signals_input":  {"dir": "/Users/dhruvpatel/dispersion_regression/baseline_input/DAILY_ALPHAS_PKL", "glob": "alpha_*.pkl"},
+    "targets_input":  {"dir": "/Users/dhruvpatel/Desktop/fret-bs/pkl_output/CRSP_frets", "glob": "*.pkl"},
+    "betsizes_input": {"dir": "/Users/dhruvpatel/Desktop/fret-bs/pkl_output/CRSP_betsizes", "glob": "*.pkl"},
 
     # Root directory for all pipeline outputs
     "output_root": "output",
@@ -82,9 +82,10 @@ DEFAULT_RUNNER_CONFIG = {
     # When regex is set (not None), it takes precedence over prefix.
     #   prefix:  simple startswith match  (e.g., "pret_" matches "pret_signal1")
     #   regex:   full regex search        (e.g., r"pret_signal.*")
-    "signal_prefix": "pret_",       "signal_regex": None,
-    "target_prefix": "fret_",       "target_regex": None,
-    "bet_prefix":    "betsize_",    "bet_regex":    None,
+    #   list:    explicit column names    (e.g., ["pret_A", "pret_B"]) — overrides prefix/regex
+    "signal_prefix": "pret_",       "signal_regex": None,   "signal_list": None,
+    "target_prefix": None,       "target_regex": None,   "target_list": ["fret_OPCL_RR", "fret_OPCL_MR", "fret_OP5CL_RR", "fret_OP5CL_MR"],
+    "bet_prefix":    None,         "bet_regex":    None,   "bet_list":    ["bs_m025_c100k", "bs_m05_c250k", "bs_m1_c500k"],
 
     # ========== Market Proxy (SPY) ==========
     "spy_ticker":      "SPY",       # ticker used as market proxy
@@ -140,11 +141,11 @@ DEFAULT_RUNNER_CONFIG = {
     #   "01/01/2021" (US format)
     #   "20210101" (compact format)
     # This date range is applied during pipeline processing AND plotting
-    "interval_start": "2019-01-01",
+    "interval_start": "2000-01-31",
     
     # End date for filtering input data (inclusive). Same format options as interval_start
     # This date range is applied during pipeline processing AND plotting
-    "interval_end": "2020-01-01"
+    "interval_end": "2024-12-31"
 }
 
 # ---- Plotting / report config (moved from plot_quantile_bars.CONFIG) ----
@@ -163,19 +164,19 @@ DEFAULT_PLOT_CONFIG = {
     # Target columns to use for H2 heatmap (per-quantile PnL daily cross-section correlation)
     # Set to "AUTO" to automatically pick common values from DAILY data (preferring prefixes)
     # Or provide explicit list: ["fret_1_MR", "fret_5_MR"] to use specific targets
-    "H2_targets": ["fret_1_MR"],
+    "H2_targets": "AUTO",
     
     # Bet size columns to use for H2 heatmap
     # Set to "AUTO" for automatic selection, or provide explicit list
-    "H2_bets": ["betsize_cap250k"],
+    "H2_bets": "AUTO",
     
     # Target columns to use for H3 heatmap (per-quantile time-series correlation of summed daily PnL)
     # Set to "AUTO" for automatic selection, or provide explicit list
-    "H3_targets": ["fret_1_MR"],
+    "H3_targets": "AUTO",
     
     # Bet size columns to use for H3 heatmap
     # Set to "AUTO" for automatic selection, or provide explicit list
-    "H3_bets": ["betsize_cap250k"],
+    "H3_bets": "AUTO",
 
     # ========== Temporal Line Smoothing Windows ==========
     # Rolling window (in trading days) for smoothing H1 temporal line plots
@@ -225,11 +226,11 @@ DEFAULT_PLOT_CONFIG = {
     # ========== Bar Plot Configuration (SUMMARY Data Only) ==========
     # Faceting variables for bar plots (creates separate pages/facets for each combination)
     # Example: ["signal", "bet_size_col"] creates one page per signal/bet combination
-    "bar_page_vars": ["signal", "bet_size_col"],
+    "bar_page_vars": ["target", "bet_size_col"],
     
     # X-axis grouping variable for bar plots
     # Example: ["target"] groups bars by target column
-    "bar_x_vars": ["target"],
+    "bar_x_vars": ["signal"],
     
     # List of metrics to display in bar plots
     # Available metrics: "pnl", "ppd", "sharpe", "hit_ratio", "long_ratio", 
@@ -340,6 +341,12 @@ if __name__ == '__main__':
         plot_cfg["H3_targets"] = env_h3_targets
     if env_h3_bets is not None:
         plot_cfg["H3_bets"] = env_h3_bets
+
+    # ---- Apply explicit list overrides (list → exact-match regex) ----
+    for list_key, regex_key in [("signal_list", "signal_regex"), ("target_list", "target_regex"), ("bet_list", "bet_regex")]:
+        lst = runner_cfg.get(list_key)
+        if lst:
+            runner_cfg[regex_key] = "^(" + "|".join(lst) + ")$"
 
     # ---- Keep plotting interval in sync with runner ----
     plot_cfg["interval_start"] = runner_cfg.get("interval_start")

@@ -85,6 +85,9 @@ def _compute_summary_stats_core(
     """
     Compute strategy summary stats over all days.
     Returns nested dict: stats[stat_type][signal][qrank][target][bet] = value
+
+    Sharpe is computed from the daily PnL series per the benchmark specification
+    (Eq. 7):  SR = mean(PnL) / stdev(PnL) * sqrt(252).
     """
     out = create_5d_stats()
 
@@ -128,11 +131,13 @@ def _compute_summary_stats_core(
     grouped = df.sort_values(date_col).groupby(date_col, sort=True)
 
     # --------- Streaming accumulators ---------
-    sqrt_252 = np.sqrt(252.0)
     rng = np.random.default_rng(random_state)
 
-    # Welford stats for daily PPD
+    # Welford stats for daily PnL — used for Sharpe (benchmark Eq. 7)
     from collections import defaultdict as _dd
+    pnl_welford = _dd(lambda: [0, 0.0, 0.0])   # key=(s,q,t,b) -> [n, mean, M2]
+
+    # Welford stats for daily PPD — kept for backward compatibility / diagnostics
     ppd_stats = _dd(lambda: [0, 0.0, 0.0])   # key=(s,q,t,b)
 
     # Regression pooled sufficient stats for r² / t
@@ -308,10 +313,21 @@ def _compute_summary_stats_core(
                 # ----- update all per (target, bet) -----
                 for ti, t_name in enumerate(tgt_names):
                     row_ppd = ppd_mat[ti, :]
+                    row_pnl = pnl_mat[ti, :]
                     for bi, b_name in enumerate(bet_names):
                         key = (s_name, qlbl, t_name, b_name)
 
-                        # Welford (daily PPD)
+                        # --- Welford on daily PnL (for Sharpe — benchmark Eq. 7) ---
+                        pnl_v = row_pnl[bi]
+                        if np.isfinite(pnl_v):
+                            n, mean, M2 = pnl_welford[key]
+                            n += 1
+                            delta = pnl_v - mean
+                            mean += delta / n
+                            M2 += delta * (pnl_v - mean)
+                            pnl_welford[key] = [n, mean, M2]
+
+                        # --- Welford on daily PPD (backward compat) ---
                         v = row_ppd[bi]
                         if np.isfinite(v):
                             n, mean, M2 = ppd_stats[key]
@@ -379,11 +395,16 @@ def _compute_summary_stats_core(
     # --------- Finalize into nested output ---------
     out_nested = create_5d_stats()
 
-    # Sharpe from daily PPD (Welford)
-    for key, st in ppd_stats.items():
+    # Sharpe from daily PnL (Welford) — benchmark Eq. 7:
+    #   SR = mean(PnL) / stdev(PnL) * sqrt(252)
+    # Uses sample standard deviation (ddof=1) via M2/(n-1).
+    for key, st in pnl_welford.items():
         n, mean, M2 = st
-        mu, sd = (mean, np.sqrt(M2 / n)) if n > 1 else (mean, np.nan)
-        sharpe = (mu / sd * np.sqrt(252.0)) if (np.isfinite(mu) and np.isfinite(sd) and sd > 0) else np.nan
+        if n > 1:
+            sd = np.sqrt(M2 / (n - 1))  # sample std (ddof=1)
+            sharpe = (mean / sd * np.sqrt(252.0)) if (np.isfinite(mean) and np.isfinite(sd) and sd > 0) else np.nan
+        else:
+            sharpe = np.nan
         s, ql, t, b = key
         out_nested['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
 
