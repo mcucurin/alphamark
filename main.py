@@ -70,9 +70,9 @@ DEFAULT_RUNNER_CONFIG = {
     #
     # Each entry is {"dir": <path>, "glob": <pattern>}.
     # "glob" can be None to fall back to "*.pkl".
-    "signals_input":  {"dir": "/Users/dhruvpatel/dispersion_regression/baseline_input/DAILY_ALPHAS_PKL", "glob": "alpha_*.pkl"},
-    "targets_input":  {"dir": "/Users/dhruvpatel/Desktop/fret-bs/pkl_output/CRSP_frets", "glob": "*.pkl"},
-    "betsizes_input": {"dir": "/Users/dhruvpatel/Desktop/fret-bs/pkl_output/CRSP_betsizes", "glob": "*.pkl"},
+    "signals_input":  {"dir": "../dispersion_regression/baseline_input/DAILY_ALPHAS_PKL", "glob": "alpha_*.pkl"},
+    "targets_input":  {"dir": "../Desktop/fret-bs/pkl_output/CRSP_frets", "glob": "*.pkl"},
+    "betsizes_input": {"dir": "../Desktop/fret-bs/pkl_output/CRSP_betsizes", "glob": "*.pkl"},
 
     # Root directory for all pipeline outputs
     "output_root": "output",
