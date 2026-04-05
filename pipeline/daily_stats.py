@@ -311,7 +311,9 @@ def _compute_daily_stats_for_one_signal(
                     ppd = (pnl / notional) if notional > 0 else np.nan
 
                     # Extras
-                    hit_ratio = float(np.nanmean(pnl_vec > 0)) if pnl_vec.size else np.nan
+                    # hit_ratio: fraction where sign(s_i) = sign(fret_i), excluding fret_i = 0
+                    nonzero_y = y[m] != 0.0
+                    hit_ratio = float(np.nanmean((pnl_vec > 0)[nonzero_y])) if nonzero_y.any() else np.nan
                     long_ratio = float(np.nanmean(sgn[m] > 0)) if sgn[m].size else np.nan
                     n = int(m.sum())
                     # Simple cross-sectional regression stats (y on s)
