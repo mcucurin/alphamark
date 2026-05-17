@@ -312,8 +312,12 @@ def _compute_daily_stats_for_one_signal(
 
                     # Extras
                     # hit_ratio: fraction where sign(s_i) = sign(fret_i), excluding fret_i = 0
+                    # Benchmark PDF §5.10: pure sign comparison, independent of bet size
                     nonzero_y = y[m] != 0.0
-                    hit_ratio = float(np.nanmean((pnl_vec > 0)[nonzero_y])) if nonzero_y.any() else np.nan
+                    if nonzero_y.any():
+                        hit_ratio = float(np.mean(sgn[m][nonzero_y] == np.sign(y[m][nonzero_y])))
+                    else:
+                        hit_ratio = np.nan
                     long_ratio = float(np.nanmean(sgn[m] > 0)) if sgn[m].size else np.nan
                     n = int(m.sum())
                     # Simple cross-sectional regression stats (y on s)
@@ -323,11 +327,11 @@ def _compute_daily_stats_for_one_signal(
                     y_mean = np.nanmean(y_vals)
                     s_dev = s_vals - s_mean
                     y_dev = y_vals - y_mean
-                    s_var = float(np.nanvar(s_vals, ddof=1)) if n > 1 else np.nan
+                    s_var = float(np.nanvar(s_vals, ddof=0)) if n > 1 else np.nan
                     cov = float(np.nanmean(s_dev * y_dev)) if n > 0 else np.nan
                     beta = (cov / s_var) if (np.isfinite(cov) and np.isfinite(s_var) and s_var > 0) else np.nan
                     s_std = math.sqrt(s_var) if np.isfinite(s_var) and s_var > 0 else np.nan
-                    y_std = float(np.nanstd(y_vals, ddof=1)) if n > 1 else np.nan
+                    y_std = float(np.nanstd(y_vals, ddof=0)) if n > 1 else np.nan
                     r = (cov / (s_std * y_std)) if (np.isfinite(cov) and np.isfinite(s_std) and np.isfinite(y_std) and s_std > 0 and y_std > 0) else np.nan
                     r2 = float(r * r) if np.isfinite(r) else np.nan
                     t_stat = (r * math.sqrt(n - 2) / math.sqrt(1 - r * r)) if (np.isfinite(r) and n > 2 and (1 - r * r) > 0) else np.nan

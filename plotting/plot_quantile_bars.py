@@ -649,7 +649,7 @@ def _rolling_sharpe(s: pd.Series, window: int):
 
     def _sharpe(x):
         mu = np.nanmean(x)
-        sd = np.nanstd(x)
+        sd = np.nanstd(x, ddof=1)  # sample std, consistent with summary Sharpe
         if not np.isfinite(mu) or not np.isfinite(sd) or sd <= 0:
             return np.nan
         return mu / sd * np.sqrt(252.0)
@@ -1223,7 +1223,7 @@ def _title_token(base: str, window: int, cumulative: bool = False) -> str:
         base = f"cumulative {base}"
         if window and int(window) > 1:
             return f"Rolling-mean {base} ({int(window)}D)"
-        return base.capitalize()
+        return base[0].upper() + base[1:]
     else:
         return f"Rolling-mean {base} ({int(window)}D)" if (window and int(window) > 1) else base
 
@@ -1280,11 +1280,32 @@ def _metric_series_for_temporal(metric: str, df: pd.DataFrame, roll_windows: dic
         return title, y
 
     if name == "ppd":
-        s = _series(df, "ppd")
-        if s.empty:
+        pnl = _series(df, "pnl")
+        notional = _series(df, "sizeNotional")
+        if pnl.empty or notional.empty:
             return None, None
-        s = s * 10000.0  # basis points
-        y = _roll_mean(s.cumsum(), roll_windows.get("ppd", 1))
+
+        cumulative = pd.concat(
+            [
+                pnl.rename("pnl"),
+                notional.rename("sizeNotional"),
+            ],
+            axis=1,
+        ).sort_index()
+        if cumulative.empty:
+            return None, None
+
+        cumulative["cum_pnl"] = cumulative["pnl"].cumsum()
+        cumulative["cum_sizeNotional"] = cumulative["sizeNotional"].cumsum()
+        y = np.divide(
+            cumulative["cum_pnl"],
+            cumulative["cum_sizeNotional"],
+            out=np.full(len(cumulative), np.nan, dtype=float),
+            where=np.isfinite(cumulative["cum_sizeNotional"].to_numpy())
+            & (cumulative["cum_sizeNotional"].to_numpy() > 0),
+        )
+        y = pd.Series(y, index=cumulative.index) * 10000.0  # basis points
+        y = _roll_mean(y, roll_windows.get("ppd", 1))
         title = _title_token("PPD (bps)", roll_windows.get("ppd", 1), cumulative=True)
         return title, y
 
@@ -1311,8 +1332,8 @@ def _metric_series_for_temporal(metric: str, df: pd.DataFrame, roll_windows: dic
         if s.empty:
             return None, None
         window = roll_windows.get("sizeNotional", 1)
-        y = _roll_mean(s, window)
-        title = _title_token("Size Notional", window, cumulative=False)
+        y = _roll_mean(s, window) / 1e6
+        title = _title_token("Daily Notional ($M)", window, cumulative=False)
         return title, y
 
     if name == "sharpe":
@@ -1971,7 +1992,7 @@ def generate_quantile_report(config: dict):
             k1 = len(labels1) if labels1 else 0
             fig, ax, cax = _centered_heatmap_axes(k1)
             base_desc = (
-                "Alpha Cross-Section Corr (Spearman)"
+                "Alpha Signal Time-Series Corr (Spearman, alpha_sum)"
                 if h1_base_stat in ("alpha_sum", "alpha_strength")
                 else f"Cross-Section Corr (Spearman, {h1_base_stat})"
             )

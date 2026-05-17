@@ -67,6 +67,15 @@ def _topk_mask_desc(abs_vals: np.ndarray, finite_mask: np.ndarray, q: float) -> 
     return out
 
 
+def _welford_add(state: List[float], value: float) -> List[float]:
+    n, mean, M2 = state
+    n += 1
+    delta = value - mean
+    mean += delta / n
+    M2 += delta * (value - mean)
+    return [n, mean, M2]
+
+
 # ===================== INTERNAL CORE (single set of signals) ====================
 def _compute_summary_stats_core(
     df: pd.DataFrame,
@@ -139,6 +148,9 @@ def _compute_summary_stats_core(
 
     # Welford stats for daily PPD — kept for backward compatibility / diagnostics
     ppd_stats = _dd(lambda: [0, 0.0, 0.0])   # key=(s,q,t,b)
+
+    # Day counter for sizeNotional average (guide §3.5: SizeNotional = (1/T)·Σ B_t)
+    count_days_notional = _dd(int)           # key=(s,q,t,b)
 
     # Regression pooled sufficient stats for r² / t
     reg = _dd(lambda: {'n':0, 'sx':0.0, 'sy':0.0, 'sxx':0.0, 'syy':0.0, 'sxy':0.0})
@@ -244,12 +256,17 @@ def _compute_summary_stats_core(
             if not m_fin.any():
                 continue
 
+            # Exclude zero-signal instruments from portfolios (consistent with daily_stats,
+            # and with PDF §5.10 which counts nrInstr "for which s_i ≠ 0").
+            m_nz  = (s_all != 0.0)
+            m_ok  = m_fin & m_nz
+
             sgn = np.sign(s_all)
             abs_s = np.abs(s_all)
 
             # quantile bucket edges if needed
             if type_quantile != 'cumulative':
-                sabs_fin = abs_s[m_fin]
+                sabs_fin = abs_s[m_ok]
                 if sabs_fin.size:
                     K = len(quantiles)
                     probs = np.linspace(0.0, 1.0, K + 1)
@@ -263,16 +280,21 @@ def _compute_summary_stats_core(
                 qlbl = _qlabel(q)
 
                 if type_quantile == 'cumulative':
-                    mask_q = _topk_mask_desc(abs_s, m_fin, q)
+                    mask_q = _topk_mask_desc(abs_s, m_ok, q)
                 else:
                     if edges is None or not np.isfinite(edges).all():
-                        mask_q = np.zeros_like(m_fin, dtype=bool)
+                        mask_q = np.zeros_like(m_ok, dtype=bool)
                     else:
                         j = quantiles.index(q) + 1
                         lo, hi = edges[j-1], edges[j]
-                        mask_q = m_fin & (abs_s >= lo) & (abs_s <= hi)
+                        mask_q = m_ok & (abs_s >= lo) & (abs_s <= hi)
 
                 if not mask_q.any():
+                    # Include no-portfolio days in Sharpe as explicit zero-PnL observations.
+                    for t_name in tgt_names:
+                        for b_name in bet_names:
+                            key = (s_name, qlbl, t_name, b_name)
+                            pnl_welford[key] = _welford_add(pnl_welford[key], 0.0)
                     continue
 
                 # slice once
@@ -295,12 +317,14 @@ def _compute_summary_stats_core(
                                     out=np.full_like(pnl_mat, np.nan),
                                     where=(not_mat > 0))
 
-                # ----- hit ratio counts -----
-                y_sign   = np.sign(Y_q)
-                nonzero  = (y_sign != 0.0) & Y_fin
-                denom_hr = (nonzero.astype(float).T @ B_fin.astype(float))   # (nt, nb)
-                eq_sign  = ((np.sign(s_q)[:, None] == y_sign) & nonzero)
-                numer_hr = (eq_sign.astype(float).T @ B_fin.astype(float))   # (nt, nb)
+                # ----- hit ratio counts (bet-independent per benchmark PDF §5.10) -----
+                # hitRatio = fraction of instruments where sign(s_i) = sign(fret_i)
+                # Bets are irrelevant; count only by instrument, not by (instrument × bet).
+                y_sign      = np.sign(Y_q)
+                nonzero     = (y_sign != 0.0) & Y_fin
+                eq_sign     = ((np.sign(s_q)[:, None] == y_sign) & nonzero)
+                nonzero_ct  = nonzero.sum(axis=0)   # (nt,) — per target
+                eq_sign_ct  = eq_sign.sum(axis=0)   # (nt,) — per target
 
                 # ----- long ratio (per bet) -----
                 long_den_vec = np.sum(B_fin, axis=0).astype(int)
@@ -320,12 +344,7 @@ def _compute_summary_stats_core(
                         # --- Welford on daily PnL (for Sharpe — benchmark Eq. 7) ---
                         pnl_v = row_pnl[bi]
                         if np.isfinite(pnl_v):
-                            n, mean, M2 = pnl_welford[key]
-                            n += 1
-                            delta = pnl_v - mean
-                            mean += delta / n
-                            M2 += delta * (pnl_v - mean)
-                            pnl_welford[key] = [n, mean, M2]
+                            pnl_welford[key] = _welford_add(pnl_welford[key], float(pnl_v))
 
                         # --- Welford on daily PPD (backward compat) ---
                         v = row_ppd[bi]
@@ -337,11 +356,11 @@ def _compute_summary_stats_core(
                             M2 += delta * (v - mean)
                             ppd_stats[key] = [n, mean, M2]
 
-                        # hit ratio counts
-                        d = int(denom_hr[ti, bi])
+                        # hit ratio (bet-independent: same count for all bets on this day)
+                        d = int(nonzero_ct[ti])
                         if d > 0:
                             hit_den[key] += d
-                            hit_num[key] += int(numer_hr[ti, bi])
+                            hit_num[key] += int(eq_sign_ct[ti])
 
                         # accumulate activity totals
                         p = pnl_mat[ti, bi]
@@ -350,6 +369,7 @@ def _compute_summary_stats_core(
                             sum_pnl[key] += float(p)
                         if np.isfinite(ntn):
                             sum_notional[key] += float(ntn)
+                            count_days_notional[key] += 1
 
                         # nrInstr / n_trades: rows contributing today
                         b_ok = B_fin[:, bi]
@@ -480,6 +500,9 @@ def _compute_summary_stats_core(
         ntrd_tot = sum_ntrades.get(key, 0.0)
 
         ppd_val = (pnl_tot / not_tot) if (np.isfinite(pnl_tot) and np.isfinite(not_tot) and not_tot > 0) else np.nan
+
+        # sizeNotional: cumulative total notional (Σ B_t) for bar plots
+        # PPD uses the same total per benchmark eq. 12
 
         s, ql, t, b = key
         out_nested['pnl'][s][ql][t][b]          = float(pnl_tot) if np.isfinite(pnl_tot) else np.nan
@@ -646,17 +669,18 @@ def compute_summary_stats_over_days(
                             sgn   = np.sign(svals)
                             abs_s = np.abs(svals)
 
+                            snz = sfin & (svals != 0.0)
                             for q in quantiles:
                                 qlbl = _qlabel(q)
                                 if q >= 1.0:
-                                    mask_q = sfin
+                                    mask_q = snz
                                 else:
-                                    idx_fin = np.where(sfin)[0]
-                                    mask_q = np.zeros_like(sfin, bool)
-                                    if idx_fin.size:
-                                        k = int(np.ceil(q * idx_fin.size))
-                                        order = np.argsort(-abs_s[idx_fin], kind="mergesort")
-                                        choose = idx_fin[order[:k]]
+                                    idx_nz = np.where(snz)[0]
+                                    mask_q = np.zeros_like(snz, bool)
+                                    if idx_nz.size:
+                                        k = int(np.ceil(q * idx_nz.size))
+                                        order = np.argsort(-abs_s[idx_nz], kind="mergesort")
+                                        choose = idx_nz[order[:k]]
                                         mask_q[choose] = True
                                 if not mask_q.any():
                                     continue
