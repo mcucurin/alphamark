@@ -2,6 +2,7 @@
 from pipeline.runner import run_pipeline
 from plotting.plot_quantile_bars import generate_quantile_report
 
+import argparse
 import pickle as pkl
 import pandas as pd
 import os, glob, json
@@ -20,7 +21,6 @@ def read_pickle_compat(path: str):
             if module.startswith("numpy._core"):
                 module = module.replace("numpy._core", "numpy.core")
             return super().find_class(module, name)
-
     with open(path, "rb") as f:
         return NPCompatUnpickler(f).load()
 
@@ -160,7 +160,7 @@ DEFAULT_PLOT_CONFIG = {
 
     # ========== Outlier Table Configuration ==========
     "outlier_metrics_for_tables": ["pnl", "ppd", "sizeNotional", "n_trades"],
-    "outlier_top_k":          3,
+    "outlier_top_k":           3,
     "outlier_tables_per_page": 2,
 
     # ========== Plot Styling ==========
@@ -168,9 +168,7 @@ DEFAULT_PLOT_CONFIG = {
     "style_second": ":",
 
     # Quantile color palette — professional, colorblind-safe.
-    # The plotting module uses these as defaults. Set to {} to let it
-    # choose automatically, or override individual keys as needed.
-    # e.g. {"qr_100": "#E31A1C"} to change only the top-quantile color.
+    # Override individual keys as needed, e.g. {"qr_100": "#E31A1C"}.
     "quantile_colors": {
         "qr_100": "#2166AC",   # steel blue
         "qr_75":  "#4DAC26",   # muted green
@@ -179,13 +177,23 @@ DEFAULT_PLOT_CONFIG = {
     },
 
     # ========== Layout and Metadata ==========
-    # Custom footer text on every PDF page.
-    # If None, auto-generated as "Window: YYYY-MM-DD → YYYY-MM-DD  |  Days: N"
+    # Custom footer text. If None, auto-generated from the date window.
     "meta_text": None,
 }
 
 
 if __name__ == '__main__':
+    ap = argparse.ArgumentParser(description="AlphaMark benchmarking pipeline")
+    ap.add_argument(
+        "--plot-only", action="store_true",
+        help=(
+            "Skip all pipeline computation and regenerate the PDF report "
+            "directly from existing PKLs in output/DAILY_STATS, "
+            "output/SUMMARY_STATS, and output/OUTLIERS."
+        ),
+    )
+    args = ap.parse_args()
+
     # -----------------------------------------------------------------
     # 1) Build centralized configs for runner + plotting
     # -----------------------------------------------------------------
@@ -262,64 +270,78 @@ if __name__ == '__main__':
     plot_cfg["ccf_enable"]  = runner_cfg.get("ccf_enable", False)
     plot_cfg["ccf_max_lag"] = runner_cfg.get("ccf_max_lag", 5)
 
-    # -----------------------------------------------------------------
-    # 2) Run pipeline
-    # -----------------------------------------------------------------
-    result = run_pipeline(runner_cfg)
-
-    daily_dir      = result.get('daily_dir')
-    summary_path   = result.get('summary_path')
-    summary_dir    = result.get('summary_dir')
-    outliers_dir   = result.get('outliers_dir')
-    market_dist_dir = result.get('market_dist_dir') or result.get('per_ticker_dir')
-
-    # -----------------------------------------------------------------
-    # 3) Build combined stats_df (backwards compatibility)
-    # -----------------------------------------------------------------
-    if isinstance(result, dict) and daily_dir:
-        daily_paths  = sorted(glob.glob(os.path.join(daily_dir, 'stats_*.pkl')))
-        daily_frames = [read_pickle_compat(p) for p in daily_paths]
-        stats_daily  = (
-            pd.concat(daily_frames, ignore_index=True)
-            if daily_frames else pd.DataFrame(columns=DEFAULT_COLS)
-        )
-        if summary_path and os.path.exists(summary_path):
-            stats_summary = read_pickle_compat(summary_path)
-        else:
-            stats_summary = pd.DataFrame(columns=DEFAULT_COLS)
-        parts    = [df for df in (stats_daily, stats_summary) if not df.empty]
-        stats_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=DEFAULT_COLS)
-    else:
-        stats_df = pd.DataFrame(columns=DEFAULT_COLS)
-
-    print(f"\n📦 Loaded stats_df with shape: {stats_df.shape}")
-    print("📄 Columns:", stats_df.columns.tolist())
-    print("\n🔍 Preview of stats_df:")
-    print(stats_df.head(10))
-
-    # ---- Backwards-compatible outputs ----
-    compat_dir = "./output/DAILY_SUMMARIES"
-    os.makedirs(compat_dir, exist_ok=True)
-    compat_pkl = os.path.join(compat_dir, "stats_tensor.pkl")
-    compat_csv = os.path.join(compat_dir, "stats_tensor.csv")
-    stats_df.to_pickle(compat_pkl)
-    stats_df.to_csv(compat_csv, index=False)
-    with open(compat_pkl, "rb") as f:
-        obj = pkl.load(f)
-    if isinstance(obj, pd.DataFrame):
-        obj.to_csv(compat_csv, index=False)
-
-    # -----------------------------------------------------------------
-    # 4) Generate PDF report
-    # -----------------------------------------------------------------
     output_root = runner_cfg["output_root"]
-    plot_cfg["daily_dir"]     = daily_dir
-    plot_cfg["summary_dir"]   = summary_dir
+
+    # -----------------------------------------------------------------
+    # 2) Run pipeline OR use existing PKLs (--plot-only)
+    # -----------------------------------------------------------------
+    if args.plot_only:
+        # Derive all dirs from output_root — no computation at all.
+        print("[INFO] --plot-only: skipping pipeline, reading existing PKLs.")
+        daily_dir       = os.path.join(output_root, "DAILY_STATS")
+        summary_dir     = os.path.join(output_root, "SUMMARY_STATS")
+        outliers_dir    = os.path.join(output_root, "OUTLIERS")
+        market_dist_dir = os.path.join(output_root, "MDS_STATS")
+
+        for d in (daily_dir, summary_dir):
+            if not os.path.isdir(d):
+                raise FileNotFoundError(
+                    f"[--plot-only] Expected directory not found: {d}\n"
+                    f"Run without --plot-only first to generate the PKLs."
+                )
+    else:
+        result = run_pipeline(runner_cfg)
+
+        daily_dir       = result.get('daily_dir')
+        summary_dir     = result.get('summary_dir')
+        summary_path    = result.get('summary_path')
+        outliers_dir    = result.get('outliers_dir')
+        market_dist_dir = result.get('market_dist_dir') or result.get('per_ticker_dir')
+
+        # ---- Build combined stats_df (backwards compatibility) ----
+        if isinstance(result, dict) and daily_dir:
+            daily_paths  = sorted(glob.glob(os.path.join(daily_dir, 'stats_*.pkl')))
+            daily_frames = [read_pickle_compat(p) for p in daily_paths]
+            stats_daily  = (
+                pd.concat(daily_frames, ignore_index=True)
+                if daily_frames else pd.DataFrame(columns=DEFAULT_COLS)
+            )
+            if summary_path and os.path.exists(summary_path):
+                stats_summary = read_pickle_compat(summary_path)
+            else:
+                stats_summary = pd.DataFrame(columns=DEFAULT_COLS)
+            parts    = [df for df in (stats_daily, stats_summary) if not df.empty]
+            stats_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=DEFAULT_COLS)
+        else:
+            stats_df = pd.DataFrame(columns=DEFAULT_COLS)
+
+        print(f"\n📦 Loaded stats_df with shape: {stats_df.shape}")
+        print("📄 Columns:", stats_df.columns.tolist())
+        print("\n🔍 Preview of stats_df:")
+        print(stats_df.head(10))
+
+        # ---- Backwards-compatible outputs ----
+        compat_dir = os.path.join(output_root, "DAILY_SUMMARIES")
+        os.makedirs(compat_dir, exist_ok=True)
+        compat_pkl = os.path.join(compat_dir, "stats_tensor.pkl")
+        compat_csv = os.path.join(compat_dir, "stats_tensor.csv")
+        stats_df.to_pickle(compat_pkl)
+        stats_df.to_csv(compat_csv, index=False)
+        with open(compat_pkl, "rb") as f:
+            obj = pkl.load(f)
+        if isinstance(obj, pd.DataFrame):
+            obj.to_csv(compat_csv, index=False)
+
+    # -----------------------------------------------------------------
+    # 3) Generate PDF report (always runs)
+    # -----------------------------------------------------------------
+    plot_cfg["daily_dir"]      = daily_dir
+    plot_cfg["summary_dir"]    = summary_dir
     plot_cfg["per_ticker_dir"] = market_dist_dir
-    plot_cfg["outliers_dir"]  = outliers_dir
-    plot_cfg["output_pdf"]    = os.path.join(output_root, "Quantile_Combined_Report.pdf")
+    plot_cfg["outliers_dir"]   = outliers_dir
+    plot_cfg["output_pdf"]     = os.path.join(output_root, "Quantile_Combined_Report.pdf")
 
     generate_quantile_report(plot_cfg)
 
     end = time.perf_counter()
-    print(f"\nTotal time (pipeline + report): {end - start:.3f} seconds")
+    print(f"\nTotal time: {end - start:.3f} seconds")
