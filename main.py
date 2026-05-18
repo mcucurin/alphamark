@@ -315,9 +315,9 @@ if __name__ == '__main__':
         else:
             stats_df = pd.DataFrame(columns=DEFAULT_COLS)
 
-        print(f"\n📦 Loaded stats_df with shape: {stats_df.shape}")
-        print("📄 Columns:", stats_df.columns.tolist())
-        print("\n🔍 Preview of stats_df:")
+        print(f"\nLoaded stats_df with shape: {stats_df.shape}")
+        print("Columns:", stats_df.columns.tolist())
+        print("\nPreview of stats_df:")
         print(stats_df.head(10))
 
         # ---- Backwards-compatible outputs ----

@@ -764,9 +764,9 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                 vwarns = _verify_summary_stats(summary, sig_list, tgt_list, bet_list)
                 if vwarns:
                     for w in vwarns[:10]:
-                        print(f"⚠️  VERIFY {w}")
+                        print(f"VERIFY {w}")
                     if len(vwarns) > 10:
-                        print(f"⚠️  VERIFY  ... and {len(vwarns) - 10} more summary warnings")
+                        print(f"VERIFY  ... and {len(vwarns) - 10} more summary warnings")
                 else:
                     print(f"Summary verification passed")
 
@@ -797,7 +797,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         print(f"[info] stat_types present in DAILY: {sorted(stats_all['stat_type'].dropna().astype(str).unique().tolist())}")
         outliers_path = os.path.join(OUTLIERS_DIR, f"outliers_{date_tag}.pkl")
         save_outliers(odf, outliers_path)
-        print(f"⚠️  Saved outliers PKL -> {outliers_path} ({len(odf)} rows)")
+        print(f"Saved outliers PKL -> {outliers_path} ({len(odf)} rows)")
     elif do_outliers:
         print("[info] No daily stats frames accumulated; skipping outlier computation.")
 
