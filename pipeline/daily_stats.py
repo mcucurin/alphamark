@@ -1,6 +1,26 @@
 # =============================
 # daily_stats.py — year-aware n_trades (carry + year-open override), no PPT
 # Parallel-per-signal (threads) with truthful state merging.
+#
+# SPEC: Alpha_Mark__financial_analysis_benchmark_pipeline.pdf (Cucuringu, priority)
+#       AlphaMark_Guide.pdf (Patel & Li, secondary — followed where no contradiction)
+#
+# KEY METRIC DEFINITIONS (Cucuringu §5.10, priority):
+#   PnL          — Σ sign(si) · fi · bi  (instruments with finite s, b, f)
+#   sizeNotional — B_t = Σ bi over U_t^(q) with finite bet (Eq.11, target-independent)
+#   ppd          — PnL / B_t  (Eq.14 daily local PPD; same B_t as sizeNotional)
+#   nrInstr      — |U_t^(q)|, si≠0 only, bet-independent
+#   hit_ratio    — fraction where sign(si)=sign(fi), fi≠0, bet-independent
+#   long_ratio   — fraction where sign(si)=1, bet-independent
+#   Sharpe       — cross-sectional proxy only; true Sharpe (Eq.7) in summary_stats
+#   n_trades     — position-diff diagnostic
+#
+# NOTE on PPD consistency:
+#   sizeNotional = B_t = Σ_{i: bi finite} bi (all portfolio members with finite bet).
+#   ppd          = PnL / B_t  using the same B_t.
+#   Instruments with missing target (fi=NaN) contribute bi to B_t but 0 to PnL
+#   (NaN targets are zeroed in the PnL sum). This means ppd = pnl / sizeNotional
+#   exactly, so verification checks pnl/sizeNotional == ppd will pass.
 # =============================
 from __future__ import annotations
 
@@ -12,31 +32,29 @@ from typing import Dict, MutableMapping, Sequence, Tuple, List
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# -----------------------------------------------------------------------------
-# Nested metrics store:
-# stats[stat_type][signal][qrank][target][bet] -> value
-# -----------------------------------------------------------------------------
+
 def create_5d_stats():
     return defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(dict))))
 
-# -----------------------------------------------------------------------------
-# GLOBAL PERSISTENT STATE (kept in-memory + optional on-disk persistence)
-# -----------------------------------------------------------------------------
+
 _GLOBAL_PREV_STATE: Dict = {}
+
 
 def get_trading_state():
     return _GLOBAL_PREV_STATE
 
+
 def reset_trading_state():
-    """Kept for API compatibility (no-op)."""
     pass
+
 
 def save_trading_state(path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
         pickle.dump(_GLOBAL_PREV_STATE, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-def load_trading_state(path: str, strict: bool=False):
+
+def load_trading_state(path: str, strict: bool = False):
     if not os.path.isfile(path):
         if strict:
             raise FileNotFoundError(f"No trading state at {path}")
@@ -47,16 +65,13 @@ def load_trading_state(path: str, strict: bool=False):
         _GLOBAL_PREV_STATE.clear()
         _GLOBAL_PREV_STATE.update(obj)
 
-# ========================= DAILY (single-date snapshot) =======================
 
 def _label_for_quantile(q: float) -> str:
     return f'qr_{int(round(q * 100))}'
 
+
 def _topk_mask_desc(abs_vals: np.ndarray, valid_mask: np.ndarray, q: float) -> np.ndarray:
-    """
-    Pick exactly ceil(q * N) largest values from abs_vals among indices where valid_mask == True.
-    Stable ordering for deterministic ties (mergesort).
-    """
+    """Top 100q% by |signal| from valid_mask. Stable (mergesort) for deterministic ties."""
     idx = np.where(valid_mask)[0]
     out = np.zeros_like(valid_mask, dtype=bool)
     if idx.size == 0 or q <= 0.0:
@@ -65,17 +80,17 @@ def _topk_mask_desc(abs_vals: np.ndarray, valid_mask: np.ndarray, q: float) -> n
         out[idx] = True
         return out
     k = int(np.ceil(q * idx.size))
-    order = np.argsort(-abs_vals[idx], kind="mergesort")  # descending, stable
-    choose = idx[order[:k]]
-    out[choose] = True
+    order = np.argsort(-abs_vals[idx], kind="mergesort")
+    out[idx[order[:k]]] = True
     return out
 
+
 def _merge_signal_branch(dst: Dict, src: Dict, signal: str) -> None:
-    """Per-signal subtrees are disjoint, so we can assign directly."""
-    for stat_type, sig_dict in src.items():
+    for stat_type in src:
         if stat_type not in dst:
             dst[stat_type] = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
         dst[stat_type][signal] = src[stat_type][signal]
+
 
 def _compute_daily_stats_for_one_signal(
     signal: str,
@@ -92,8 +107,7 @@ def _compute_daily_stats_for_one_signal(
     report_empty_trades_as_nan: bool,
     prev_state_slice: MutableMapping,
 ) -> Tuple[Dict, Dict]:
-    """Worker: compute metrics for ONE signal (thread)."""
-    rng = np.random.default_rng(rng_state)
+    rng   = np.random.default_rng(rng_state)
     stats = create_5d_stats()
 
     s = df_np.get(signal)
@@ -102,22 +116,21 @@ def _compute_daily_stats_for_one_signal(
 
     m_fin = np.isfinite(s)
     m_nz  = (s != 0.0)
+    # Portfolio universe: finite AND nonzero signal (Cucuringu §5.10)
     m_ok  = m_fin & m_nz
     if not m_fin.any():
         return stats, prev_state_slice
 
-    sgn = np.sign(s)
+    sgn   = np.sign(s)
     abs_s = np.abs(s)
 
-    # Precompute absolute bet arrays
     bet_abs: Dict[str, np.ndarray] = {}
-    for b in bet_size_cols:
-        x = df_np.get(b)
-        bet_abs[b] = np.abs(x) if x is not None else np.full(s.size, np.nan, dtype='float64')
+    for b_name in bet_size_cols:
+        x = df_np.get(b_name)
+        bet_abs[b_name] = np.abs(x) if x is not None else np.full(s.size, np.nan, dtype='float64')
 
-    # Optional bucket edges
     if type_quantile == 'quantEach':
-        K = len(quantiles)
+        K     = len(quantiles)
         probs = np.linspace(0.0, 1.0, K + 1, dtype='float64')
         edges = np.nanquantile(abs_s[m_ok], probs) if m_ok.any() else np.array([np.nan, np.nan])
     else:
@@ -128,33 +141,34 @@ def _compute_daily_stats_for_one_signal(
     for q in quantiles:
         qlabel = _label_for_quantile(q)
 
-        # Selection mask
         if type_quantile == 'cumulative':
             mask_q = _topk_mask_desc(abs_s, m_ok, q)
         else:
             if edges is None or not np.isfinite(edges).all():
                 mask_q = np.zeros_like(m_ok, dtype=bool)
             else:
-                j = quantiles.index(q) + 1  # 1..K
-                lo, hi = edges[j-1], (edges[j-1] if j == len(quantiles) else edges[j])
-                mask_q = m_ok & (abs_s >= lo) if j == len(quantiles) else (m_ok & (abs_s >= lo) & (abs_s <= hi))
+                j  = quantiles.index(q) + 1
+                lo = edges[j - 1]
+                hi = edges[j - 1] if j == len(quantiles) else edges[j]
+                mask_q = (m_ok & (abs_s >= lo)) if j == len(quantiles) else (m_ok & (abs_s >= lo) & (abs_s <= hi))
 
-        # alpha_sum (emit once per (signal,q))
         alpha_sum_today = float(np.nansum(s[mask_q])) if mask_q.any() else 0.0
         if qlabel not in alpha_written:
             stats['alpha_sum'][signal][qlabel]['__ALL__']['__ALL__'] = alpha_sum_today
             alpha_written.add(qlabel)
 
-        # nrInstr (bet-independent)
+        # nrInstr — bet-independent: count si≠0 (Cucuringu §5.10)
         if id_arr is not None:
             if mask_q.any():
                 ids = id_arr[mask_q]
-                ids = ids[ids == ids]  # drop NaN-ish
-                nr_instr_today = int(np.unique(ids).size)
+                nr_instr_today = int(np.unique(ids[ids == ids]).size)
             else:
                 nr_instr_today = 0
         else:
             nr_instr_today = int(mask_q.sum()) if mask_q.any() else 0
+
+        # long_ratio — bet-independent: fraction sign(si)=1 (Cucuringu §5.10)
+        long_ratio_q = float(np.nanmean(sgn[mask_q] > 0)) if mask_q.any() else np.nan
 
         for bet in bet_size_cols:
             if bet == "__ALL__":
@@ -162,14 +176,18 @@ def _compute_daily_stats_for_one_signal(
             b = bet_abs.get(bet)
             if b is None:
                 continue
-            b_fin = np.isfinite(b)
-            mask_qb = mask_q & b_fin
+            b_fin   = np.isfinite(b)
+            mask_qb = mask_q & b_fin   # portfolio with finite bet
 
-            key_sb = (signal, qlabel, bet)
-            prev = prev_state_slice.get(key_sb, {})
+            key_sb   = (signal, qlabel, bet)
+            prev     = prev_state_slice.get(key_sb, {})
             prev_map = prev.get('pos_map', {}) if isinstance(prev.get('pos_map', {}), dict) else {}
 
-            # n_trades (truthful empties)
+            # B_t = Σ_{i∈mask_qb} bi — target-independent (Eq.11)
+            # Used for both sizeNotional and as PPD denominator so pnl/sizeNotional == ppd exactly.
+            Bt = float(np.nansum(b[mask_qb]))
+
+            # n_trades: position-diff diagnostic
             if id_arr is not None:
                 if mask_qb.any():
                     pos_today = (sgn[mask_qb] * b[mask_qb]).astype('float64', copy=False)
@@ -177,46 +195,35 @@ def _compute_daily_stats_for_one_signal(
                     pos_map_today: Dict = {}
                     for inst, pos in zip(ids_today, pos_today):
                         pos_map_today[inst] = float(pos)
-
                     if not prev_map:
-                        day_trades = len(pos_map_today)  # openers
+                        day_trades = len(pos_map_today)
                     else:
-                        day_trades = 0
-                        for inst, pos in pos_map_today.items():
-                            prev_pos = float(prev_map.get(inst, 0.0))
-                            if pos != prev_pos:
-                                day_trades += 1
+                        day_trades = sum(1 for inst, pos in pos_map_today.items()
+                                         if pos != float(prev_map.get(inst, 0.0)))
                         day_trades += len(set(prev_map.keys()) - set(pos_map_today.keys()))
                     n_trades_today = float(day_trades)
                     prev_state_slice[key_sb] = {
-                        'Bt': float(np.nansum(b[mask_qb])),
-                        'mean_bet': float(np.nanmean(b[mask_qb])),
-                        'pos_map': pos_map_today,
-                    }
+                        'Bt': Bt, 'mean_bet': float(np.nanmean(b[mask_qb])), 'pos_map': pos_map_today}
                 else:
                     if empty_day_policy == "close":
                         n_trades_today = float(len(prev_map))
                         prev_state_slice[key_sb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
                     elif empty_day_policy == "carry":
-                        n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
-                    else:  # skip
+                        n_trades_today = np.nan if report_empty_trades_as_nan else 0.0
+                    else:
                         n_trades_today = np.nan
             else:
-                # proxy mode (no IDs)
                 if mask_qb.any():
-                    Bt_today = float(np.nansum(b[mask_qb]))
                     mean_bet = float(np.nanmean(b[mask_qb]))
-                    prev_Bt = float(prev.get('Bt', np.nan)) if prev and 'Bt' in prev else np.nan
-                    prev_mb = float(prev.get('mean_bet', np.nan)) if prev and 'mean_bet' in prev else np.nan
-
+                    prev_Bt  = float(prev.get('Bt', np.nan)) if prev and 'Bt' in prev else np.nan
+                    prev_mb  = float(prev.get('mean_bet', np.nan)) if prev and 'mean_bet' in prev else np.nan
                     if np.isfinite(prev_Bt):
-                        dBt = abs(Bt_today - prev_Bt)
+                        dBt   = abs(Bt - prev_Bt)
                         denom = mean_bet if mean_bet > 0 else (prev_mb if np.isfinite(prev_mb) and prev_mb > 0 else np.nan)
                         n_trades_today = (dBt / denom) if (np.isfinite(denom) and denom > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
                     else:
-                        n_trades_today = (Bt_today / mean_bet) if (mean_bet and mean_bet > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
-
-                    prev_state_slice[key_sb] = {'Bt': Bt_today, 'mean_bet': mean_bet, 'pos_map': {}}
+                        n_trades_today = (Bt / mean_bet) if mean_bet > 0 else (np.nan if report_empty_trades_as_nan else 0.0)
+                    prev_state_slice[key_sb] = {'Bt': Bt, 'mean_bet': mean_bet, 'pos_map': {}}
                 else:
                     if empty_day_policy == "close":
                         prev_Bt = float(prev.get('Bt', 0.0) or 0.0)
@@ -224,148 +231,144 @@ def _compute_daily_stats_for_one_signal(
                         n_trades_today = (prev_Bt / prev_mb) if prev_mb > 0 else 0.0
                         prev_state_slice[key_sb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
                     elif empty_day_policy == "carry":
-                        n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
+                        n_trades_today = np.nan if report_empty_trades_as_nan else 0.0
                     else:
                         n_trades_today = np.nan
 
-            # per-target metrics
             for target in target_cols:
                 if target == "__ALL__":
-                    # Do not emit n_trades / nrInstr for pseudo targets
                     continue
                 y = df_np.get(target)
                 if y is None:
                     continue
                 y_fin = np.isfinite(y)
+
+                # m: finite bet + finite target → used for PnL, regression, n_trades per target
                 m = mask_qb & y_fin
 
-                # nrInstr and n_trades are target-specific
-                if id_arr is not None:
-                    nr_instr_today = int(np.unique(id_arr[m]).size) if m.any() else 0
-                else:
-                    nr_instr_today = int(m.sum()) if m.any() else 0
+                # m_hit: finite signal(≠0) + finite target, NO bet — for hit_ratio only.
+                # nrInstr = |U_t^(q)| is target-independent; use nr_instr_today (from mask_q).
+                m_hit = mask_q & y_fin
 
-                key_sqtb = (signal, qlabel, target, bet)
-                prev = prev_state_slice.get(key_sqtb, {})
-                prev_map = prev.get('pos_map', {}) if isinstance(prev.get('pos_map', {}), dict) else {}
+                # n_trades per (target, bet): position-diff diagnostic
+                key_sqtb     = (signal, qlabel, target, bet)
+                prev_tgt     = prev_state_slice.get(key_sqtb, {})
+                prev_map_tgt = prev_tgt.get('pos_map', {}) if isinstance(prev_tgt.get('pos_map', {}), dict) else {}
 
                 if id_arr is not None:
                     if m.any():
-                        pos_today = (sgn[m] * b[m]).astype('float64', copy=False)
-                        ids_today = id_arr[m]
-                        pos_map_today: Dict = {inst: float(pos) for inst, pos in zip(ids_today, pos_today)}
-
-                        if not prev_map:
-                            day_trades = len(pos_map_today)
+                        pos_today_t = (sgn[m] * b[m]).astype('float64', copy=False)
+                        ids_today_t = id_arr[m]
+                        pos_map_t   = {inst: float(pos) for inst, pos in zip(ids_today_t, pos_today_t)}
+                        if not prev_map_tgt:
+                            day_trades_t = len(pos_map_t)
                         else:
-                            day_trades = 0
-                            for inst, pos in pos_map_today.items():
-                                prev_pos = float(prev_map.get(inst, 0.0))
-                                if pos != prev_pos:
-                                    day_trades += 1
-                            day_trades += len(set(prev_map.keys()) - set(pos_map_today.keys()))
-                        n_trades_today = float(day_trades)
+                            day_trades_t = sum(1 for inst, pos in pos_map_t.items()
+                                               if pos != float(prev_map_tgt.get(inst, 0.0)))
+                            day_trades_t += len(set(prev_map_tgt.keys()) - set(pos_map_t.keys()))
+                        n_trades_tgt = float(day_trades_t)
                         prev_state_slice[key_sqtb] = {
-                            'Bt': float(np.nansum(b[m])),
-                            'mean_bet': float(np.nanmean(b[m])),
-                            'pos_map': pos_map_today,
-                        }
+                            'Bt': float(np.nansum(b[m])), 'mean_bet': float(np.nanmean(b[m])), 'pos_map': pos_map_t}
                     else:
                         if empty_day_policy == "close":
-                            n_trades_today = float(len(prev_map))
+                            n_trades_tgt = float(len(prev_map_tgt))
                             prev_state_slice[key_sqtb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
                         elif empty_day_policy == "carry":
-                            n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
+                            n_trades_tgt = np.nan if report_empty_trades_as_nan else 0.0
                         else:
-                            n_trades_today = np.nan
+                            n_trades_tgt = np.nan
                 else:
                     if m.any():
-                        Bt_today = float(np.nansum(b[m]))
-                        mean_bet = float(np.nanmean(b[m]))
-                        prev_Bt = float(prev.get('Bt', np.nan)) if prev and 'Bt' in prev else np.nan
-                        prev_mb = float(prev.get('mean_bet', np.nan)) if prev and 'mean_bet' in prev else np.nan
-
-                        if np.isfinite(prev_Bt):
-                            dBt = abs(Bt_today - prev_Bt)
-                            denom = mean_bet if mean_bet > 0 else (prev_mb if np.isfinite(prev_mb) and prev_mb > 0 else np.nan)
-                            n_trades_today = (dBt / denom) if (np.isfinite(denom) and denom > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
+                        Bt_t     = float(np.nansum(b[m]))
+                        mb_t     = float(np.nanmean(b[m]))
+                        prev_Bt_t = float(prev_tgt.get('Bt', np.nan)) if prev_tgt and 'Bt' in prev_tgt else np.nan
+                        prev_mb_t = float(prev_tgt.get('mean_bet', np.nan)) if prev_tgt and 'mean_bet' in prev_tgt else np.nan
+                        if np.isfinite(prev_Bt_t):
+                            dBt_t   = abs(Bt_t - prev_Bt_t)
+                            denom_t = mb_t if mb_t > 0 else (prev_mb_t if np.isfinite(prev_mb_t) and prev_mb_t > 0 else np.nan)
+                            n_trades_tgt = (dBt_t / denom_t) if (np.isfinite(denom_t) and denom_t > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
                         else:
-                            n_trades_today = (Bt_today / mean_bet) if (mean_bet and mean_bet > 0) else (np.nan if report_empty_trades_as_nan else 0.0)
-
-                        prev_state_slice[key_sqtb] = {'Bt': Bt_today, 'mean_bet': mean_bet, 'pos_map': {}}
+                            n_trades_tgt = (Bt_t / mb_t) if mb_t > 0 else (np.nan if report_empty_trades_as_nan else 0.0)
+                        prev_state_slice[key_sqtb] = {'Bt': Bt_t, 'mean_bet': mb_t, 'pos_map': {}}
                     else:
                         if empty_day_policy == "close":
-                            prev_Bt = float(prev.get('Bt', 0.0) or 0.0)
-                            prev_mb = float(prev.get('mean_bet', 0.0) or 0.0)
-                            n_trades_today = (prev_Bt / prev_mb) if prev_mb > 0 else 0.0
+                            prev_Bt_t = float(prev_tgt.get('Bt', 0.0) or 0.0)
+                            prev_mb_t = float(prev_tgt.get('mean_bet', 0.0) or 0.0)
+                            n_trades_tgt = (prev_Bt_t / prev_mb_t) if prev_mb_t > 0 else 0.0
                             prev_state_slice[key_sqtb] = {'Bt': 0.0, 'mean_bet': 0.0, 'pos_map': {}}
                         elif empty_day_policy == "carry":
-                            n_trades_today = (np.nan if report_empty_trades_as_nan else 0.0)
+                            n_trades_tgt = np.nan if report_empty_trades_as_nan else 0.0
                         else:
-                            n_trades_today = np.nan
+                            n_trades_tgt = np.nan
+
+                # -------------------------------------------------------
+                # PnL: Σ sign(si)·fi·bi over instruments with finite s, b, f.
+                # NaN targets are excluded (m already requires y_fin).
+                # sizeNotional: B_t = Σ bi over mask_qb (all finite-bet instruments),
+                # target-independent per Eq.11. Same B_t used as PPD denominator so
+                # pnl / sizeNotional == ppd exactly (verification-safe).
+                # -------------------------------------------------------
+                if m.any():
+                    pnl_vec  = sgn[m] * y[m] * b[m]
+                    pnl      = float(np.nansum(pnl_vec))
+                else:
+                    pnl_vec  = np.array([], dtype='float64')
+                    pnl      = 0.0
+
+                # PPD = PnL / B_t (Eq.14). B_t = Bt (computed above, target-independent).
+                ppd = (pnl / Bt) if Bt > 0 else np.nan
+
+                # hit_ratio — bet-independent (Cucuringu §5.10)
+                # Computed from m_hit (mask_q & y_fin), NOT from m (mask_qb & y_fin).
+                # Must be outside the if m.any() block so it is computed whenever
+                # there are instruments with finite signal and target, regardless of bets.
+                if m_hit.any():
+                    y_hit     = y[m_hit]
+                    s_hit     = sgn[m_hit]
+                    nonzero_y = y_hit != 0.0
+                    hit_ratio = float(np.mean(s_hit[nonzero_y] == np.sign(y_hit[nonzero_y]))) if nonzero_y.any() else np.nan
+                else:
+                    hit_ratio = np.nan
 
                 if m.any():
-                    pnl_vec = sgn[m] * y[m] * b[m]
-                    pnl = float(np.nansum(pnl_vec))
-                    notional = float(np.nansum(b[m]))
-                    ppd = (pnl / notional) if notional > 0 else np.nan
-
-                    # Extras
-                    # hit_ratio: fraction where sign(s_i) = sign(fret_i), excluding fret_i = 0
-                    # Benchmark PDF §5.10: pure sign comparison, independent of bet size
-                    nonzero_y = y[m] != 0.0
-                    if nonzero_y.any():
-                        hit_ratio = float(np.mean(sgn[m][nonzero_y] == np.sign(y[m][nonzero_y])))
-                    else:
-                        hit_ratio = np.nan
-                    long_ratio = float(np.nanmean(sgn[m] > 0)) if sgn[m].size else np.nan
-                    n = int(m.sum())
-                    # Simple cross-sectional regression stats (y on s)
+                    # Cross-sectional regression (y on s) over bet-filtered portfolio
+                    n      = int(m.sum())
                     s_vals = s[m].astype('float64', copy=False)
                     y_vals = y[m].astype('float64', copy=False)
-                    s_mean = np.nanmean(s_vals)
-                    y_mean = np.nanmean(y_vals)
-                    s_dev = s_vals - s_mean
-                    y_dev = y_vals - y_mean
-                    s_var = float(np.nanvar(s_vals, ddof=0)) if n > 1 else np.nan
-                    cov = float(np.nanmean(s_dev * y_dev)) if n > 0 else np.nan
-                    beta = (cov / s_var) if (np.isfinite(cov) and np.isfinite(s_var) and s_var > 0) else np.nan
-                    s_std = math.sqrt(s_var) if np.isfinite(s_var) and s_var > 0 else np.nan
-                    y_std = float(np.nanstd(y_vals, ddof=0)) if n > 1 else np.nan
-                    r = (cov / (s_std * y_std)) if (np.isfinite(cov) and np.isfinite(s_std) and np.isfinite(y_std) and s_std > 0 and y_std > 0) else np.nan
-                    r2 = float(r * r) if np.isfinite(r) else np.nan
-                    t_stat = (r * math.sqrt(n - 2) / math.sqrt(1 - r * r)) if (np.isfinite(r) and n > 2 and (1 - r * r) > 0) else np.nan
+                    s_mean = np.nanmean(s_vals); y_mean = np.nanmean(y_vals)
+                    s_dev  = s_vals - s_mean;    y_dev  = y_vals - y_mean
+                    s_var  = float(np.nanvar(s_vals, ddof=0)) if n > 1 else np.nan
+                    cov    = float(np.nanmean(s_dev * y_dev)) if n > 0 else np.nan
+                    s_std  = math.sqrt(s_var) if np.isfinite(s_var) and s_var > 0 else np.nan
+                    y_std  = float(np.nanstd(y_vals, ddof=0)) if n > 1 else np.nan
+                    r      = (cov / (s_std * y_std)) if (np.isfinite(cov) and s_std and y_std and s_std > 0 and y_std > 0) else np.nan
+                    r2     = float(r * r) if np.isfinite(r) else np.nan
+                    t_stat = (r * math.sqrt(n - 2) / math.sqrt(max(1e-15, 1.0 - r * r))) if (np.isfinite(r) and n > 2 and (1.0 - r * r) > 0) else np.nan
+                    # Cross-sectional Sharpe proxy only — true annualised Sharpe (Eq.7) in summary_stats
                     sharpe = (np.nanmean(pnl_vec) / np.nanstd(pnl_vec, ddof=1)) if (pnl_vec.size > 1 and np.nanstd(pnl_vec, ddof=1) > 0) else np.nan
                 else:
-                    pnl = 0.0
-                    notional = 0.0
-                    ppd = np.nan
-                    hit_ratio = np.nan
-                    long_ratio = np.nan
-                    r2 = np.nan
-                    t_stat = np.nan
-                    sharpe = np.nan
+                    # hit_ratio already computed above from m_hit (bet-independent)
+                    r2 = np.nan; t_stat = np.nan; sharpe = np.nan
 
                 stats['pnl'][signal][qlabel][target][bet]          = pnl
                 stats['ppd'][signal][qlabel][target][bet]          = ppd
-                stats['sizeNotional'][signal][qlabel][target][bet] = notional
+                # sizeNotional = B_t (Eq.11, target-independent); ppd = pnl/sizeNotional exactly
+                stats['sizeNotional'][signal][qlabel][target][bet] = Bt
+                # nrInstr = |U_t^(q)|: bet-independent AND target-independent (Cucuringu §5.10)
+                # Use nr_instr_today (from mask_q only), not nr_instr_tgt (which conditions on y_fin)
                 stats['nrInstr'][signal][qlabel][target][bet]      = nr_instr_today
-                ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
-                stats['n_trades'][signal][qlabel][target][bet]     = ntr
+                stats['n_trades'][signal][qlabel][target][bet]     = float(n_trades_tgt) if np.isfinite(n_trades_tgt) else np.nan
                 stats['hit_ratio'][signal][qlabel][target][bet]    = hit_ratio
-                stats['long_ratio'][signal][qlabel][target][bet]   = long_ratio
+                stats['long_ratio'][signal][qlabel][target][bet]   = long_ratio_q
                 stats['r2'][signal][qlabel][target][bet]           = r2
                 stats['t_stat'][signal][qlabel][target][bet]       = t_stat
                 stats['sharpe'][signal][qlabel][target][bet]       = sharpe
 
-            # Store nrInstr and n_trades once per (signal, qrank, bet) under target="__ALL__"
-            stats['nrInstr'][signal][qlabel]['__ALL__'][bet] = nr_instr_today
-            ntr = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
-            stats['n_trades'][signal][qlabel]['__ALL__'][bet] = ntr
+            # __ALL__ target aggregates
+            stats['nrInstr'][signal][qlabel]['__ALL__'][bet]  = nr_instr_today
+            stats['n_trades'][signal][qlabel]['__ALL__'][bet] = float(n_trades_today) if np.isfinite(n_trades_today) else np.nan
 
-    # Optional raw distributions (thin sampling) per signal
     if enable_distributions:
-        # targets
         for target in target_cols:
             y = df_np.get(target)
             if y is None:
@@ -374,10 +377,8 @@ def _compute_daily_stats_for_one_signal(
             if y.size == 0:
                 continue
             if y.size > max_dist_samples_per_series:
-                idx = rng.choice(y.size, size=max_dist_samples_per_series, replace=False)
-                y = y[idx]
+                y = y[rng.choice(y.size, size=max_dist_samples_per_series, replace=False)]
             stats['fret_value'][f'__S__{signal}']['__ALL__'][target]['__ALL__'] = float(np.nanmean(y))
-        # bet columns
         for bet in bet_size_cols:
             b = df_np.get(bet)
             if b is None:
@@ -386,8 +387,7 @@ def _compute_daily_stats_for_one_signal(
             if x.size == 0:
                 continue
             if x.size > max_dist_samples_per_series:
-                idx = rng.choice(x.size, size=max_dist_samples_per_series, replace=False)
-                x = x[idx]
+                x = x[rng.choice(x.size, size=max_dist_samples_per_series, replace=False)]
             stats['betsize_value'][f'__B__{bet}']['__ALL__']['__ALL__'][bet] = float(np.nanmean(x))
 
     return stats, prev_state_slice
@@ -400,76 +400,57 @@ def compute_daily_stats(
     quantiles: Sequence[float] = (1.0, 0.75, 0.5, 0.25),
     bet_size_cols: Sequence[str] = ('betsize_equal',),
     prev_state: MutableMapping | None = None,
-    type_quantile: str = 'cumulative',   # 'cumulative' (top-K) or 'quantEach' (bucket)
-    # ---- RAW distribution rows (for plotting histograms) ----
+    type_quantile: str = 'cumulative',
     enable_distributions: bool = False,
     max_dist_samples_per_series: int = 50_000,
     random_state=None,
-    # ---- Empty-slice handling (default 'carry' so state persists across empties)
-    empty_day_policy: str = "carry",     # 'close' | 'carry' | 'skip'
-    # ---- Reporting tweak on empties under "carry"
+    empty_day_policy: str = "carry",
     report_empty_trades_as_nan: bool = True,
-    # ---- Parallelism
-    n_jobs: int = 1,                     # >1 => threads per-signal
+    n_jobs: int = 1,
 ):
-    """Per-day cross-section stats (single date), optionally parallelized per signal."""
     import pandas as pd
 
     if prev_state is None:
         prev_state = _GLOBAL_PREV_STATE
 
-    rng = np.random.default_rng(random_state)
+    rng   = np.random.default_rng(random_state)
     stats = create_5d_stats()
 
-    # ----------------------------
-    # Column preparation (FAST)
-    # ----------------------------
     id_col = 'ticker' if 'ticker' in df.columns else None
-
     want_numeric = (set(signal_cols) | set(target_cols) | set(bet_size_cols)) - ({id_col} if id_col else set())
     df_np: Dict[str, np.ndarray] = {}
 
     for col in want_numeric:
         if col not in df.columns:
             continue
-        arr = pd.to_numeric(df[col], errors='coerce').to_numpy()
-        arr = arr.astype('float64', copy=False)
+        arr = pd.to_numeric(df[col], errors='coerce').to_numpy().astype('float64', copy=False)
         arr[~np.isfinite(arr)] = np.nan
         df_np[col] = arr
 
     id_arr = df[id_col].to_numpy() if id_col else None
 
-    n = len(df)
-    if n == 0:
+    if len(df) == 0:
         return stats
 
-    # Prepare per-signal prev_state slices
-    def _slice_state_for_signal(sig: str) -> Dict:
-        out = {}
-        for k, v in prev_state.items():
-            if isinstance(k, tuple) and len(k) == 3 and k[0] == sig:
-                out[k] = v
-        return out
+    def _slice_state(sig: str) -> Dict:
+        return {k: v for k, v in prev_state.items()
+                if isinstance(k, tuple) and len(k) >= 3 and k[0] == sig}
 
-    signals = [s for s in signal_cols if s in df_np]
+    signals   = [s for s in signal_cols if s in df_np]
     n_threads = min(max(1, int(n_jobs or 1)), len(signals) or 1)
 
     if n_threads == 1:
         for signal in signals:
             stats_sig, st_sig = _compute_daily_stats_for_one_signal(
-                signal=signal,
-                df_np=df_np,
-                id_arr=id_arr,
-                target_cols=target_cols,
-                quantiles=quantiles,
-                bet_size_cols=bet_size_cols,
-                type_quantile=type_quantile,
+                signal=signal, df_np=df_np, id_arr=id_arr,
+                target_cols=target_cols, quantiles=quantiles,
+                bet_size_cols=bet_size_cols, type_quantile=type_quantile,
                 enable_distributions=enable_distributions,
                 max_dist_samples_per_series=max_dist_samples_per_series,
                 rng_state=None if random_state is None else int(rng.integers(0, 2**31 - 1)),
                 empty_day_policy=empty_day_policy,
                 report_empty_trades_as_nan=report_empty_trades_as_nan,
-                prev_state_slice=_slice_state_for_signal(signal),
+                prev_state_slice=_slice_state(signal),
             )
             _merge_signal_branch(stats, stats_sig, signal)
             prev_state.update(st_sig)
@@ -479,23 +460,13 @@ def compute_daily_stats(
             for signal in signals:
                 futs.append(ex.submit(
                     _compute_daily_stats_for_one_signal,
-                    signal,
-                    df_np,
-                    id_arr,
-                    target_cols,
-                    quantiles,
-                    bet_size_cols,
-                    type_quantile,
-                    enable_distributions,
-                    max_dist_samples_per_series,
+                    signal, df_np, id_arr, target_cols, quantiles, bet_size_cols,
+                    type_quantile, enable_distributions, max_dist_samples_per_series,
                     None if random_state is None else int(rng.integers(0, 2**31 - 1)),
-                    empty_day_policy,
-                    report_empty_trades_as_nan,
-                    _slice_state_for_signal(signal),
+                    empty_day_policy, report_empty_trades_as_nan, _slice_state(signal),
                 ))
             for fut in as_completed(futs):
                 stats_sig, st_sig = fut.result()
-                # find signal name inside branch (fallbacks safe)
                 try:
                     sig_name = next(iter(next(iter(stats_sig.values())).keys()))
                 except Exception:
@@ -505,10 +476,8 @@ def compute_daily_stats(
 
     return stats
 
-# ========================= YEAR-AWARE OVERRIDE HELPERS ========================
 
 def _snapshot_prev_book_counts(prev_state: MutableMapping) -> Dict[tuple, int]:
-    """(signal, qlabel, bet) -> count of open names in carried book."""
     out = {}
     for key_sb, obj in prev_state.items():
         if not isinstance(key_sb, tuple) or len(key_sb) != 3:
@@ -522,33 +491,24 @@ def _snapshot_prev_book_counts(prev_state: MutableMapping) -> Dict[tuple, int]:
             out[key_sb] = int(round(Bt / mb)) if mb > 0 else 0
     return out
 
+
 def _apply_year_opening_override(stats: Dict, prev_counts: Dict[tuple, int], override_if: str = "zero_or_nan"):
-    """
-    On the first trading day of a year, for each (signal, qlabel, bet),
-    if n_trades meets the condition, set to prev_counts[(signal, qlabel, bet)].
-    """
-    def _should_override(x):
-        if override_if == "always":
-            return True
-        if override_if == "zero_or_nan":
-            return (x is None) or (not math.isfinite(x)) or (x == 0.0)
-        if override_if == "nan_only":
-            return (x is None) or (not math.isfinite(x))
+    def _should(x):
+        if override_if == "always":         return True
+        if override_if == "zero_or_nan":    return (x is None) or (not math.isfinite(x)) or (x == 0.0)
+        if override_if == "nan_only":       return (x is None) or (not math.isfinite(x))
         return False
 
-    ntr_tree = stats.get('n_trades', {})
-    for signal, qdict in ntr_tree.items():
+    for signal, qdict in stats.get('n_trades', {}).items():
         for qlabel, tdict in qdict.items():
             for _, bdict in tdict.items():
                 for bet, ntr_val in list(bdict.items()):
                     k = (signal, qlabel, bet)
-                    if k in prev_counts and _should_override(ntr_val):
+                    if k in prev_counts and _should(ntr_val):
                         bdict[bet] = float(prev_counts[k])
 
-# ========================= SERIES RUNNERS (with override) =====================
 
 def compute_series_continuous(df_sorted_by_date, date_col: str, **kwargs):
-    """Original continuous runner (no year-aware override)."""
     import pandas as pd
     prev = kwargs.pop('prev_state', None)
     if prev is None:
@@ -558,39 +518,31 @@ def compute_series_continuous(df_sorted_by_date, date_col: str, **kwargs):
         out.append((pd.Timestamp(d), compute_daily_stats(df_day, prev_state=prev, **kwargs)))
     return out
 
+
 def compute_series_continuous_yearaware(
     df_sorted_by_date, date_col: str,
-    *, override_if: str = "zero_or_nan",  # "zero_or_nan" | "nan_only" | "always"
+    *, override_if: str = "zero_or_nan",
     **kwargs
 ):
-    """
-    Continuous runner that, on the first trading day of each calendar year, replaces
-    n_trades with the size of yesterday's carried book when n_trades would be 0/NaN.
-    """
     import pandas as pd
-
-    prev = kwargs.pop('prev_state', None)
+    prev      = kwargs.pop('prev_state', None)
     if prev is None:
         prev = get_trading_state()
-
-    out = []
+    out       = []
     prev_year = None
 
     for d, df_day in df_sorted_by_date.sort_values(date_col).groupby(date_col):
-        ts = pd.Timestamp(d)
+        ts           = pd.Timestamp(d)
         year_changed = (prev_year is not None) and (ts.year != prev_year)
-
-        prev_counts = _snapshot_prev_book_counts(prev) if year_changed else None
-
-        stats = compute_daily_stats(df_day, prev_state=prev, **kwargs)
-
+        prev_counts  = _snapshot_prev_book_counts(prev) if year_changed else None
+        stats        = compute_daily_stats(df_day, prev_state=prev, **kwargs)
         if year_changed and prev_counts:
             _apply_year_opening_override(stats, prev_counts, override_if=override_if)
-
         out.append((ts, stats))
         prev_year = ts.year
 
     return out
+
 
 __all__ = [
     'compute_daily_stats',

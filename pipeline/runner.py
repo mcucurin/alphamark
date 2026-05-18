@@ -649,9 +649,9 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                                              bet_size_cols, quantiles)
                 if vwarns:
                     for w in vwarns[:5]:  # cap at 5 warnings per day
-                        print(f"⚠️  VERIFY {w}")
+                        print(f"VERIFY {w}")
                     if len(vwarns) > 5:
-                        print(f"⚠️  VERIFY  ... and {len(vwarns) - 5} more warnings for {day_str}")
+                        print(f"VERIFY  ... and {len(vwarns) - 5} more warnings for {day_str}")
                 else:
                     print(f"Verification passed for {day_str}")
             else:
