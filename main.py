@@ -70,9 +70,9 @@ DEFAULT_RUNNER_CONFIG = {
     "output_root": "output",
 
     # ========== Column Discovery ==========
-    "signal_prefix": "pret_",       "signal_regex": None,
-    "target_prefix": "fret_",       "target_regex": None,
-    "bet_prefix":    "betsize_",    "bet_regex":    None,
+    "signal_prefix": "pret_",       "signal_regex": None,       "signal_list": None,
+    "target_prefix": "fret_",       "target_regex": None,       "target_list": None,
+    "bet_prefix":    "betsize_",    "bet_regex":    None,       "bet_list": None,
 
     # ========== Market Proxy (SPY) ==========
     "spy_ticker":      "SPY",
