@@ -173,7 +173,7 @@ DEFAULT_PLOT_CONFIG = {
         "qr_100": "#2166AC",   # steel blue
         "qr_75":  "#4DAC26",   # muted green
         "qr_50":  "#D6604D",   # muted coral
-        "qr_25":  "#878787",   # medium grey
+        "qr_25":  "#9970AB",   # muted purple
     },
 
     # ========== Layout and Metadata ==========

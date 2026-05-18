@@ -349,8 +349,41 @@ def _draw_heatmap(fig, ax, cax, M, labels, title, vmin=-1, vmax=1, fmt=".2f"):
         return
     k    = len(labels)
     fs_l = 9 if k <= 18 else (7 if k <= 30 else 6)
-    fs_c = 8 if k <= 18 else (6 if k <= 30 else 5)
-    im   = ax.imshow(M, vmin=vmin, vmax=vmax, cmap="RdYlBu_r", aspect="equal",
+    # Larger annotation font for small matrices (e.g. 5x5)
+    fs_c = 11 if k <= 6 else (9 if k <= 12 else (7 if k <= 18 else (5 if k <= 30 else 4)))
+
+    # Data-adaptive colour range: expand symmetrically around the data's actual range
+    # but always keep 0 centred so the colormap is interpretable.
+    # For correlation matrices almost all values will be near 1; zooming in makes
+    # small differences visible (e.g. 0.95 vs 0.99 actually look different).
+    fin_vals = M[np.isfinite(M)]
+    d_min_data = vmin  # track actual data min for colorbar ticks
+    d_max_data = vmax
+    if fin_vals.size > 0:
+        d_min_data = float(np.nanmin(fin_vals))
+        d_max_data = float(np.nanmax(fin_vals))
+        d_range    = d_max_data - d_min_data
+        if d_range < 0.15:
+            # Tightly clustered — pad the colour scale beyond the data range
+            # so neighbouring cells look similar rather than dramatically different.
+            # Pad = 4× data range below, tiny pad above (keep max anchor visible).
+            pad  = max(0.06, d_range * 4.0)
+            if d_min_data >= 0:
+                vmin = max(0.0,  d_min_data - pad)
+                vmax = min(1.0,  d_max_data + 0.005)
+            else:
+                vmin = max(-1.0, d_min_data - pad)
+                vmax = min(1.0,  d_max_data + pad)
+        else:
+            abs_max = max(abs(d_min_data), abs(d_max_data))
+            vmin = max(-1.0, -abs_max)
+            vmax = min(1.0,   abs_max)
+            d_min_data = vmin; d_max_data = vmax
+    # else keep caller-supplied vmin/vmax
+
+    # Colormap selection:
+    _cmap = "RdYlBu_r"
+    im   = ax.imshow(M, vmin=vmin, vmax=vmax, cmap=_cmap, aspect="equal",
                      interpolation="nearest")
     _set_title(fig, ax, title, base=13, pad=10)
     ax.set_xticks(range(k)); ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=fs_l)
@@ -362,13 +395,27 @@ def _draw_heatmap(fig, ax, cax, M, labels, title, vmin=-1, vmax=1, fmt=".2f"):
     for spine in ax.spines.values():
         spine.set_visible(False)
     ax.set_facecolor("white")
+    # Annotation colour: white text on dark cells, dark text on light cells.
+    # Use the 70th percentile of the data as the threshold so most cells get
+    # white text (readable on the darker upper end of the scale).
+    mid = float(np.nanpercentile(M[np.isfinite(M)], 70)) if fin_vals.size > 0 else 0.5 * (vmin + vmax)
     for i in range(k):
         for j in range(k):
             v = M[i, j]
             if np.isfinite(v):
+                txt_color = "white" if v >= mid else "0.15"
                 ax.text(j, i, format(v, fmt), ha="center", va="center",
-                        fontsize=fs_c, color="white" if abs(v) >= 0.5 else "black")
-    fig.colorbar(im, cax=cax).ax.tick_params(labelsize=9)
+                        fontsize=fs_c, color=txt_color, fontweight="semibold")
+    cb = fig.colorbar(im, cax=cax)
+    cb.ax.tick_params(labelsize=8.5)
+    # Colorbar ticks: show actual data range (not padded vmin/vmax)
+    # so the reader sees meaningful values, not the internal padding.
+    t_lo  = round(d_min_data, 2)
+    t_hi  = round(d_max_data, 2)
+    t_mid = round((t_lo + t_hi) / 2, 2)
+    ticks = sorted({t_lo, t_mid, t_hi})
+    cb.set_ticks(ticks)
+    cb.ax.yaxis.set_major_formatter(mpl.ticker.FormatStrFormatter("%.2f"))
 
 
 def _minp(w, floor=3):
@@ -1100,7 +1147,7 @@ def generate_quantile_report(config: dict):
         "qr_100": "#2166AC",   # steel blue
         "qr_75":  "#4DAC26",   # muted green
         "qr_50":  "#D6604D",   # muted coral/red
-        "qr_25":  "#878787",   # medium grey
+        "qr_25":  "#9970AB",   # muted purple — more visible than grey on warm white
     }
     _LEGACY_Q_COLORS = {
         "qr_100": "red",  "qr_75": "green",
