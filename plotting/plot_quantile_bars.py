@@ -817,20 +817,26 @@ def _tok(base, w, cum=False):
     return f"Rolling-mean {base} ({int(w)}D)" if (w and int(w) > 1) else base
 
 
+def _rtitle(label, w):
+    """Return 'X-day mean — label' when w>1, else just 'label'."""
+    w = max(1, int(w))
+    return f"{w}-day mean — {label}" if w > 1 else label
+
+
 def _metric_series(metric, df, roll_windows, roll_sharpe):
     name = _canonical(str(metric))
     if df is None or df.empty:
         return None, None
 
     if name == "pnl":
+        # Cumulative sum — rolling mean on a cumsum is nonsensical; always raw.
         s = _series(df, "pnl")
         if s.empty:
             return None, None
-        return _tok("PNL", roll_windows.get("pnl", 1), cum=True), _roll_mean(s.cumsum(), roll_windows.get("pnl", 1))
+        return "Cumulative PnL", s.cumsum()
 
     if name == "ppd":
-        # Cumulative PPD in bps = (cumΣPnL / cumΣB_t) × 10000
-        # sizeNotional = ΣB_t (Eq.11), same as PPD denominator, so this is exact
+        # Cumulative PPD in bps = (cumΣPnL / cumΣB_t) × 10000 — always raw.
         pnl = _series(df, "pnl"); sn = _series(df, "sizeNotional")
         if pnl.empty or sn.empty:
             return None, None
@@ -839,44 +845,40 @@ def _metric_series(metric, df, roll_windows, roll_sharpe):
             return None, None
         cum["cp"] = cum["pnl"].cumsum()
         cum["cs"] = cum["sizeNotional"].cumsum()
-        cs_arr    = cum["cs"].to_numpy()
-        # Suppress startup spike: require cumulative notional to reach at least
-        # min(5% of max, value at day-20) before showing ratio.
-        # For short intervals (<20 days), no suppression is applied.
-        T         = len(cs_arr)
-        cs_max    = np.nanmax(cs_arr) if cs_arr.size else 0.0
-        if T >= 20 and cs_max > 0:
-            warmup_val = cs_arr[min(19, T - 1)]               # notional at day 20
-            cs_thresh  = min(0.05 * cs_max, float(warmup_val) if np.isfinite(warmup_val) else 0.0)
-        else:
-            cs_thresh = 0.0                                    # no suppression for short intervals
-        valid = np.isfinite(cs_arr) & (cs_arr > max(cs_thresh, 1e-12))
+        cs_arr = cum["cs"].to_numpy()
+        valid  = np.isfinite(cs_arr) & (cs_arr > 1e-12)
         y = np.divide(cum["cp"], cum["cs"],
                       out=np.full(len(cum), np.nan, dtype=float),
                       where=valid)
-        y = pd.Series(y, index=cum.index) * 10000.0
-        return _tok("PPD (bps)", roll_windows.get("ppd", 1), cum=True), _roll_mean(y, roll_windows.get("ppd", 1))
-
-    if name == "nrInstr":
-        s = _series(df, "nrInstr")
-        if s.empty:
-            return None, None
-        w = roll_windows.get("nrInstr", 1)
-        return _tok("nrInstr", w), _roll_mean(s, w)
+        return "Cumulative PPD (bps)", pd.Series(y, index=cum.index) * 10000.0
 
     if name == "n_trades":
         s = _series(df, "n_trades")
         if s.empty:
             return None, None
         w = roll_windows.get("n_trades", 1)
-        return _tok("n_trades", w), _roll_mean(s, w)
+        return _rtitle("Daily Trades", w), _roll_mean(s, w)
 
     if name == "sizeNotional":
         s = _series(df, "sizeNotional")
         if s.empty:
             return None, None
         w = roll_windows.get("sizeNotional", 1)
-        return _tok("Daily Notional ($M)", w), _roll_mean(s, w) / 1e6
+        return _rtitle("Daily Notional ($M)", w), _roll_mean(s, w) / 1e6
+
+    if name == "nrInstr":
+        s = _series(df, "nrInstr")
+        if s.empty:
+            return None, None
+        w = roll_windows.get("nrInstr", 1)
+        return _rtitle("Nr. Instruments", w), _roll_mean(s, w)
+
+    if name == "hit_ratio":
+        s = _series(df, "hit_ratio")
+        if s.empty:
+            return None, None
+        w = roll_windows.get("hit_ratio", 1)
+        return _rtitle("Hit Ratio", w), _roll_mean(s, w)
 
     if name == "sharpe":
         pnl = _series(df, "pnl")
@@ -889,7 +891,7 @@ def _metric_series(metric, df, roll_windows, roll_sharpe):
     if s.empty:
         return None, None
     w = roll_windows.get(name, roll_windows.get("__default__", 1))
-    return _tok(name, w), (_roll_mean(s, w) if w and int(w) > 1 else s)
+    return _rtitle(name, w), (_roll_mean(s, w) if w and int(w) > 1 else s)
 
 
 def _plot_temporal_grid(pdf, df, qranks, qcolors, metrics, roll_windows,
@@ -1109,18 +1111,16 @@ def generate_quantile_report(config: dict):
     outliers_dir   = config["outliers_dir"]
     output_pdf     = config["output_pdf"]
 
-    qranks_req  = [str(q) for q in config.get("qranks", [])][:4]
-    allow_miss  = bool(config.get("allow_missing_qranks", False))
+    qranks_req  = [str(q) for q in config.get("qranks", [])]
 
     roll_h1     = int(config.get("roll_h1_lines",    30))
     roll_h2     = int(config.get("roll_h2_lines",    30))
     roll_h3     = int(config.get("roll_h3_lines",     1))
-    roll_nr     = int(config.get("roll_nrinstr",      1))
-    roll_ppd    = int(config.get("roll_ppd",          1))
-    roll_tr     = int(config.get("roll_trades",       1))
-    roll_pnl    = int(config.get("roll_pnl",          1))
-    roll_sn     = int(config.get("roll_size_notional",1))
-    roll_sr     = int(config.get("roll_sharpe",      60))
+    roll_nr     = int(config.get("roll_nrinstr",       1))
+    roll_tr     = int(config.get("roll_trades",        1))
+    roll_sn     = int(config.get("roll_size_notional", 1))
+    roll_sr     = int(config.get("roll_sharpe",       60))
+    roll_hit    = int(config.get("roll_hit_ratio",     1))
 
     temp_vars   = _norm_metrics(config.get("variables_temporal_plot", [])) or ["pnl", "ppd", "n_trades", "sizeNotional", "sharpe"]
     arr_dim     = config.get("arrayDim_temporal_plot", (2, 2))
@@ -1138,7 +1138,7 @@ def generate_quantile_report(config: dict):
     out_topk    = int(config.get("outlier_top_k",          3))
     out_pp      = int(config.get("outlier_tables_per_page", 3))
 
-    style1      = config.get("style_first", "-")
+    style1      = config.get("line_style", "-")
     # Default quantile color palette: muted, colorblind-safe, publication quality.
     # User can override via config["quantile_colors"] — but only if they've changed
     # from the old matplotlib defaults (red/green/blue/black). This prevents
@@ -1181,11 +1181,10 @@ def generate_quantile_report(config: dict):
     if not qranks_req:
         qranks = qranks_all
     else:
-        if not allow_miss:
-            missing = [q for q in qranks_req if q not in qranks_all]
-            if missing:
-                print(f"[WARN] qranks not found, ignored: {missing}")
-        qranks = [q for q in qranks_req if (allow_miss or q in qranks_all)] or qranks_all
+        missing = [q for q in qranks_req if q not in qranks_all]
+        if missing:
+            print(f"[WARN] qranks not found, ignored: {missing}")
+        qranks = [q for q in qranks_req if q in qranks_all] or qranks_all
 
     qcolors  = _ensure_colors(qranks, qcolors_cfg)
     bar_w    = 0.18
@@ -1375,18 +1374,10 @@ def generate_quantile_report(config: dict):
                                              window=roll_h3, qf=[q], tgts=h3_tgts, bets=h3_bets)
 
         # ── Temporal pages ────────────────────────────────────────────────────
-        # Adaptive smoothing: apply a data-length-aware minimum smoothing window
-        # for noisy daily series. The minimum is min(20, ndays//5) so it never
-        # blanks out short intervals, and caps at ndays//3 to avoid over-smoothing.
-        _ndays    = int(daily_nonall["date"].nunique()) if "date" in daily_nonall.columns else 252
-        _smooth_n = max(1, min(20, _ndays // 5))    # min smoothing window
-        _smooth_s = max(1, min(20, _ndays // 5))    # same for sizeNotional
-        _smooth_i = max(1, min(5,  _ndays // 10))   # smaller for nrInstr
-        roll_windows = {"pnl":          roll_pnl,
-                        "ppd":          roll_ppd,
-                        "n_trades":     max(roll_tr, _smooth_n),
-                        "sizeNotional": max(roll_sn, _smooth_s),
-                        "nrInstr":      max(roll_nr, _smooth_i),
+        roll_windows = {"n_trades":     roll_tr,
+                        "sizeNotional": roll_sn,
+                        "nrInstr":      roll_nr,
+                        "hit_ratio":    roll_hit,
                         "__default__":  1}
         for target in sorted(daily_nonall["target"].dropna().unique()):
             if target == "__ALL__":

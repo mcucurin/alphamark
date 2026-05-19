@@ -83,11 +83,6 @@ DEFAULT_RUNNER_CONFIG = {
     "quantiles": [1.0, 0.75, 0.5, 0.25],
     "type_quantile": "cumulative",
 
-    # ========== Pipeline Stage Toggles ==========
-    "do_daily": True,
-    "do_summary": True,
-    "do_outliers": True,
-
     # ========== Summary Statistics Extras ==========
     "add_spearman": False,
     "add_dcor": False,
@@ -102,8 +97,6 @@ DEFAULT_RUNNER_CONFIG = {
     "outlier_metrics": ["pnl", "ppd", "sizeNotional", "n_trades"],
 
     # ========== Daily Processing Behavior ==========
-    "empty_day_policy": "carry",
-    "report_empty_trades_as_nan": True,
 
     # ========== Parallelism Configuration ==========
     "n_jobs_io": 1,
@@ -114,15 +107,14 @@ DEFAULT_RUNNER_CONFIG = {
     "random_state": 123,
 
     # ========== Date Range Filter (Inclusive) ==========
-    "interval_start": "2000-01-31",
-    "interval_end":   "2021-12-31",
+    "interval_start": "2024-01-01",
+    "interval_end":   "2024-01-31",
 }
 
 # ---- Plotting / report config ----
 DEFAULT_PLOT_CONFIG = {
     # ========== Quantile Display Configuration ==========
     "qranks": ["qr_100", "qr_75", "qr_50", "qr_25"],
-    "allow_missing_qranks": False,
 
     # ========== Heatmap Filter Configuration (H2/H3) ==========
     "H2_targets": "AUTO",
@@ -139,14 +131,13 @@ DEFAULT_PLOT_CONFIG = {
     # Set to 1 for no smoothing; the plotting module applies an adaptive
     # data-length-aware minimum so short intervals are never blanked out.
     "roll_nrinstr":       1,
-    "roll_ppd":           1,
     "roll_trades":        1,
-    "roll_pnl":           1,
     "roll_size_notional": 1,
     "roll_sharpe":        60,
+    "roll_hit_ratio":     1,
 
     # ========== Temporal Plot Configuration ==========
-    "variables_temporal_plot": ["pnl", "ppd", "nrTrades", "sizeNotional"],
+    "variables_temporal_plot": ["pnl", "ppd", "n_trades", "sizeNotional"],
     "arrayDim_temporal_plot":  (2, 2),
 
     # ========== Bar Plot Configuration (SUMMARY Data Only) ==========
@@ -164,10 +155,9 @@ DEFAULT_PLOT_CONFIG = {
     "outlier_tables_per_page": 2,
 
     # ========== Plot Styling ==========
-    "style_first":  "-",
-    "style_second": ":",
+    "line_style":  "-",
 
-    # Quantile color palette
+    # Quantile color palette — professional, colorblind-safe.
     # Override individual keys as needed, e.g. {"qr_100": "#E31A1C"}.
     "quantile_colors": {
         "qr_100": "#2166AC",   # steel blue

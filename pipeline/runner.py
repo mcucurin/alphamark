@@ -284,11 +284,6 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     quantiles      = local_cfg["quantiles"]
     type_quantile  = local_cfg["type_quantile"]
 
-    # ---- Stage toggles ----
-    do_daily    = local_cfg["do_daily"]
-    do_summary  = local_cfg["do_summary"]
-    do_outliers = local_cfg["do_outliers"]
-
     # ---- Summary extras ----
     add_spearman = local_cfg["add_spearman"]
     add_dcor     = local_cfg["add_dcor"]
@@ -300,9 +295,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     ccf_dump_per_ticker  = local_cfg.get("ccf_dump_per_ticker", False)
 
     # ---- Outlier / daily behaviour ----
-    outlier_metrics            = local_cfg["outlier_metrics"]
-    empty_day_policy           = local_cfg["empty_day_policy"]
-    report_empty_trades_as_nan = local_cfg["report_empty_trades_as_nan"]
+    outlier_metrics = local_cfg["outlier_metrics"]
 
     # ---- Parallelism ----
     n_jobs_io      = local_cfg["n_jobs_io"]
@@ -610,71 +603,67 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         for t, sc in spy_map_for_day.items():
             spy_by_target_global[t] = sc
 
-        if do_daily:
-            stats = compute_daily_stats(
-                df,
-                signal_cols=signal_cols,
-                target_cols=target_cols,
-                quantiles=quantiles,
-                bet_size_cols=bet_size_cols,
-                type_quantile=type_quantile,
-                empty_day_policy=empty_day_policy,
-                report_empty_trades_as_nan=report_empty_trades_as_nan,
-                n_jobs=n_jobs_daily,
-                random_state=random_state,
+        stats = compute_daily_stats(
+            df,
+            signal_cols=signal_cols,
+            target_cols=target_cols,
+            quantiles=quantiles,
+            bet_size_cols=bet_size_cols,
+            type_quantile=type_quantile,
+            n_jobs=n_jobs_daily,
+            random_state=random_state,
+        )
+
+        # Flatten nested dict -> rows
+        rows = []
+        for stat_type, sig_dict in stats.items():
+            for s, qd in sig_dict.items():
+                for q, td in qd.items():
+                    for t, bd in td.items():
+                        for b, v in bd.items():
+                            rows.append((day_str, s, t, q, stat_type, b, v))
+
+        if rows:
+            day_df_stats = pd.DataFrame(
+                rows,
+                columns=["date", "signal", "target", "qrank", "stat_type", "bet_size_col", "value"],
             )
+            out_path = os.path.join(DAILY_STATS_DIR, f"stats_{day_str}.pkl")
+            _atomic_pickle_dump(day_df_stats, out_path)
+            per_day_index_rows.append({"date": day_str, "path": out_path, "n_rows": len(day_df_stats)})
+            daily_stats_frames.append(day_df_stats)
+            print(f"Saved daily stats PKL for {day_str} -> {out_path} ({len(day_df_stats)} rows)")
 
-            # Flatten nested dict -> rows
-            rows = []
-            for stat_type, sig_dict in stats.items():
-                for s, qd in sig_dict.items():
-                    for q, td in qd.items():
-                        for t, bd in td.items():
-                            for b, v in bd.items():
-                                rows.append((day_str, s, t, q, stat_type, b, v))
-
-            if rows:
-                day_df_stats = pd.DataFrame(
-                    rows,
-                    columns=["date", "signal", "target", "qrank", "stat_type", "bet_size_col", "value"],
-                )
-                out_path = os.path.join(DAILY_STATS_DIR, f"stats_{day_str}.pkl")
-                _atomic_pickle_dump(day_df_stats, out_path)
-                per_day_index_rows.append({"date": day_str, "path": out_path, "n_rows": len(day_df_stats)})
-                daily_stats_frames.append(day_df_stats)
-                print(f"Saved daily stats PKL for {day_str} -> {out_path} ({len(day_df_stats)} rows)")
-
-                # Verification: check internal consistency of daily stats
-                vwarns = _verify_daily_stats(stats, day_str, signal_cols, target_cols,
-                                             bet_size_cols, quantiles)
-                if vwarns:
-                    for w in vwarns[:5]:  # cap at 5 warnings per day
-                        print(f"VERIFY {w}")
-                    if len(vwarns) > 5:
-                        print(f"VERIFY  ... and {len(vwarns) - 5} more warnings for {day_str}")
-                else:
-                    print(f"Verification passed for {day_str}")
+            # Verification: check internal consistency of daily stats
+            vwarns = _verify_daily_stats(stats, day_str, signal_cols, target_cols,
+                                         bet_size_cols, quantiles)
+            if vwarns:
+                for w in vwarns[:5]:  # cap at 5 warnings per day
+                    print(f"VERIFY {w}")
+                if len(vwarns) > 5:
+                    print(f"VERIFY  ... and {len(vwarns) - 5} more warnings for {day_str}")
             else:
-                print(f"[skip] {day_str}: no stats produced")
+                print(f"Verification passed for {day_str}")
+        else:
+            print(f"[skip] {day_str}: no stats produced")
 
-        if do_summary:
-            # include any spy columns we created this day
-            spy_cols_today = list(spy_map_for_day.values())
+        # include any spy columns we created this day
+        spy_cols_today = list(spy_map_for_day.values())
 
-            # Always include ticker for potential per-id dumps
-            base_cols: List[str] = []
-            if "ticker" in df.columns:
-                base_cols.append("ticker")
+        # Always include ticker for potential per-id dumps
+        base_cols: List[str] = []
+        if "ticker" in df.columns:
+            base_cols.append("ticker")
 
-            keep_cols = ["date"] + base_cols + signal_cols + target_cols + bet_size_cols + spy_cols_today
-            raw_days_for_summary.append(
-                df[base_cols + signal_cols + target_cols + bet_size_cols + spy_cols_today]
-                .assign(date=day_dt)[keep_cols]
-            )
+        keep_cols = ["date"] + base_cols + signal_cols + target_cols + bet_size_cols + spy_cols_today
+        raw_days_for_summary.append(
+            df[base_cols + signal_cols + target_cols + bet_size_cols + spy_cols_today]
+            .assign(date=day_dt)[keep_cols]
+        )
 
     # 3) Summary stats over all days (PKL)
     summary_path = None
-    if do_summary and raw_days_for_summary:
+    if raw_days_for_summary:
         big_df = pd.concat(raw_days_for_summary, ignore_index=True, copy=False)
 
         sig_list = sorted([c for c in needed_sig if c in big_df.columns])
@@ -774,12 +763,12 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
                 print("[info] Summary produced no rows; not saving.")
         else:
             print("[info] No valid columns for summary stats; skipping summary save.")
-    elif do_summary:
+    else:
         print("[info] No daily data collected; skipping summary computation.")
 
     # 4) Outliers across all daily-stat frames (PKL)
     outliers_path = None
-    if do_outliers and daily_stats_frames:
+    if daily_stats_frames:
         stats_all = pd.concat(daily_stats_frames, ignore_index=True, copy=False)
         dates = pd.to_datetime(stats_all["date"], errors="coerce")
         first_day = pd.to_datetime(dates.min())
@@ -798,13 +787,13 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         outliers_path = os.path.join(OUTLIERS_DIR, f"outliers_{date_tag}.pkl")
         save_outliers(odf, outliers_path)
         print(f"Saved outliers PKL -> {outliers_path} ({len(odf)} rows)")
-    elif do_outliers:
+    else:
         print("[info] No daily stats frames accumulated; skipping outlier computation.")
 
     # 5) Write index for daily stats (CSV + PKL)
     index_csv = None
     index_pkl = None
-    if do_daily and per_day_index_rows:
+    if per_day_index_rows:
         index_df = pd.DataFrame(per_day_index_rows).sort_values("date")
         index_csv = os.path.join(DAILY_STATS_DIR, "_index.csv")
         with NamedTemporaryFile(dir=os.path.dirname(index_csv), delete=False, mode="w", newline="") as tmp:
