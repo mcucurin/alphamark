@@ -425,7 +425,7 @@ def _compute_summary_stats_core(
         else:
             sharpe = np.nan
         s, ql, t, b = key
-        out_nested['sharpe'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
+        out_nested['sharpe_ratio'][s][ql][t][b] = float(sharpe) if np.isfinite(sharpe) else np.nan
 
     # R² and t-stat from pooled regression sufficient stats
     eps = 1e-15
@@ -499,9 +499,9 @@ def _compute_summary_stats_core(
 
         s, ql, t, b = key
         out_nested['pnl'][s][ql][t][b]          = float(pnl_tot)   if np.isfinite(pnl_tot)   else np.nan
-        out_nested['sizeNotional'][s][ql][t][b] = float(not_tot)   if np.isfinite(not_tot)   else np.nan
-        out_nested['nrInstr'][s][ql][t][b]      = float(nrin_mean) if np.isfinite(nrin_mean) else np.nan
-        out_nested['n_trades'][s][ql][t][b]     = float(ntrd_tot)  if np.isfinite(ntrd_tot)  else np.nan
+        out_nested['size_notional'][s][ql][t][b] = float(not_tot)   if np.isfinite(not_tot)   else np.nan
+        out_nested['nr_instr'][s][ql][t][b]      = float(nrin_mean) if np.isfinite(nrin_mean) else np.nan
+        out_nested['nr_trades'][s][ql][t][b]     = float(ntrd_tot)  if np.isfinite(ntrd_tot)  else np.nan
         out_nested['ppd'][s][ql][t][b]          = float(ppd_val)   if np.isfinite(ppd_val)   else np.nan
 
     # market_corr — Spearman(PnL_t, SPY_t)

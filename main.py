@@ -5,7 +5,7 @@ from plotting.plot_quantile_bars import generate_quantile_report
 import argparse
 import pickle as pkl
 import pandas as pd
-import os, glob, json
+import os, glob, json, re
 import time
 
 start = time.perf_counter()
@@ -63,102 +63,162 @@ def _parse_list(s: str | None):
 # ---- Runner / pipeline config ----
 DEFAULT_RUNNER_CONFIG = {
     # ========== I/O Configuration ==========
+    # Each entry: {"dir": "/path/to/pkl_files", "glob": "pattern_*.pkl"}
+    # All three can point to the same directory if signals, targets, and bet sizes
+    # are stored together in a single set of daily PKL files.
     "signals_input":  {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
     "targets_input":  {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
     "betsizes_input": {"dir": "input/DAILY_FEATURES_PKL", "glob": "features_*.pkl"},
 
+    # Root directory where DAILY_STATS/, SUMMARY_STATS/, OUTLIERS/ are written.
     "output_root": "output",
 
     # ========== Column Discovery ==========
-    "signal_prefix": "pret_",       "signal_regex": None,       "signal_list": None,
-    "target_prefix": "fret_",       "target_regex": None,       "target_list": None,
-    "bet_prefix":    "betsize_",    "bet_regex":    None,       "bet_list": None,
+    # For each column type, provide either a regex pattern OR an explicit list of
+    # column names — the list takes precedence when non-empty.
+    #   signal_regex: matches columns that represent alpha signals (e.g. ^pret_ for
+    #                 predicted returns).
+    #   target_regex: matches columns that represent forward returns / targets.
+    #   bet_regex:    matches columns that represent position / bet sizes.
+    # Regex tip: use ^(col_a|col_b)$ to match an exact set of names via regex.
+    "signal_regex": "^pret_",   "signal_list": None,
+    "target_regex": "^fret_",   "target_list": None,
+    "bet_regex":    "^betsize_","bet_list":    None,
 
-    # ========== Market Proxy (SPY) ==========
-    "spy_ticker":      "SPY",
-    "spy_col_base":    "spy",
-    "spy_single_name": "spy_ret",
+    # ========== Market Proxy ==========
+    # Ticker of the market proxy instrument present in the daily PKL files (e.g. SPY).
+    # Used to compute market_corr (Spearman ρ between daily portfolio PnL and this
+    # proxy return) shown in bar plots, and as the benchmark in CCF analysis.
+    # Set to None or "" to skip both market correlation and CCF.
+    "spy_ticker": "SPY",
 
-    # ========== Quantile Configuration ==========
+    # ========== Quantile Portfolios ==========
+    # List of quantile thresholds (fractions). Each value q builds a portfolio from
+    # the top-q fraction of instruments ranked by |signal| each day.
+    #   type_quantile options:
+    #     "cumulative" — top-K cumulative portfolios (each q is a separate portfolio)
+    #     "quantEach"  — exclusive bands (each q is a mutually exclusive bucket)
     "quantiles": [1.0, 0.75, 0.5, 0.25],
     "type_quantile": "cumulative",
 
-    # ========== Summary Statistics Extras ==========
+    # ========== Correlation Diagnostics (slow) ==========
+    # Cross-sectional Spearman ρ and distance correlation between signal and target
+    # across instruments, computed per (signal, target, quantile) combination.
+    # Results appear in bar plots only. Both are computationally expensive.
+    #   spearman_sample_cap_per_key: max rows sampled per key when computing
+    #   Spearman ρ — lower values run faster at the cost of precision.
     "add_spearman": False,
-    "add_dcor": False,
+    "add_dcor":     False,
     "spearman_sample_cap_per_key": 10000,
 
-    # ========== CCF (Cross-Correlation vs Market Proxy) ==========
+    # ========== CCF vs Market Proxy (slow) ==========
+    # Cross-correlation of daily portfolio PnL against the market proxy return,
+    # computed at lags 0..ccf_max_lag (trading days).
+    # Requires spy_ticker to be set. Results appear as a dedicated PDF section.
+    #   ccf_dump_per_ticker: also saves each ticker's CCF series to disk for
+    #   inspection outside the report.
     "ccf_enable": False,
     "ccf_max_lag": 5,
     "ccf_dump_per_ticker": False,
 
     # ========== Outlier Detection ==========
-    "outlier_metrics": ["pnl", "ppd", "sizeNotional", "n_trades"],
+    # Metrics to flag as outliers using global z-scores across the date range.
+    # Available: pnl, ppd, size_notional, nr_trades, long_ratio, hit_ratio
+    "outlier_metrics": ["pnl", "ppd", "size_notional", "nr_trades", "long_ratio"],
 
-    # ========== Daily Processing Behavior ==========
-
-    # ========== Parallelism Configuration ==========
+    # ========== Parallelism ==========
+    # n_jobs_io:      threads used when loading PKL files from disk
+    # n_jobs_daily:   workers for per-day stat computation
+    # n_jobs_summary: workers for summary stat computation across the full period
     "n_jobs_io": 1,
     "n_jobs_daily": 3,
     "n_jobs_summary": 3,
 
     # ========== Reproducibility ==========
+    # Seed for Spearman sampling — set to any integer for deterministic results.
     "random_state": 123,
 
-    # ========== Date Range Filter (Inclusive) ==========
-    "interval_start": "2024-01-01",
-    "interval_end":   "2024-01-31",
+    # ========== Date Range (inclusive) ==========
+    "interval_start": "2000-01-01",
+    "interval_end":   "2021-12-31",
 }
 
 # ---- Plotting / report config ----
 DEFAULT_PLOT_CONFIG = {
-    # ========== Quantile Display Configuration ==========
+    # ========== Quantile Display ==========
+    # Which quantile portfolios to include in all plots. Must match the quantile
+    # thresholds in DEFAULT_RUNNER_CONFIG["quantiles"] (formatted as qr_<pct>).
     "qranks": ["qr_100", "qr_75", "qr_50", "qr_25"],
 
-    # ========== Heatmap Filter Configuration (H2/H3) ==========
+    # ========== Heatmap Target / Bet Filters (H2 and H3 pages) ==========
+    # "AUTO" selects the most common targets/bets automatically.
+    # Provide an explicit list to pin specific values, e.g. ["fret_1d", "fret_5d"].
     "H2_targets": "AUTO",
     "H2_bets":    "AUTO",
     "H3_targets": "AUTO",
     "H3_bets":    "AUTO",
 
-    # ========== Temporal Line Smoothing Windows ==========
+    # ========== Heatmap Line Smoothing (rolling mean, days) ==========
+    # Applied to the time-series lines overlaid on H1/H2/H3 heatmap pages.
+    # Set to 1 to disable smoothing.
     "roll_h1_lines": 30,
     "roll_h2_lines": 30,
     "roll_h3_lines": 1,
 
-    # ========== Rolling Windows for Temporal Panels ==========
-    # Set to 1 for no smoothing; the plotting module applies an adaptive
-    # data-length-aware minimum so short intervals are never blanked out.
+    # ========== Temporal Panel Rolling Windows (days) ==========
+    # Rolling mean applied to each metric before plotting on temporal pages.
+    # Set to 1 for raw daily values (no smoothing).
+    # sharpe_ratio: minimum 21 days (one trading month) — values below this are
+    #               silently raised because std(ddof=1) on fewer observations is
+    #               statistically meaningless for Sharpe.
+    # pnl and ppd are always plotted as cumulative sums — no rolling option.
     "roll_nrinstr":       1,
     "roll_trades":        1,
     "roll_size_notional": 1,
-    "roll_sharpe":        60,
+    "roll_sharpe":        21,
     "roll_hit_ratio":     1,
 
-    # ========== Temporal Plot Configuration ==========
-    "variables_temporal_plot": ["pnl", "ppd", "n_trades", "sizeNotional"],
+    # ========== Temporal Plot Layout ==========
+    # variables_temporal_plot: metrics shown as time-series panels. Each variable
+    #   fills one cell of the grid left-to-right, top-to-bottom.
+    #   Available: pnl, ppd, nr_trades, size_notional, sharpe_ratio, hit_ratio, nr_instr
+    # arrayDim_temporal_plot: (rows, cols) grid dimensions per page.
+    "variables_temporal_plot": ["pnl", "ppd", "nr_trades", "size_notional"],
     "arrayDim_temporal_plot":  (2, 2),
 
-    # ========== Bar Plot Configuration (SUMMARY Data Only) ==========
+    # ========== Bar Plot Configuration (summary stats only) ==========
+    # bar_page_vars: one PDF page is generated per unique combination of these
+    #   dimensions. E.g. ["target", "bet_size_col"] → one page per target×bet pair.
+    # bar_x_vars: dimension placed on the x-axis within each bar chart.
+    #   A variable cannot appear in both bar_page_vars and bar_x_vars.
+    # bar_metrics: metrics rendered as bar chart panels, left-to-right order.
+    #   spearman / dcor only appear when add_spearman / add_dcor are enabled.
+    # aspect_ratio_barplots: width/height ratio for each bar panel (16/9 ≈ 1.778).
     "bar_page_vars":        ["target", "bet_size_col"],
     "bar_x_vars":           ["signal"],
     "bar_metrics": [
-        "pnl", "ppd", "sharpe", "hit_ratio", "long_ratio",
-        "sizeNotional", "r2", "t_stat", "n_trades", "market_corr"
+        "pnl", "ppd", "sharpe_ratio", "hit_ratio", "long_ratio",
+        "size_notional", "r2", "t_stat", "nr_trades", "market_corr"
     ],
     "aspect_ratio_barplots": 16 / 9,
 
-    # ========== Outlier Table Configuration ==========
-    "outlier_metrics_for_tables": ["pnl", "ppd", "sizeNotional", "n_trades"],
+    # ========== Outlier Tables ==========
+    # outlier_metrics_for_tables: subset of outlier_metrics to show in PDF tables.
+    # outlier_top_k: number of extreme high and low rows shown per metric per table.
+    # outlier_tables_per_page: tables stacked per PDF page; partial pages scale down
+    #   proportionally so each table keeps the same height across all pages.
+    "outlier_metrics_for_tables": ["pnl", "ppd", "size_notional", "nr_trades"],
     "outlier_top_k":           3,
     "outlier_tables_per_page": 2,
 
-    # ========== Plot Styling ==========
+    # ========== Line Style ==========
+    # Matplotlib linestyle for temporal plot lines: "-" solid, "--" dashed,
+    # "-." dash-dot, ":" dotted.
     "line_style":  "-",
 
-    # Quantile color palette — professional, colorblind-safe.
-    # Override individual keys as needed, e.g. {"qr_100": "#E31A1C"}.
+    # ========== Quantile Color Palette ==========
+    # One color per quantile portfolio. Keys must match qranks above.
+    # Any valid matplotlib color string is accepted.
     "quantile_colors": {
         "qr_100": "#2166AC",   # steel blue
         "qr_75":  "#4DAC26",   # muted green
@@ -166,8 +226,9 @@ DEFAULT_PLOT_CONFIG = {
         "qr_25":  "#9970AB",   # muted purple
     },
 
-    # ========== Layout and Metadata ==========
-    # Custom footer text. If None, auto-generated from the date window.
+    # ========== Report Footer ==========
+    # Custom text shown bottom-right of every PDF page.
+    # None = auto-generated from the date window (interval_start – interval_end).
     "meta_text": None,
 }
 
@@ -242,16 +303,6 @@ if __name__ == '__main__':
     if env_h3_targets is not None: plot_cfg["H3_targets"] = env_h3_targets
     if env_h3_bets    is not None: plot_cfg["H3_bets"]    = env_h3_bets
 
-    # ---- Apply explicit list overrides (list → exact-match regex) ----
-    for list_key, regex_key in [
-        ("signal_list", "signal_regex"),
-        ("target_list", "target_regex"),
-        ("bet_list",    "bet_regex"),
-    ]:
-        lst = runner_cfg.get(list_key)
-        if lst:
-            runner_cfg[regex_key] = "^(" + "|".join(lst) + ")$"
-
     # ---- Keep plotting interval in sync with runner ----
     plot_cfg["interval_start"] = runner_cfg.get("interval_start")
     plot_cfg["interval_end"]   = runner_cfg.get("interval_end")
@@ -261,6 +312,20 @@ if __name__ == '__main__':
     plot_cfg["ccf_max_lag"] = runner_cfg.get("ccf_max_lag", 5)
 
     output_root = runner_cfg["output_root"]
+
+    # ---- If explicit list provided, convert to exact-match regex ----
+    for _lk, _rk in [("signal_list","signal_regex"),("target_list","target_regex"),("bet_list","bet_regex")]:
+        _lst = runner_cfg.get(_lk)
+        if _lst:
+            runner_cfg[_rk] = "^(" + "|".join(re.escape(c) for c in _lst) + ")$"
+
+    # ---- Strip correlation metrics from bar_metrics when not computed ----
+    _bm = plot_cfg.get("bar_metrics", [])
+    if not runner_cfg.get("add_spearman"): _bm = [m for m in _bm if m != "spearman"]
+    if not runner_cfg.get("add_dcor"):     _bm = [m for m in _bm if m != "dcor"]
+    plot_cfg["bar_metrics"] = _bm
+
+
 
     # -----------------------------------------------------------------
     # 2) Run pipeline OR use existing PKLs (--plot-only)

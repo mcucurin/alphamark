@@ -84,17 +84,25 @@ mpl.rcParams.update({
     "lines.solid_capstyle":  "round",
     "patch.linewidth":       0.5,
 })
-PAGE_SIZE       = (14, 8.5)
-HEATMAP_AX_TOP  = 0.90
-TEMPORAL_AX_TOP = 0.90
-META_TEXT       = None
+PAGE_SIZE           = (14, 8.5)
+HEATMAP_AX_TOP      = 0.90
+TEMPORAL_AX_TOP     = 0.90
+META_TEXT           = None
+_SHARPE_MIN_WINDOW  = 21   # 1 trading month — minimum meaningful Sharpe window
 
 STAT_ALIASES = {
-    "spy_corr":  "market_corr",
-    "mkt_corr":  "market_corr",
-    "nrTrades":  "n_trades",
-    "nr_trades": "n_trades",
-    "ntrades":   "n_trades",
+    "spy_corr":     "market_corr",
+    "mkt_corr":     "market_corr",
+    # n_trades / nr_trades backward compat
+    "n_trades":     "nr_trades",
+    "nrTrades":     "nr_trades",
+    "ntrades":      "nr_trades",
+    # nrInstr backward compat
+    "nrInstr":      "nr_instr",
+    # sizeNotional backward compat
+    "sizeNotional": "size_notional",
+    # sharpe backward compat
+    "sharpe":       "sharpe_ratio",
 }
 
 
@@ -130,8 +138,10 @@ def _metric_label(metric: str) -> str:
     return re.sub(r"(?<!^)(?=[A-Z])", " ", n).replace("_", " ").title()
 
 
-def savefig_white(pdf, fig):
-    fig.set_size_inches(*PAGE_SIZE, forward=True)
+def savefig_white(pdf, fig, height=None):
+    w = PAGE_SIZE[0]
+    h = height if height is not None else PAGE_SIZE[1]
+    fig.set_size_inches(w, h, forward=True)
     fig.patch.set_facecolor("white")
     fig.patch.set_alpha(1.0)
     # Footer: metadata in small italic bottom-right
@@ -430,15 +440,23 @@ def _roll_mean(s, w):
 
 
 def _rolling_sharpe(s, w):
-    """Rolling annualised Sharpe: mean(PnL)/std(PnL,ddof=1)*√252 — matches Cucuringu Eq.7."""
+    """Rolling annualised Sharpe: mean(PnL)/std(PnL,ddof=1)*sqrt(252).
+
+    Minimum window is _SHARPE_MIN_WINDOW (21 days = 1 trading month).
+    Values below this minimum are silently raised — std(ddof=1) on
+    fewer than 21 observations is statistically meaningless for Sharpe.
+    """
     if s is None or len(s) == 0:
         return pd.Series(dtype=float)
-    w  = max(1, int(w))
-    mp = _minp(w, 5)
+    w  = max(_SHARPE_MIN_WINDOW, int(w))
+    mp = max(_SHARPE_MIN_WINDOW // 2, 10)
     def _sr(x):
-        mu = np.nanmean(x); sd = np.nanstd(x, ddof=1)
-        return (mu / sd * np.sqrt(252.0)) if (np.isfinite(mu) and np.isfinite(sd) and sd > 0) else np.nan
-    return s.rolling(w, min_periods=mp).apply(_sr, raw=False)
+        finite = x[np.isfinite(x)]
+        if len(finite) < 2:
+            return np.nan
+        mu = finite.mean(); sd = finite.std(ddof=1)
+        return (mu / sd * np.sqrt(252.0)) if (np.isfinite(sd) and sd > 0) else np.nan
+    return s.rolling(w, min_periods=mp).apply(_sr, raw=True)
 
 
 def _exclude_all(df):
@@ -793,14 +811,15 @@ def append_outlier_pages(pkl_path, pdf, metrics=None, top_k=3, per_page=3):
     pp = max(1, int(per_page))
     for start in range(0, len(tables), pp):
         chunk = tables[start:start + pp]
-        fig   = plt.figure(figsize=(14, 8.5))
+        fig_h = max(2.5, PAGE_SIZE[1] * len(chunk) / pp)
+        fig   = plt.figure(figsize=(14, fig_h))
         fig.suptitle("Outlier Tables", fontsize=18, weight="bold", y=0.985)
         gs = GridSpec(len(chunk), 1, figure=fig, left=0.03, right=0.97,
                       top=0.90, bottom=0.06, hspace=0.35)
         for i, (mn, cl, rws) in enumerate(chunk):
             _draw_table(fig.add_subplot(gs[i, 0]),
                         f"{mn} — Top Highs & Lows", cl, rws)
-        savefig_white(pdf, fig)
+        savefig_white(pdf, fig, height=fig_h)
 
 
 # ─── temporal metric series ───────────────────────────────────────────────────
@@ -812,15 +831,16 @@ def _series(df, stat):
 
 def _tok(base, w, cum=False):
     if cum:
-        base = f"cumulative {base}"
-        return f"Rolling-mean {base} ({int(w)}D)" if (w and int(w) > 1) else base[0].upper() + base[1:]
-    return f"Rolling-mean {base} ({int(w)}D)" if (w and int(w) > 1) else base
+        return f"Cumulative {base}"
+    if w and int(w) > 1:
+        return f"{int(w)}-day mean — {base}"
+    return f"Daily {base}"
 
 
 def _rtitle(label, w):
-    """Return 'X-day mean — label' when w>1, else just 'label'."""
+    """Return 'Daily label' for w=1, 'X-day mean — label' for w>1."""
     w = max(1, int(w))
-    return f"{w}-day mean — {label}" if w > 1 else label
+    return f"{w}-day mean — {label}" if w > 1 else f"Daily {label}"
 
 
 def _metric_series(metric, df, roll_windows, roll_sharpe):
@@ -837,14 +857,14 @@ def _metric_series(metric, df, roll_windows, roll_sharpe):
 
     if name == "ppd":
         # Cumulative PPD in bps = (cumΣPnL / cumΣB_t) × 10000 — always raw.
-        pnl = _series(df, "pnl"); sn = _series(df, "sizeNotional")
+        pnl = _series(df, "pnl"); sn = _series(df, "size_notional")
         if pnl.empty or sn.empty:
             return None, None
-        cum = pd.concat([pnl.rename("pnl"), sn.rename("sizeNotional")], axis=1).sort_index()
+        cum = pd.concat([pnl.rename("pnl"), sn.rename("size_notional")], axis=1).sort_index()
         if cum.empty:
             return None, None
         cum["cp"] = cum["pnl"].cumsum()
-        cum["cs"] = cum["sizeNotional"].cumsum()
+        cum["cs"] = cum["size_notional"].cumsum()
         cs_arr = cum["cs"].to_numpy()
         valid  = np.isfinite(cs_arr) & (cs_arr > 1e-12)
         y = np.divide(cum["cp"], cum["cs"],
@@ -852,25 +872,25 @@ def _metric_series(metric, df, roll_windows, roll_sharpe):
                       where=valid)
         return "Cumulative PPD (bps)", pd.Series(y, index=cum.index) * 10000.0
 
-    if name == "n_trades":
-        s = _series(df, "n_trades")
+    if name == "nr_trades":
+        s = _series(df, "nr_trades")
         if s.empty:
             return None, None
-        w = roll_windows.get("n_trades", 1)
-        return _rtitle("Daily Trades", w), _roll_mean(s, w)
+        w = roll_windows.get("nr_trades", 1)
+        return _rtitle("Trades", w), _roll_mean(s, w)
 
-    if name == "sizeNotional":
-        s = _series(df, "sizeNotional")
+    if name == "size_notional":
+        s = _series(df, "size_notional")
         if s.empty:
             return None, None
-        w = roll_windows.get("sizeNotional", 1)
-        return _rtitle("Daily Notional ($M)", w), _roll_mean(s, w) / 1e6
+        w = roll_windows.get("size_notional", 1)
+        return _rtitle("Notional ($M)", w), _roll_mean(s, w) / 1e6
 
-    if name == "nrInstr":
-        s = _series(df, "nrInstr")
+    if name == "nr_instr":
+        s = _series(df, "nr_instr")
         if s.empty:
             return None, None
-        w = roll_windows.get("nrInstr", 1)
+        w = roll_windows.get("nr_instr", 1)
         return _rtitle("Nr. Instruments", w), _roll_mean(s, w)
 
     if name == "hit_ratio":
@@ -880,11 +900,11 @@ def _metric_series(metric, df, roll_windows, roll_sharpe):
         w = roll_windows.get("hit_ratio", 1)
         return _rtitle("Hit Ratio", w), _roll_mean(s, w)
 
-    if name == "sharpe":
+    if name == "sharpe_ratio":
         pnl = _series(df, "pnl")
         if pnl.empty:
             return None, None
-        w = max(1, int(roll_sharpe))
+        w = max(_SHARPE_MIN_WINDOW, int(roll_sharpe))
         return f"Rolling Sharpe ({w}D)", _rolling_sharpe(pnl, w)
 
     s = _series(df, name)
@@ -1122,7 +1142,7 @@ def generate_quantile_report(config: dict):
     roll_sr     = int(config.get("roll_sharpe",       60))
     roll_hit    = int(config.get("roll_hit_ratio",     1))
 
-    temp_vars   = _norm_metrics(config.get("variables_temporal_plot", [])) or ["pnl", "ppd", "n_trades", "sizeNotional", "sharpe"]
+    temp_vars   = _norm_metrics(config.get("variables_temporal_plot", [])) or ["pnl", "ppd", "nr_trades", "size_notional", "sharpe_ratio"]
     arr_dim     = config.get("arrayDim_temporal_plot", (2, 2))
     try:
         tr, tc  = int(arr_dim[0]), int(arr_dim[1])
@@ -1249,12 +1269,15 @@ def generate_quantile_report(config: dict):
                     disp = _metric_label(metric)
                     data = subset[subset["stat_type"] == metric].copy()
                     if data.empty:
-                        ax.set_title(f"{disp}: no data", fontsize=11); ax.axis("off"); continue
+                        ax.axis("off")
+                        ax.text(0.5, 0.5, f"{disp}\nno data", ha="center", va="center",
+                                fontsize=9, color="0.5", transform=ax.transAxes)
+                        continue
 
                     unit = ""
                     if metric.lower() == "ppd":
                         data["value"] = data["value"] * 10000; unit = " (bps)"
-                    elif metric == "sizeNotional":
+                    elif metric == "size_notional":
                         data["value"] = data["value"] / 1e6;   unit = " ($M)"
 
                     if "date" in data.columns:
@@ -1288,6 +1311,10 @@ def generate_quantile_report(config: dict):
                         yl, yh = ax.get_ylim()
                         if yl <= 0.5 <= yh:
                             ax.axhline(y=0.5, color="red", linestyle=":", lw=1.5, alpha=0.7, zorder=0)
+                    if metric in ("spearman", "dcor", "market_corr"):
+                        yl, yh = ax.get_ylim()
+                        if yl <= 0.0 <= yh:
+                            ax.axhline(y=0.0, color="0.45", linestyle=":", lw=1.2, alpha=0.6, zorder=0)
 
                     ax.set_ylabel(f"{disp}{unit}", fontsize=9, color="0.25")
                     ax.set_xticks(np.arange(len(x_levels)))
@@ -1374,11 +1401,11 @@ def generate_quantile_report(config: dict):
                                              window=roll_h3, qf=[q], tgts=h3_tgts, bets=h3_bets)
 
         # ── Temporal pages ────────────────────────────────────────────────────
-        roll_windows = {"n_trades":     roll_tr,
-                        "sizeNotional": roll_sn,
-                        "nrInstr":      roll_nr,
-                        "hit_ratio":    roll_hit,
-                        "__default__":  1}
+        roll_windows = {"nr_trades":     roll_tr,
+                        "size_notional": roll_sn,
+                        "nr_instr":      roll_nr,
+                        "hit_ratio":     roll_hit,
+                        "__default__":   1}
         for target in sorted(daily_nonall["target"].dropna().unique()):
             if target == "__ALL__":
                 continue

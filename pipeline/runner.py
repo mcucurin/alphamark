@@ -66,6 +66,26 @@ def _ensure_dirs(output_root: str):
     return daily, summary, outliers, per_ticker
 
 
+def _clear_run_dirs(output_root: str) -> None:
+    """Delete all PKL/CSV files from the three computed-output dirs before a fresh run.
+
+    Prevents stale files from a previous dataset from being picked up by the
+    plotting code, which globs every file in these directories.
+    MDS_STATS (per-ticker) is also cleared to avoid mixing old CCF data.
+    """
+    daily, summary, outliers, per_ticker = _dirpaths(output_root)
+    for d in (daily, summary, outliers, per_ticker):
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if f.endswith((".pkl", ".csv")):
+                try:
+                    os.remove(os.path.join(d, f))
+                except OSError:
+                    pass
+    print(f"[info] Cleared output dirs under '{output_root}' for fresh run.")
+
+
 def _split_list_arg(s: Optional[str]) -> List[str]:
     if not s:
         return []
@@ -111,7 +131,7 @@ def _verify_daily_stats(stats: Dict, day_str: str, signal_cols: List[str],
     warnings_list: List[str] = []
     expected_qlabels = [f"qr_{int(round(q * 100))}" for q in quantiles]
 
-    for stat_type in ['pnl', 'ppd', 'sizeNotional']:
+    for stat_type in ['pnl', 'ppd', 'size_notional']:
         if stat_type not in stats:
             warnings_list.append(f"  [{day_str}] Missing stat_type '{stat_type}' entirely.")
             continue
@@ -137,7 +157,7 @@ def _verify_daily_stats(stats: Dict, day_str: str, signal_cols: List[str],
     # Check PnL = sum(sign(s) * fret * betsize) consistency
     pnl_tree = stats.get('pnl', {})
     ppd_tree = stats.get('ppd', {})
-    not_tree = stats.get('sizeNotional', {})
+    not_tree = stats.get('size_notional', {})
     for sig in signal_cols:
         for ql in expected_qlabels:
             for tgt in target_cols:
@@ -168,7 +188,7 @@ def _verify_summary_stats(summary: Dict, signal_cols: List[str],
     warnings_list: List[str] = []
 
     # Check Sharpe is computed from daily PPD mean/std
-    sharpe_tree = summary.get('sharpe', {})
+    sharpe_tree = summary.get('sharpe_ratio', {})
     ppd_tree = summary.get('ppd', {})
     for sig, q_dict in sharpe_tree.items():
         for ql, t_dict in q_dict.items():
@@ -185,7 +205,7 @@ def _verify_summary_stats(summary: Dict, signal_cols: List[str],
 
     # Check PPD = PnL / SizeNotional consistency
     pnl_tree = summary.get('pnl', {})
-    not_tree = summary.get('sizeNotional', {})
+    not_tree = summary.get('size_notional', {})
     for sig, q_dict in ppd_tree.items():
         for ql, t_dict in q_dict.items():
             for tgt, b_dict in t_dict.items():
@@ -268,17 +288,12 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     output_root = local_cfg["output_root"]
 
     # ---- Column discovery ----
-    signal_prefix = local_cfg["signal_prefix"]
-    target_prefix = local_cfg["target_prefix"]
-    bet_prefix    = local_cfg["bet_prefix"]
     signal_regex  = local_cfg.get("signal_regex")
     target_regex  = local_cfg.get("target_regex")
     bet_regex     = local_cfg.get("bet_regex")
 
     # ---- SPY ----
     spy_ticker      = local_cfg["spy_ticker"]
-    spy_col_base    = local_cfg["spy_col_base"]
-    spy_single_name = local_cfg["spy_single_name"]
 
     # ---- Quantiles ----
     quantiles      = local_cfg["quantiles"]
@@ -318,6 +333,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     else:
         print(f"[info] Single-directory mode: {sig_dir}  (glob: {sig_glob})")
 
+    _clear_run_dirs(output_root)
     DAILY_STATS_DIR, SUMMARY_STATS_DIR, OUTLIERS_DIR, PER_TICKER_DIR = _ensure_dirs(output_root)
 
     # Parse interval (inclusive)
@@ -375,26 +391,24 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
             "elapsed_sec": elapsed,
         }
 
-    def _pick_cols(df: pd.DataFrame, prefix: str, regex: Optional[str]) -> List[str]:
-        pool = [c for c in df.columns if isinstance(c, str)]
-        if regex:
-            import re as _re
-            r = _re.compile(regex)
-            return [c for c in pool if r.search(c)]
-        return [c for c in pool if c.startswith(prefix)]
+    def _pick_cols(df: pd.DataFrame, regex: str) -> List[str]:
+        if not regex:
+            return []
+        import re as _re
+        r = _re.compile(regex)
+        return [c for c in df.columns if isinstance(c, str) and r.search(c)]
 
     def _spy_col_for_target(target_name: str) -> str:
-        # final spy column per target, stable naming
-        return f"{spy_col_base}__{target_name}"
+        return f"spy__{target_name}"
 
     def _load_and_merge_multi(day_str: str) -> Optional[pd.DataFrame]:
         """Load signal/target/betsize from separate directories and merge on ticker."""
         frames = {}
         col_sets = {}
-        for label, by_date, prefix, regex in [
-            ("signal", sig_by_date, signal_prefix, signal_regex),
-            ("target", tgt_by_date, target_prefix, target_regex),
-            ("betsize", bet_by_date, bet_prefix, bet_regex),
+        for label, by_date, regex in [
+            ("signal",  sig_by_date, signal_regex),
+            ("target",  tgt_by_date, target_regex),
+            ("betsize", bet_by_date, bet_regex),
         ]:
             p = by_date.get(day_str) if by_date else None
             if p is None or not p.exists():
@@ -407,7 +421,7 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
             if "ticker" not in df.columns:
                 print(f"[skip] {p.name}: missing 'ticker'")
                 continue
-            cols = _pick_cols(df, prefix, regex)
+            cols = _pick_cols(df, regex)
             if not cols:
                 continue
             frames[label] = df[["ticker"] + cols].copy()
@@ -444,12 +458,12 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
             print(f"[skip] {p.name}: missing 'ticker'")
             return None
 
-        signal_cols = _pick_cols(df, signal_prefix, signal_regex)
-        target_cols = _pick_cols(df, target_prefix, target_regex)
-        bet_cols = _pick_cols(df, bet_prefix, bet_regex)
+        signal_cols = _pick_cols(df, signal_regex)
+        target_cols = _pick_cols(df, target_regex)
+        bet_cols = _pick_cols(df, bet_regex)
 
         if not signal_cols or not target_cols or not bet_cols:
-            print(f"[skip] {p.name}: missing features ({signal_prefix}*, {target_prefix}*, {bet_prefix}*)")
+            print(f"[skip] {p.name}: missing features (signal_regex={signal_regex!r}, target_regex={target_regex!r}, bet_regex={bet_regex!r})")
             return None
 
         keep = ["ticker"] + sorted(set(signal_cols + target_cols + bet_cols))
@@ -495,12 +509,12 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
         if df_use is None:
             return None
 
-        signal_cols = _pick_cols(df_use, signal_prefix, signal_regex)
-        target_cols = _pick_cols(df_use, target_prefix, target_regex)
-        bet_cols = _pick_cols(df_use, bet_prefix, bet_regex)
+        signal_cols = _pick_cols(df_use, signal_regex)
+        target_cols = _pick_cols(df_use, target_regex)
+        bet_cols = _pick_cols(df_use, bet_regex)
 
         if not signal_cols or not target_cols or not bet_cols:
-            print(f"[skip] {day_str}: missing features after merge ({signal_prefix}*, {target_prefix}*, {bet_prefix}*)")
+            print(f"[skip] {day_str}: missing features after merge (signal_regex={signal_regex!r}, target_regex={target_regex!r}, bet_regex={bet_regex!r})")
             return None
 
         # Derive per-target SPY columns
@@ -591,9 +605,9 @@ def run_pipeline(cfg: Dict) -> Dict[str, Optional[str]]:
     spy_by_target_global: Dict[str, str] = {}
 
     for day_dt, day_str, src_path, df, spy_map_for_day in items:
-        signal_cols = _pick_cols(df, signal_prefix, signal_regex)
-        target_cols = _pick_cols(df, target_prefix, target_regex)
-        bet_size_cols = _pick_cols(df, bet_prefix, bet_regex)
+        signal_cols = _pick_cols(df, signal_regex)
+        target_cols = _pick_cols(df, target_regex)
+        bet_size_cols = _pick_cols(df, bet_regex)
 
         needed_sig.update(signal_cols)
         needed_tgt.update(target_cols)

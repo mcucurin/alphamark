@@ -207,25 +207,22 @@ def _compute_daily_stats_for_one_signal(
                     r      = (cov / (s_std * y_std)) if (np.isfinite(cov) and s_std and y_std and s_std > 0 and y_std > 0) else np.nan
                     r2     = float(r * r) if np.isfinite(r) else np.nan
                     t_stat = (r * math.sqrt(n - 2) / math.sqrt(max(1e-15, 1.0 - r * r))) if (np.isfinite(r) and n > 2 and (1.0 - r * r) > 0) else np.nan
-                    # Cross-sectional Sharpe proxy only — true annualised Sharpe (Eq.7) in summary_stats
-                    sharpe = (np.nanmean(pnl_vec) / np.nanstd(pnl_vec, ddof=1)) if (pnl_vec.size > 1 and np.nanstd(pnl_vec, ddof=1) > 0) else np.nan
                 else:
-                    r2 = np.nan; t_stat = np.nan; sharpe = np.nan
+                    r2 = np.nan; t_stat = np.nan
 
-                stats['pnl'][signal][qlabel][target][bet]          = pnl
-                stats['ppd'][signal][qlabel][target][bet]          = ppd
-                stats['sizeNotional'][signal][qlabel][target][bet] = Bt
-                stats['nrInstr'][signal][qlabel][target][bet]      = nr_instr_today
-                stats['n_trades'][signal][qlabel][target][bet]     = n_trades_tgt
-                stats['hit_ratio'][signal][qlabel][target][bet]    = hit_ratio
-                stats['long_ratio'][signal][qlabel][target][bet]   = long_ratio_q
-                stats['r2'][signal][qlabel][target][bet]           = r2
-                stats['t_stat'][signal][qlabel][target][bet]       = t_stat
-                stats['sharpe'][signal][qlabel][target][bet]       = sharpe
+                stats['pnl'][signal][qlabel][target][bet]           = pnl
+                stats['ppd'][signal][qlabel][target][bet]           = ppd
+                stats['size_notional'][signal][qlabel][target][bet] = Bt
+                stats['nr_instr'][signal][qlabel][target][bet]      = nr_instr_today
+                stats['nr_trades'][signal][qlabel][target][bet]     = n_trades_tgt
+                stats['hit_ratio'][signal][qlabel][target][bet]     = hit_ratio
+                stats['long_ratio'][signal][qlabel][target][bet]    = long_ratio_q
+                stats['r2'][signal][qlabel][target][bet]            = r2
+                stats['t_stat'][signal][qlabel][target][bet]        = t_stat
 
             # __ALL__ target aggregates
-            stats['nrInstr'][signal][qlabel]['__ALL__'][bet]  = nr_instr_today
-            stats['n_trades'][signal][qlabel]['__ALL__'][bet] = n_trades_today
+            stats['nr_instr'][signal][qlabel]['__ALL__'][bet]  = nr_instr_today
+            stats['nr_trades'][signal][qlabel]['__ALL__'][bet] = n_trades_today
 
     if enable_distributions:
         for target in target_cols:
